@@ -1,0 +1,34 @@
+﻿#include <windows.h>
+
+// Иконка приложения (закомментировано, если нет файла иконки)
+// IDI_ICON1 ICON "app.ico"
+
+// Информация о версии
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     3, 0, 0, 0
+PRODUCTVERSION  3, 0, 0, 0
+FILEFLAGSMASK   0x3fL
+FILEFLAGS       0x0L
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+	BLOCK "StringFileInfo"
+	BEGIN
+		BLOCK "040904E4"
+		BEGIN
+			VALUE "agup", "Personal Use"
+			VALUE "FileDescription", "Route Manager Pro - VPN Routing Application"
+			VALUE "FileVersion", "3.0.0.0"
+			VALUE "InternalName", "RouteManagerPro"
+			VALUE "LegalCopyright", "Copyright (C) 2025"
+			VALUE "OriginalFilename", "RouteManagerPro.exe"
+			VALUE "ProductName", "Route Manager Pro"
+			VALUE "ProductVersion", "3.0.0.0"
+		END
+	END
+	BLOCK "VarFileInfo"
+	BEGIN
+		VALUE "Translation", 0x409, 1252
+	END
+END

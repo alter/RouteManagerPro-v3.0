@@ -1,0 +1,331 @@
+﻿// src/ui/MainWindow.cpp
+#include "MainWindow.h"
+#include "ServiceClient.h"
+#include "SystemTray.h"
+#include "ProcessPanel.h"
+#include "RouteTable.h"
+#include "../common/Constants.h"
+#include "../common/Utils.h"
+#include "../common/Logger.h"
+#include "../common/ShutdownCoordinator.h"
+#include <commctrl.h>
+#include <windowsx.h>
+#include <sstream>
+#include <thread>
+
+#pragma comment(lib, "comctl32.lib")
+
+MainWindow* MainWindow::instance = nullptr;
+
+MainWindow::MainWindow(HINSTANCE hInst) : hwnd(nullptr), hInstance(hInst), isShuttingDown(false) {
+    instance = this;
+}
+
+MainWindow::~MainWindow() {
+    instance = nullptr;
+}
+
+int MainWindow::Run(HINSTANCE hInstance, int nCmdShow) {
+    INITCOMMONCONTROLSEX icex;
+    icex.dwSize = sizeof(INITCOMMONCONTROLSEX);
+    icex.dwICC = ICC_WIN95_CLASSES;
+    InitCommonControlsEx(&icex);
+
+    MainWindow window(hInstance);
+    if (!window.CreateMainWindow(nCmdShow)) {
+        return 1;
+    }
+
+    MSG msg;
+    while (GetMessage(&msg, nullptr, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    return static_cast<int>(msg.wParam);
+}
+
+bool MainWindow::CreateMainWindow(int nCmdShow) {
+    WNDCLASSEXW wcex = { sizeof(WNDCLASSEXW) };
+    wcex.style = CS_HREDRAW | CS_VREDRAW;
+    wcex.lpfnWndProc = WindowProc;
+    wcex.hInstance = hInstance;
+    wcex.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wcex.lpszClassName = L"RouteManagerProWindow";
+    wcex.hIconSm = wcex.hIcon;
+
+    if (!RegisterClassExW(&wcex)) {
+        return false;
+    }
+
+    hwnd = CreateWindowExW(
+        0,
+        L"RouteManagerProWindow",
+        L"Route Manager Pro v3.0",
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT,
+        850, 650,
+        nullptr,
+        nullptr,
+        hInstance,
+        this
+    );
+
+    if (!hwnd) {
+        return false;
+    }
+
+    serviceClient = std::make_unique<ServiceClient>();
+    systemTray = std::make_unique<SystemTray>(hwnd);
+    processPanel = std::make_unique<ProcessPanel>(hwnd, serviceClient.get());
+    routeTable = std::make_unique<RouteTable>(hwnd, serviceClient.get());
+
+    CreateControls();
+
+    serviceClient->Connect();
+
+    LoadConfiguration();
+    UpdateStatus();
+
+    ShowWindow(hwnd, config.startMinimized ? SW_MINIMIZE : nCmdShow);
+    UpdateWindow(hwnd);
+
+    SetTimer(hwnd, 1, 1000, nullptr);
+    SetTimer(hwnd, 2, 5000, nullptr);
+
+    return true;
+}
+
+void MainWindow::CreateControls() {
+    HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+
+    CreateWindow(L"BUTTON", L"Configuration", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+        10, 10, 200, 120, hwnd, nullptr, hInstance, nullptr);
+
+    CreateWindow(L"STATIC", L"Gateway:", WS_CHILD | WS_VISIBLE,
+        20, 35, 60, 20, hwnd, nullptr, hInstance, nullptr);
+
+    gatewayEdit = CreateWindow(L"EDIT", L"10.200.210.1",
+        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+        85, 32, 115, 22, hwnd, nullptr, hInstance, nullptr);
+
+    CreateWindow(L"STATIC", L"Metric:", WS_CHILD | WS_VISIBLE,
+        20, 62, 60, 20, hwnd, nullptr, hInstance, nullptr);
+
+    metricEdit = CreateWindow(L"EDIT", L"1",
+        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER,
+        85, 59, 50, 22, hwnd, nullptr, hInstance, nullptr);
+
+    applyButton = CreateWindow(L"BUTTON", L"Apply",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        140, 59, 60, 22, hwnd, (HMENU)1001, hInstance, nullptr);
+
+    aiPreloadCheckbox = CreateWindow(L"BUTTON", L"Preload AI IPs",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        20, 90, 180, 20, hwnd, (HMENU)1002, hInstance, nullptr);
+
+    CreateWindow(L"BUTTON", L"Status", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+        220, 10, 610, 120, hwnd, nullptr, hInstance, nullptr);
+
+    statusLabel = CreateWindow(L"STATIC",
+        L"Service: • Running\r\n"
+        L"Monitor: • Active\r\n"
+        L"Routes: 0 active\r\n"
+        L"Memory: 0 MB\r\n"
+        L"Uptime: 0m",
+        WS_CHILD | WS_VISIBLE,
+        230, 30, 590, 90, hwnd, nullptr, hInstance, nullptr);
+
+    processPanel->Create(10, 140, 820, 240);
+    routeTable->Create(10, 390, 820, 180);
+
+    minimizeButton = CreateWindow(L"BUTTON", L"Minimize to Tray",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        10, 580, 120, 30, hwnd, (HMENU)1003, hInstance, nullptr);
+
+    viewLogsButton = CreateWindow(L"BUTTON", L"View Logs",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        140, 580, 100, 30, hwnd, (HMENU)1004, hInstance, nullptr);
+
+    EnumChildWindows(hwnd, [](HWND hwnd, LPARAM lParam) -> BOOL {
+        SendMessage(hwnd, WM_SETFONT, (WPARAM)lParam, TRUE);
+        return TRUE;
+        }, (LPARAM)hFont);
+}
+
+LRESULT CALLBACK MainWindow::WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CREATE: {
+        CREATESTRUCT* cs = (CREATESTRUCT*)lParam;
+        SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
+        return 0;
+    }
+
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case 1001: instance->OnApplyConfig(); break;
+        case 1002: instance->OnAIPreloadToggle(); break;
+        case 1003: instance->OnMinimizeToTray(); break;
+        case 1004: instance->OnViewLogs(); break;
+        default:
+            if (instance->processPanel) {
+                instance->processPanel->HandleCommand(wParam);
+            }
+            if (instance->routeTable) {
+                instance->routeTable->HandleCommand(wParam);
+            }
+            break;
+        }
+        return 0;
+
+    case WM_TIMER:
+        if (wParam == 1 && !instance->isShuttingDown) {
+            instance->UpdateStatus();
+        }
+        else if (wParam == 2 && !instance->isShuttingDown) {
+            if (instance->processPanel) {
+                instance->processPanel->Refresh();
+            }
+            if (instance->routeTable) {
+                instance->routeTable->Refresh();
+            }
+        }
+        return 0;
+
+    case Constants::WM_TRAY_ICON:
+        if (lParam == WM_LBUTTONDBLCLK) {
+            ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
+        }
+        else if (lParam == WM_RBUTTONUP) {
+            instance->systemTray->ShowContextMenu();
+        }
+        return 0;
+
+    case WM_SIZE:
+        if (wParam == SIZE_MINIMIZED) {
+            ShowWindow(hwnd, SW_HIDE);
+        }
+        return 0;
+
+    case WM_NOTIFY: {
+        LPNMHDR pnmh = (LPNMHDR)lParam;
+        if (instance->processPanel) {
+            instance->processPanel->HandleNotify(pnmh);
+        }
+        return 0;
+    }
+
+    case WM_CLOSE: {
+        instance->OnClose();
+        return 0;
+    }
+
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+void MainWindow::OnClose() {
+    Logger::Instance().Info("MainWindow::OnClose - Starting shutdown sequence");
+
+    if (isShuttingDown) {
+        Logger::Instance().Warning("Already shutting down, ignoring duplicate close");
+        return;
+    }
+
+    isShuttingDown = true;
+
+    KillTimer(hwnd, 1);
+    KillTimer(hwnd, 2);
+
+    ShutdownCoordinator::Instance().InitiateShutdown();
+
+    if (serviceClient && serviceClient->IsConnected()) {
+        Logger::Instance().Info("Saving configuration before shutdown");
+        serviceClient->SetConfig(config);
+
+        Logger::Instance().Info("Disconnecting from service");
+        serviceClient->Disconnect();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    if (systemTray) {
+        systemTray.reset();
+    }
+
+    processPanel.reset();
+    routeTable.reset();
+    serviceClient.reset();
+
+    Logger::Instance().Info("Destroying main window");
+    DestroyWindow(hwnd);
+}
+
+void MainWindow::UpdateStatus() {
+    if (isShuttingDown) {
+        return;
+    }
+
+    if (!serviceClient || !serviceClient->IsConnected()) {
+        if (serviceClient) {
+            serviceClient->Connect();
+        }
+
+        if (!serviceClient || !serviceClient->IsConnected()) {
+            SetWindowText(statusLabel, L"Service: ○ Not Connected\r\nTrying to connect...");
+            return;
+        }
+    }
+
+    status = serviceClient->GetStatus();
+
+    std::wstringstream ss;
+    ss << L"Service: " << (status.isRunning ? L"●" : L"○") << L" Running\r\n";
+    ss << L"Monitor: " << (status.monitorActive ? L"●" : L"○") << L" Active\r\n";
+    ss << L"Routes: " << status.activeRoutes << L" active\r\n";
+    ss << L"Memory: " << status.memoryUsageMB << L" MB\r\n";
+    ss << L"Uptime: " << Utils::StringToWString(Utils::FormatDuration(status.uptime));
+
+    SetWindowText(statusLabel, ss.str().c_str());
+}
+
+void MainWindow::OnApplyConfig() {
+    char buffer[256];
+    GetWindowTextA(gatewayEdit, buffer, sizeof(buffer));
+    config.gatewayIp = buffer;
+
+    GetWindowTextA(metricEdit, buffer, sizeof(buffer));
+    config.metric = std::stoi(buffer);
+
+    serviceClient->SetConfig(config);
+}
+
+void MainWindow::OnMinimizeToTray() {
+    ShowWindow(hwnd, SW_HIDE);
+}
+
+void MainWindow::OnViewLogs() {
+    std::string logPath = Utils::GetCurrentDirectory() + "\\logs";
+    Utils::CreateDirectoryIfNotExists(logPath);
+    std::wstring widePath = Utils::StringToWString(logPath);
+    ShellExecuteW(nullptr, L"open", widePath.c_str(), nullptr, nullptr, SW_SHOW);
+}
+
+void MainWindow::OnAIPreloadToggle() {
+    bool checked = SendMessage(aiPreloadCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    config.aiPreloadEnabled = checked;
+    serviceClient->SetAIPreload(checked);
+}
+
+void MainWindow::LoadConfiguration() {
+    config = serviceClient->GetConfig();
+    SetWindowTextA(gatewayEdit, config.gatewayIp.c_str());
+    SetWindowTextA(metricEdit, std::to_string(config.metric).c_str());
+    SendMessage(aiPreloadCheckbox, BM_SETCHECK, config.aiPreloadEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+}

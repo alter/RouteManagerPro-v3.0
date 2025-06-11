@@ -18,6 +18,49 @@
       <Platform>x64</Platform>
     </ProjectConfiguration>
   </ItemGroup>
+  <ItemGroup>
+    <None Include="config\default_config.json" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="app.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\common\IPCSerializer.cpp" />
+    <ClCompile Include="src\common\Utils.cpp" />
+    <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\service\ConfigManager.cpp" />
+    <ClCompile Include="src\service\NetworkMonitor.cpp" />
+    <ClCompile Include="src\service\ProcessManager.cpp" />
+    <ClCompile Include="src\service\RouteController.cpp" />
+    <ClCompile Include="src\service\ServiceMain.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="src\service\Watchdog.cpp" />
+    <ClCompile Include="src\ui\MainWindow.cpp" />
+    <ClCompile Include="src\ui\ProcessPanel.cpp" />
+    <ClCompile Include="src\ui\RouteTable.cpp" />
+    <ClCompile Include="src\ui\ServiceClient.cpp" />
+    <ClCompile Include="src\ui\SystemTray.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\common\Constants.h" />
+    <ClInclude Include="src\common\IPCProtocol.h" />
+    <ClInclude Include="src\common\Logger.h" />
+    <ClInclude Include="src\common\Models.h" />
+    <ClInclude Include="src\common\ShutdownCoordinator.h" />
+    <ClInclude Include="src\common\Utils.h" />
+    <ClInclude Include="src\service\ConfigManager.h" />
+    <ClInclude Include="src\service\NetworkMonitor.h" />
+    <ClInclude Include="src\service\ProcessManager.h" />
+    <ClInclude Include="src\service\RouteController.h" />
+    <ClInclude Include="src\service\ServiceMain.h" />
+    <ClInclude Include="src\service\Watchdog.h" />
+    <ClInclude Include="src\ui\MainWindow.h" />
+    <ClInclude Include="src\ui\ProcessPanel.h" />
+    <ClInclude Include="src\ui\RouteTable.h" />
+    <ClInclude Include="src\ui\ServiceClient.h" />
+    <ClInclude Include="src\ui\SystemTray.h" />
+  </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>17.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
@@ -100,12 +143,16 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;_WINDOWS;_CRT_SECURE_NO_WARNINGS;WIN32_LEAN_AND_MEAN;_WINSOCK_DEPRECATED_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\common;$(ProjectDir)src\service;$(ProjectDir)src\ui;$(ProjectDir)libs\WinDivert\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalLibraryDirectories>$(ProjectDir)libs\WinDivert\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>WinDivert.lib;iphlpapi.lib;psapi.lib;comctl32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -122,22 +169,6 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
   </ItemDefinitionGroup>
-  <ItemGroup>
-    <ClInclude Include="framework.h" />
-    <ClInclude Include="Resource.h" />
-    <ClInclude Include="RouteManagerPro v3.0.h" />
-    <ClInclude Include="targetver.h" />
-  </ItemGroup>
-  <ItemGroup>
-    <ClCompile Include="RouteManagerPro v3.0.cpp" />
-  </ItemGroup>
-  <ItemGroup>
-    <ResourceCompile Include="RouteManagerPro v3.0.rc" />
-  </ItemGroup>
-  <ItemGroup>
-    <Image Include="RouteManagerPro v3.0.ico" />
-    <Image Include="small.ico" />
-  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

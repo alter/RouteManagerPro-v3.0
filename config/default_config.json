@@ -1,0 +1,11 @@
+{
+  "gatewayIp": "10.200.210.1",
+  "metric": 1,
+  "gamingMode": true,
+  "startMinimized": false,
+  "startWithWindows": true,
+  "aiPreloadEnabled": false,
+  "selectedProcesses": [
+    "Discord.exe"
+  ]
+}
