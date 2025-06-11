@@ -14,11 +14,11 @@
 #include <chrono>
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "WinDivert.lib")
 
-NetworkMonitor::NetworkMonitor(RouteController* rc, ProcessManager* pm)
-    : routeController(rc), processManager(pm),
-    divertHandle(INVALID_HANDLE_VALUE), running(false), active(false),
-    isStoppingFlag(false) {
+NetworkMonitor::NetworkMonitor(RouteController* rc, ProcessManager* pm, PacketInterceptor* pi)
+    : routeController(rc), processManager(pm), packetInterceptor(pi),
+    divertHandle(INVALID_HANDLE_VALUE), running(false), active(false) {
     Logger::Instance().Info("NetworkMonitor created");
 }
 
@@ -31,9 +31,7 @@ void NetworkMonitor::Start() {
 
     Logger::Instance().Info("Starting NetworkMonitor");
 
-    divertHandle = WinDivertOpen("true", WINDIVERT_LAYER_FLOW, 0,
-        WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY);
-
+    divertHandle = WinDivertOpen("true", WINDIVERT_LAYER_FLOW, 0, WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY);
     if (divertHandle == INVALID_HANDLE_VALUE) {
         DWORD error = GetLastError();
         Logger::Instance().Error("Failed to open WinDivert handle: " + std::to_string(error));
@@ -49,15 +47,10 @@ void NetworkMonitor::Start() {
     running = true;
     monitorThread = std::thread(&NetworkMonitor::MonitorThreadFunc, this);
 
-    Logger::Instance().Info("NetworkMonitor started");
+    Logger::Instance().Info("NetworkMonitor started - monitoring FLOW events");
 }
 
 void NetworkMonitor::Stop() {
-    if (isStoppingFlag.exchange(true)) {
-        Logger::Instance().Debug("NetworkMonitor::Stop - Already stopping");
-        return;
-    }
-
     Logger::Instance().Info("NetworkMonitor::Stop called");
     running = false;
 
@@ -67,14 +60,7 @@ void NetworkMonitor::Stop() {
 
         if (monitorThread.joinable()) {
             Logger::Instance().Info("Waiting for monitor thread to complete");
-            try {
-                if (monitorThread.joinable()) {
-                    monitorThread.join();
-                }
-            }
-            catch (const std::exception& e) {
-                Logger::Instance().Error("Exception joining monitor thread: " + std::string(e.what()));
-            }
+            monitorThread.join();
         }
 
         WinDivertClose(divertHandle);
@@ -91,14 +77,13 @@ void NetworkMonitor::MonitorThreadFunc() {
     active = true;
     auto lastCleanup = std::chrono::steady_clock::now();
     int eventCount = 0;
-    int logFrequency = 100;
 
     Logger::Instance().Info("Monitor thread started - waiting for FLOW events");
 
     while (running.load() && !ShutdownCoordinator::Instance().isShuttingDown) {
         if (!WinDivertRecv(divertHandle, NULL, 0, NULL, &addr)) {
             DWORD error = GetLastError();
-            if (error == ERROR_NO_DATA || error == ERROR_OPERATION_ABORTED) {
+            if (error == ERROR_NO_DATA) {
                 break;
             }
             if (error != ERROR_INSUFFICIENT_BUFFER) {
@@ -113,8 +98,8 @@ void NetworkMonitor::MonitorThreadFunc() {
             if (addr.Event == WINDIVERT_EVENT_FLOW_ESTABLISHED ||
                 addr.Event == WINDIVERT_EVENT_FLOW_DELETED) {
                 eventCount++;
-                if (eventCount % logFrequency == 0) {
-                    Logger::Instance().Debug("Processed " + std::to_string(eventCount) + " FLOW events");
+                if (eventCount <= 10 || eventCount % 100 == 0) {
+                    Logger::Instance().Info("Processing FLOW event #" + std::to_string(eventCount));
                 }
                 ProcessFlowEvent(addr);
             }
@@ -131,20 +116,10 @@ void NetworkMonitor::MonitorThreadFunc() {
 }
 
 void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr) {
-    if (addr.Flow.ProcessId == 0 || addr.Flow.ProcessId == 4) {
-        return;
-    }
-
     std::string processPath = GetProcessPathFromFlowId(0, addr.Flow.ProcessId);
     if (processPath.empty()) return;
 
     std::string processName = Utils::GetProcessNameFromPath(processPath);
-
-    if (processName.find("svchost") != std::string::npos ||
-        processName.find("System") != std::string::npos ||
-        processName.find("Registry") != std::string::npos) {
-        return;
-    }
 
     char localStr[INET6_ADDRSTRLEN], remoteStr[INET6_ADDRSTRLEN];
     WinDivertHelperFormatIPv6Address(addr.Flow.LocalAddr, localStr, sizeof(localStr));
@@ -155,14 +130,25 @@ void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr) {
         remoteIp = remoteIp.substr(7);
     }
 
+    std::stringstream logMsg;
+    logMsg << "Flow event: " << (addr.Event == WINDIVERT_EVENT_FLOW_ESTABLISHED ? "ESTABLISHED" : "DELETED")
+        << " Process: " << processName << " (" << addr.Flow.ProcessId << ")"
+        << " Remote: " << remoteIp << ":" << ntohs(addr.Flow.RemotePort)
+        << " Protocol: " << (int)addr.Flow.Protocol;
+    Logger::Instance().Info(logMsg.str());
+
     if (Utils::IsPrivateIP(remoteIp)) {
+        Logger::Instance().Debug("Skipping private IP: " + remoteIp);
         return;
     }
 
     bool isSelected = processManager->IsProcessSelected(processName);
     if (!isSelected) {
+        Logger::Instance().Debug("Process not selected: " + processName);
         return;
     }
+
+    Logger::Instance().Info("Selected process detected: " + processName + " -> " + remoteIp);
 
     if (addr.Event == WINDIVERT_EVENT_FLOW_ESTABLISHED) {
         std::lock_guard<std::mutex> lock(connectionsMutex);
@@ -180,6 +166,7 @@ void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr) {
         };
 
         if (routeController) {
+            Logger::Instance().Info("Adding route IMMEDIATELY for " + remoteIp + " (process: " + processName + ")");
             routeController->AddRoute(remoteIp, processName);
         }
     }
@@ -189,6 +176,7 @@ void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr) {
             ((UINT64)addr.Flow.LocalPort << 16) |
             addr.Flow.RemotePort;
         connections.erase(flowId);
+        Logger::Instance().Debug("Flow deleted for " + processName);
     }
 }
 
@@ -209,7 +197,7 @@ void NetworkMonitor::CleanupOldConnections() {
     }
 
     if (cleaned > 0) {
-        Logger::Instance().Debug("Cleaned up " + std::to_string(cleaned) + " old connections");
+        Logger::Instance().Info("Cleaned up " + std::to_string(cleaned) + " old connections");
     }
 }
 
@@ -230,6 +218,7 @@ std::string NetworkMonitor::GetProcessPathFromFlowId(UINT64 flowId, UINT32 proce
 
 PacketPriority NetworkMonitor::DeterminePacketPriority(const std::string& processName, UINT16 port) {
     if (Utils::IsDiscordProcess(processName)) {
+        Logger::Instance().Debug("Discord process detected, assigning Discord priority");
         return PacketPriority::Discord;
     }
 

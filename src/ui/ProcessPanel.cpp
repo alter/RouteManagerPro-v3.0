@@ -1,4 +1,6 @@
 ﻿// src/ui/ProcessPanel.cpp
+#include <winsock2.h>
+#include <windows.h>
 #include "ProcessPanel.h"
 #include "ServiceClient.h"
 #include "../common/Utils.h"
@@ -70,12 +72,16 @@ void ProcessPanel::CreateControls(int x, int y, int width, int height) {
     column.mask = LVCF_TEXT | LVCF_WIDTH;
 
     column.pszText = (LPWSTR)L"Process Name";
-    column.cx = 250;
+    column.cx = 200;
     ListView_InsertColumn(listView, 0, &column);
 
-    column.pszText = (LPWSTR)L"Path";
-    column.cx = width - 290;
+    column.pszText = (LPWSTR)L"Type";
+    column.cx = 100;
     ListView_InsertColumn(listView, 1, &column);
+
+    column.pszText = (LPWSTR)L"Path";
+    column.cx = width - 340;
+    ListView_InsertColumn(listView, 2, &column);
 }
 
 void ProcessPanel::Refresh() {
@@ -103,6 +109,19 @@ void ProcessPanel::UpdateProcessList() {
         info.path = L"(Not running)";
         info.isSelected = true;
         info.isRunning = false;
+
+        if (Utils::IsDiscordProcess(selectedName)) {
+            info.type = L"Discord (5ms)";
+        }
+        else if (Utils::IsGameProcess(selectedName)) {
+            info.type = L"Game (10ms)";
+        }
+        else if (Utils::IsDevProcess(selectedName)) {
+            info.type = L"Dev (25ms)";
+        }
+        else {
+            info.type = L"App (50ms)";
+        }
 
         uniqueProcessesMap[wideName] = info;
         Logger::Instance().Debug("Added selected process: " + selectedName);
@@ -161,6 +180,19 @@ void ProcessPanel::UpdateProcessList() {
                     info.isSelected = isSelected;
                     info.isRunning = true;
 
+                    if (Utils::IsDiscordProcess(processNameStr)) {
+                        info.type = L"Discord (5ms)";
+                    }
+                    else if (Utils::IsGameProcess(processNameStr)) {
+                        info.type = L"Game (10ms)";
+                    }
+                    else if (Utils::IsDevProcess(processNameStr)) {
+                        info.type = L"Dev (25ms)";
+                    }
+                    else {
+                        info.type = L"App (50ms)";
+                    }
+
                     uniqueProcessesMap[processName] = info;
                 }
 
@@ -180,13 +212,10 @@ void ProcessPanel::UpdateProcessList() {
             if (a.isSelected && !b.isSelected) return true;
             if (!a.isSelected && b.isSelected) return false;
 
-            std::string nameA = Utils::WStringToString(a.name);
-            std::string nameB = Utils::WStringToString(b.name);
-
-            if (Utils::IsDiscordProcess(nameA) && !Utils::IsDiscordProcess(nameB)) return true;
-            if (!Utils::IsDiscordProcess(nameA) && Utils::IsDiscordProcess(nameB)) return false;
-            if (Utils::IsGameProcess(nameA) && !Utils::IsGameProcess(nameB)) return true;
-            if (!Utils::IsGameProcess(nameA) && Utils::IsGameProcess(nameB)) return false;
+            if (a.type == L"Discord (5ms)" && b.type != L"Discord (5ms)") return true;
+            if (a.type != L"Discord (5ms)" && b.type == L"Discord (5ms)") return false;
+            if (a.type == L"Game (10ms)" && b.type != L"Game (10ms)") return true;
+            if (a.type != L"Game (10ms)" && b.type == L"Game (10ms)") return false;
 
             return _wcsicmp(a.name.c_str(), b.name.c_str()) < 0;
         });
@@ -206,7 +235,8 @@ void ProcessPanel::UpdateProcessList() {
         int index = ListView_InsertItem(listView, &item);
         if (index == -1) continue;
 
-        ListView_SetItemText(listView, index, 1, const_cast<LPWSTR>(proc.path.c_str()));
+        ListView_SetItemText(listView, index, 1, const_cast<LPWSTR>(proc.type.c_str()));
+        ListView_SetItemText(listView, index, 2, const_cast<LPWSTR>(proc.path.c_str()));
 
         ListView_SetCheckState(listView, index, proc.isSelected ? TRUE : FALSE);
 
@@ -313,7 +343,8 @@ void ProcessPanel::FilterProcesses(const std::string& filter) {
 
             int itemIndex = ListView_InsertItem(listView, &item);
 
-            ListView_SetItemText(listView, itemIndex, 1, const_cast<LPWSTR>(processes[i].path.c_str()));
+            ListView_SetItemText(listView, itemIndex, 1, const_cast<LPWSTR>(processes[i].type.c_str()));
+            ListView_SetItemText(listView, itemIndex, 2, const_cast<LPWSTR>(processes[i].path.c_str()));
             ListView_SetCheckState(listView, itemIndex, processes[i].isSelected);
             index++;
         }

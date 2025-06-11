@@ -1,14 +1,15 @@
 // src/service/Watchdog.cpp
+#include <winsock2.h>
+#include <windows.h>
 #include "Watchdog.h"
 #include "ServiceMain.h"
 #include "../common/Constants.h"
 #include "../common/Logger.h"
 #include "../common/ShutdownCoordinator.h"
-#include <windows.h>
 #include <psapi.h>
 
 Watchdog::Watchdog(ServiceMain* svc) : service(svc), running(false),
-isStoppingFlag(false), startTime(std::chrono::system_clock::now()) {
+startTime(std::chrono::system_clock::now()) {
     Logger::Instance().Debug("Watchdog::Watchdog - Constructor called");
 }
 
@@ -26,23 +27,13 @@ void Watchdog::Start() {
 }
 
 void Watchdog::Stop() {
-    if (isStoppingFlag.exchange(true)) {
-        Logger::Instance().Debug("Watchdog::Stop - Already stopping");
-        return;
-    }
-
     Logger::Instance().Debug("Watchdog::Stop - Stopping watchdog");
     running = false;
 
     if (watchThread.joinable()) {
         Logger::Instance().Debug("Watchdog::Stop - Waiting for watch thread");
-        try {
-            watchThread.join();
-            Logger::Instance().Debug("Watchdog::Stop - Watch thread joined");
-        }
-        catch (const std::exception& e) {
-            Logger::Instance().Error("Watchdog::Stop - Exception joining thread: " + std::string(e.what()));
-        }
+        watchThread.join();
+        Logger::Instance().Debug("Watchdog::Stop - Watch thread joined");
     }
 }
 
@@ -76,7 +67,6 @@ void Watchdog::WatchThreadFunc() {
             Logger::Instance().Error("Watchdog::WatchThreadFunc - Exception: " + std::string(e.what()));
         }
 
-        // Use interruptible sleep
         for (int i = 0; i < Constants::WATCHDOG_INTERVAL_SEC * 10; i++) {
             if (!running.load() || ShutdownCoordinator::Instance().isShuttingDown) {
                 break;
@@ -107,9 +97,13 @@ void Watchdog::CheckComponentHealth() {
     std::lock_guard<std::mutex> lock(componentsMutex);
 
     auto now = std::chrono::system_clock::now();
-    for (auto& [name, health] : components) {
-        auto timeSinceActivity = std::chrono::duration_cast<std::chrono::seconds>(
-            now - health.lastActivity).count();
+    for (auto it = components.begin(); it != components.end(); ++it) {
+        std::string name = it->first;
+        ComponentHealth& health = it->second;
+
+        auto duration = std::chrono::duration_cast<std::chrono::seconds>(
+            now - health.lastActivity);
+        int64_t timeSinceActivity = duration.count();
 
         if (timeSinceActivity > 60 && health.isHealthy) {
             health.isHealthy = false;

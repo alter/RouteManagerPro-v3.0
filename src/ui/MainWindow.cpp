@@ -1,4 +1,6 @@
 ﻿// src/ui/MainWindow.cpp
+#include <winsock2.h>
+#include <windows.h>
 #include "MainWindow.h"
 #include "ServiceClient.h"
 #include "SystemTray.h"

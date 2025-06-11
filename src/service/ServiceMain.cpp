@@ -1,4 +1,6 @@
 ﻿// src/service/ServiceMain.cpp
+#include <winsock2.h>
+#include <windows.h>
 #include "ServiceMain.h"
 #include "NetworkMonitor.h"
 #include "RouteController.h"
@@ -16,17 +18,14 @@ SERVICE_STATUS_HANDLE ServiceMain::statusHandle = nullptr;
 SERVICE_STATUS ServiceMain::serviceStatus = { 0 };
 HANDLE ServiceMain::stopEvent = nullptr;
 
-ServiceMain::ServiceMain() : running(false), pipeThread(nullptr), isShuttingDown(false),
-pipeServerRunning(false) {
+ServiceMain::ServiceMain() : running(false), pipeThread(nullptr) {
     Logger::Instance().Debug("ServiceMain::ServiceMain() - Constructor called");
     instance = this;
 }
 
 ServiceMain::~ServiceMain() {
     Logger::Instance().Debug("ServiceMain::~ServiceMain() - Destructor called");
-    if (!isShuttingDown) {
-        Stop();
-    }
+    Stop();
     instance = nullptr;
 }
 
@@ -210,7 +209,7 @@ void ServiceMain::Start() {
 
         Logger::Instance().Debug("ServiceMain::Start - Creating NetworkMonitor");
         networkMonitor = std::make_unique<NetworkMonitor>(
-            routeController.get(), processManager.get());
+            routeController.get(), processManager.get(), nullptr);
 
         Logger::Instance().Debug("ServiceMain::Start - Creating Watchdog");
         watchdog = std::make_unique<Watchdog>(this);
@@ -222,7 +221,6 @@ void ServiceMain::Start() {
         watchdog->Start();
 
         Logger::Instance().Debug("ServiceMain::Start - Creating pipe server thread");
-        pipeServerRunning = true;
         pipeThread = CreateThread(nullptr, 0, PipeServerThread, this, 0, nullptr);
 
         running = true;
@@ -242,45 +240,44 @@ void ServiceMain::Start() {
 void ServiceMain::Stop() {
     Logger::Instance().Info("ServiceMain::Stop - Starting graceful shutdown");
 
-    if (isShuttingDown.exchange(true)) {
-        Logger::Instance().Warning("ServiceMain::Stop - Already shutting down");
+    static std::atomic<bool> stopInProgress(false);
+    bool expected = false;
+    if (!stopInProgress.compare_exchange_strong(expected, true)) {
+        Logger::Instance().Warning("ServiceMain::Stop - Already in progress, returning");
         return;
     }
 
     if (!running) {
         Logger::Instance().Warning("Service already stopped");
+        stopInProgress = false;
         return;
     }
 
     Logger::Instance().Debug("ServiceMain::Stop - Setting running to false");
     running = false;
-    pipeServerRunning = false;
 
     Logger::Instance().Debug("ServiceMain::Stop - Initiating shutdown coordinator");
     ShutdownCoordinator::Instance().InitiateShutdown();
 
     try {
-        // Stop components in reverse order of creation
-        if (watchdog) {
-            Logger::Instance().Info("Stopping Watchdog");
-            watchdog->Stop();
-            Logger::Instance().Debug("Watchdog stopped successfully");
-        }
-
         if (networkMonitor) {
             Logger::Instance().Info("Stopping NetworkMonitor");
             networkMonitor->Stop();
             Logger::Instance().Debug("NetworkMonitor stopped successfully");
         }
 
-        // Cancel any pending IO operations on pipe
+        if (watchdog) {
+            Logger::Instance().Info("Stopping Watchdog");
+            watchdog->Stop();
+            Logger::Instance().Debug("Watchdog stopped successfully");
+        }
+
         if (pipeThread) {
             Logger::Instance().Info("Stopping pipe server thread");
-            // Signal pipe thread to stop by closing any active connections
-            DWORD result = WaitForSingleObject(pipeThread, 2000);
+            DWORD result = WaitForSingleObject(pipeThread, 5000);
             if (result == WAIT_TIMEOUT) {
-                Logger::Instance().Warning("Pipe thread did not exit in time");
-                // Don't terminate thread, just continue
+                Logger::Instance().Warning("Pipe thread did not exit in time, terminating");
+                TerminateThread(pipeThread, 1);
             }
             else {
                 Logger::Instance().Debug("Pipe thread stopped successfully");
@@ -294,12 +291,11 @@ void ServiceMain::Stop() {
             SetEvent(stopEvent);
         }
 
-        // Clear components in reverse order
-        Logger::Instance().Debug("ServiceMain::Stop - Clearing components");
-        watchdog.reset();
+        Logger::Instance().Debug("ServiceMain::Stop - Resetting unique_ptrs");
         networkMonitor.reset();
         processManager.reset();
         routeController.reset();
+        watchdog.reset();
         configManager.reset();
 
         if (stopEvent) {
@@ -316,6 +312,8 @@ void ServiceMain::Stop() {
     catch (...) {
         Logger::Instance().Error("ServiceMain::Stop - Unknown exception during shutdown");
     }
+
+    stopInProgress = false;
 }
 
 void ServiceMain::ReportStatus(DWORD currentState, DWORD exitCode, DWORD waitHint) {
@@ -351,7 +349,7 @@ DWORD WINAPI ServiceMain::PipeServerThread(LPVOID param) {
     OVERLAPPED overlapped = { 0 };
     overlapped.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
 
-    while (service->pipeServerRunning && !ShutdownCoordinator::Instance().isShuttingDown) {
+    while (service->running && !ShutdownCoordinator::Instance().isShuttingDown) {
         Logger::Instance().Debug("PipeServerThread: Creating named pipe");
 
         HANDLE pipe = CreateNamedPipeA(
@@ -359,8 +357,8 @@ DWORD WINAPI ServiceMain::PipeServerThread(LPVOID param) {
             PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
             PIPE_UNLIMITED_INSTANCES,
-            65536,
-            65536,
+            4096,
+            4096,
             0,
             nullptr
         );
@@ -374,7 +372,7 @@ DWORD WINAPI ServiceMain::PipeServerThread(LPVOID param) {
         BOOL connected = ConnectNamedPipe(pipe, &overlapped);
         if (!connected && GetLastError() == ERROR_IO_PENDING) {
             HANDLE waitHandles[] = { overlapped.hEvent, ShutdownCoordinator::Instance().shutdownEvent };
-            DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, 5000);
+            DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
 
             if (waitResult == WAIT_OBJECT_0) {
                 DWORD bytesTransferred;
@@ -383,8 +381,8 @@ DWORD WINAPI ServiceMain::PipeServerThread(LPVOID param) {
                     service->HandlePipeClient(pipe);
                 }
             }
-            else if (waitResult == WAIT_OBJECT_0 + 1 || waitResult == WAIT_TIMEOUT) {
-                Logger::Instance().Info("PipeServerThread: Shutdown requested or timeout");
+            else if (waitResult == WAIT_OBJECT_0 + 1) {
+                Logger::Instance().Info("PipeServerThread: Shutdown requested");
                 CancelIo(pipe);
                 CloseHandle(pipe);
                 break;
@@ -405,11 +403,9 @@ DWORD WINAPI ServiceMain::PipeServerThread(LPVOID param) {
 void ServiceMain::HandlePipeClient(HANDLE pipe) {
     Logger::Instance().Debug("ServiceMain::HandlePipeClient - Starting");
 
-    const size_t BUFFER_SIZE = 65536;
-
     while (running && !ShutdownCoordinator::Instance().isShuttingDown) {
         DWORD bytesRead;
-        std::vector<uint8_t> buffer(BUFFER_SIZE);
+        std::vector<uint8_t> buffer(4096);
 
         if (!ReadFile(pipe, buffer.data(), static_cast<DWORD>(buffer.size()), &bytesRead, nullptr)) {
             DWORD error = GetLastError();
@@ -444,59 +440,40 @@ void ServiceMain::HandlePipeClient(HANDLE pipe) {
             }
 
             case IPCMessageType::GetConfig: {
-                if (configManager) {
-                    auto config = configManager->GetConfig();
-                    response.data = IPCSerializer::SerializeServiceConfig(config);
-                }
+                auto config = configManager->GetConfig();
+                response.data = IPCSerializer::SerializeServiceConfig(config);
                 break;
             }
 
             case IPCMessageType::SetConfig: {
-                if (configManager) {
-                    auto config = IPCSerializer::DeserializeServiceConfig(msgData);
-                    configManager->SetConfig(config);
-                }
+                auto config = IPCSerializer::DeserializeServiceConfig(msgData);
+                configManager->SetConfig(config);
                 break;
             }
 
             case IPCMessageType::GetProcesses: {
-                if (processManager) {
-                    auto processes = processManager->GetAllProcesses();
-                    response.data = IPCSerializer::SerializeProcessList(processes);
-                }
+                auto processes = processManager->GetAllProcesses();
+                response.data = IPCSerializer::SerializeProcessList(processes);
                 break;
             }
 
             case IPCMessageType::SetSelectedProcesses: {
-                if (processManager && configManager) {
-                    auto processes = IPCSerializer::DeserializeStringList(msgData);
-
-                    Logger::Instance().Info("ServiceMain::HandlePipeClient - SetSelectedProcesses received " +
-                        std::to_string(processes.size()) + " processes");
-
-                    processManager->SetSelectedProcesses(processes);
-
-                    auto config = configManager->GetConfig();
-                    config.selectedProcesses = processes;
-                    configManager->SetConfig(config);
-
-                    Logger::Instance().Info("ServiceMain::HandlePipeClient - Configuration saved");
-                }
+                auto processes = IPCSerializer::DeserializeStringList(msgData);
+                processManager->SetSelectedProcesses(processes);
+                auto config = configManager->GetConfig();
+                config.selectedProcesses = processes;
+                configManager->SetConfig(config);
                 break;
             }
 
             case IPCMessageType::GetRoutes: {
-                if (routeController) {
-                    auto routes = routeController->GetActiveRoutes();
-                    response.data = IPCSerializer::SerializeRouteList(routes);
-                }
+                auto routes = routeController->GetActiveRoutes();
+                response.data = IPCSerializer::SerializeRouteList(routes);
                 break;
             }
 
             case IPCMessageType::ClearRoutes: {
-                if (routeController) {
-                    routeController->CleanupAllRoutes();
-                }
+                routeController->CleanupAllRoutes();
                 break;
             }
 
@@ -505,10 +482,10 @@ void ServiceMain::HandlePipeClient(HANDLE pipe) {
             }
 
             case IPCMessageType::SetAIPreload: {
-                if (!msgData.empty() && configManager && routeController) {
+                if (!msgData.empty()) {
                     bool enabled = msgData[0] != 0;
                     configManager->SetAIPreloadEnabled(enabled);
-                    if (enabled) {
+                    if (enabled && routeController) {
                         routeController->PreloadAIRoutes();
                     }
                 }

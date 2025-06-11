@@ -1,4 +1,5 @@
 ﻿// src/main.cpp
+#include <winsock2.h>
 #include <windows.h>
 #include <shellapi.h>
 #include <iostream>
@@ -68,7 +69,7 @@ void StopServiceThread() {
         return;
     }
 
-    const auto maxShutdownTime = std::chrono::seconds(5);
+    const auto maxShutdownTime = std::chrono::seconds(10);
     auto shutdownStart = std::chrono::steady_clock::now();
 
     try {
@@ -86,7 +87,7 @@ void StopServiceThread() {
 
         if (g_shutdownEvent) {
             Logger::Instance().Debug("StopServiceThread - Waiting for shutdown event");
-            DWORD result = WaitForSingleObject(g_shutdownEvent, 2000);
+            DWORD result = WaitForSingleObject(g_shutdownEvent, 5000);
             if (result == WAIT_TIMEOUT) {
                 Logger::Instance().Warning("StopServiceThread - Service thread did not complete within timeout");
             }
@@ -108,6 +109,10 @@ void StopServiceThread() {
     catch (...) {
         Logger::Instance().Error("StopServiceThread - Unknown exception during shutdown");
     }
+
+    Logger::Instance().Debug("StopServiceThread - Deleting service instance");
+    delete g_service;
+    g_service = nullptr;
 
     Logger::Instance().Info("StopServiceThread - Completed");
 }
@@ -155,9 +160,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     try {
         Logger::Instance().Debug("WinMain - Starting service thread");
         g_serviceThread = std::thread(RunServiceInThread);
-
-        // Give service time to start
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
         Logger::Instance().Debug("WinMain - Starting MainWindow");
         result = MainWindow::Run(hInstance, nCmdShow);

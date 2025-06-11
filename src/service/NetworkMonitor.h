@@ -2,7 +2,7 @@
 #pragma once
 #include <winsock2.h>
 #include <windows.h>
-#include <windivert.h>
+#include "../../libs/WinDivert/include/windivert.h"
 #include <atomic>
 #include <thread>
 #include <unordered_map>
@@ -11,10 +11,11 @@
 
 class RouteController;
 class ProcessManager;
+class PacketInterceptor;
 
 class NetworkMonitor {
 public:
-    NetworkMonitor(RouteController* routeController, ProcessManager* processManager);
+    NetworkMonitor(RouteController* routeController, ProcessManager* processManager, PacketInterceptor* packetInterceptor);
     ~NetworkMonitor();
 
     void Start();
@@ -24,11 +25,11 @@ public:
 private:
     RouteController* routeController;
     ProcessManager* processManager;
+    PacketInterceptor* packetInterceptor;
 
     HANDLE divertHandle;
     std::atomic<bool> running;
     std::atomic<bool> active;
-    std::atomic<bool> isStoppingFlag;
     std::thread monitorThread;
 
     struct ConnectionInfo {

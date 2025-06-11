@@ -5,7 +5,8 @@
 #include <mutex>
 #include <chrono>
 #include <sstream>
-#include <filesystem>
+#include <windows.h>
+#include <direct.h>
 
 class Logger {
 public:
@@ -17,8 +18,7 @@ public:
     void Log(const std::string& message) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!logFile_.is_open()) {
-            // Создаем папку logs если её нет
-            std::filesystem::create_directories("logs");
+            _mkdir("logs");
             logFile_.open("logs/route_manager.log", std::ios::app);
         }
 
@@ -26,7 +26,9 @@ public:
         auto time_t = std::chrono::system_clock::to_time_t(now);
 
         char timeStr[100];
-        strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", localtime(&time_t));
+        struct tm timeinfo;
+        localtime_s(&timeinfo, &time_t);
+        strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
 
         logFile_ << "[" << timeStr << "] " << message << std::endl;
         logFile_.flush();

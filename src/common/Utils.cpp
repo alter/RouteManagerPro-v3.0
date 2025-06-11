@@ -3,8 +3,10 @@
 #include <regex>
 #include <sstream>
 #include <iomanip>
-#include <filesystem>
 #include <tlhelp32.h>
+#include <windows.h>
+#include <io.h>
+#include <direct.h>
 
 bool Utils::IsValidIPv4(const std::string& ip) {
     std::regex ipPattern("^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$");
@@ -163,12 +165,12 @@ std::string Utils::GetCurrentDirectory() {
 }
 
 bool Utils::FileExists(const std::string& path) {
-    return std::filesystem::exists(path);
+    return _access(path.c_str(), 0) == 0;
 }
 
 bool Utils::CreateDirectoryIfNotExists(const std::string& path) {
-    if (!std::filesystem::exists(path)) {
-        return std::filesystem::create_directories(path);
+    if (_access(path.c_str(), 0) != 0) {
+        return _mkdir(path.c_str()) == 0 || errno == EEXIST;
     }
     return true;
 }

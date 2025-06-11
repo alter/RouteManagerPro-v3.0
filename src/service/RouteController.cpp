@@ -9,14 +9,12 @@
 #include <netioapi.h>
 #include <sstream>
 #include <fstream>
-#include <filesystem>
 #include <chrono>
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
 
-RouteController::RouteController(const ServiceConfig& cfg) : config(cfg), running(true),
-lastSaveTime(std::chrono::steady_clock::now()) {
+RouteController::RouteController(const ServiceConfig& cfg) : config(cfg), running(true) {
     LoadRoutesFromDisk();
     verifyThread = std::thread(&RouteController::VerifyRoutesThreadFunc, this);
     if (config.aiPreloadEnabled) {
@@ -44,12 +42,14 @@ bool RouteController::AddRoute(const std::string& ip, const std::string& process
     auto it = routes.find(ip);
     if (it != routes.end()) {
         it->second->refCount++;
+        Logger::Instance().Info("Route already exists, incrementing ref count: " + ip + " (refs: " + std::to_string(it->second->refCount.load()) + ")");
         return true;
     }
 
     if (AddSystemRoute(ip)) {
         routes[ip] = std::make_unique<RouteInfo>(ip, processName);
         Logger::Instance().Info("Added new route: " + ip + " for process: " + processName);
+        SaveRoutesToDisk();
         return true;
     }
 
@@ -66,6 +66,7 @@ bool RouteController::RemoveRoute(const std::string& ip) {
         if (RemoveSystemRoute(ip)) {
             Logger::Instance().Info("Removed route: " + ip);
             routes.erase(it);
+            SaveRoutesToDisk();
             return true;
         }
     }
@@ -77,8 +78,9 @@ void RouteController::CleanupAllRoutes() {
     Logger::Instance().Info("CleanupAllRoutes - Starting cleanup of all routes");
     std::lock_guard<std::mutex> lock(routesMutex);
 
-    for (const auto& [ip, route] : routes) {
-        Logger::Instance().Debug("Removing Windows route for: " + ip);
+    for (auto it = routes.begin(); it != routes.end(); ++it) {
+        std::string ip = it->first;
+        Logger::Instance().Info("Removing Windows route for: " + ip);
         if (!RemoveSystemRoute(ip)) {
             Logger::Instance().Error("Failed to remove Windows route for: " + ip);
         }
@@ -113,18 +115,12 @@ size_t RouteController::GetRouteCount() const {
 std::vector<RouteInfo> RouteController::GetActiveRoutes() const {
     std::lock_guard<std::mutex> lock(routesMutex);
     std::vector<RouteInfo> result;
-    result.reserve(routes.size());
 
-    for (const auto& [ip, route] : routes) {
-        result.push_back(*route);
+    for (auto it = routes.begin(); it != routes.end(); ++it) {
+        result.push_back(*(it->second));
     }
 
     return result;
-}
-
-bool RouteController::RouteExists(const std::string& ip) const {
-    std::lock_guard<std::mutex> lock(routesMutex);
-    return routes.find(ip) != routes.end();
 }
 
 bool RouteController::AddSystemRoute(const std::string& ip) {
@@ -160,12 +156,18 @@ bool RouteController::AddSystemRoute(const std::string& ip) {
     route.Protocol = MIB_IPPROTO_NETMGMT;
     route.Metric = config.metric;
 
+    Logger::Instance().Debug("Adding route via CreateIpForwardEntry2: " + ip +
+        " -> " + config.gatewayIp +
+        " (interface: " + std::to_string(bestInterface) + ")");
+
     result = CreateIpForwardEntry2(&route);
 
     if (result == NO_ERROR) {
+        Logger::Instance().Info("Successfully added route: " + ip + " -> " + config.gatewayIp);
         return true;
     }
     else if (result == ERROR_OBJECT_ALREADY_EXISTS) {
+        Logger::Instance().Debug("Route already exists: " + ip);
         return true;
     }
     else {
@@ -180,22 +182,26 @@ bool RouteController::AddSystemRoute(const std::string& ip) {
 }
 
 bool RouteController::AddSystemRouteOldAPI(const std::string& ip) {
+    Logger::Instance().Info("Falling back to old API for compatibility");
+
     MIB_IPFORWARDROW route = { 0 };
 
-    route.dwForwardDest = inet_addr(ip.c_str());
-    if (route.dwForwardDest == INADDR_NONE) {
+    struct in_addr addr;
+    if (inet_pton(AF_INET, ip.c_str(), &addr) != 1) {
         Logger::Instance().Error("Invalid IP address: " + ip);
         return false;
     }
+    route.dwForwardDest = addr.s_addr;
 
     route.dwForwardMask = 0xFFFFFFFF;
     route.dwForwardPolicy = 0;
-    route.dwForwardNextHop = inet_addr(config.gatewayIp.c_str());
 
-    if (route.dwForwardNextHop == INADDR_NONE) {
+    struct in_addr gwAddr;
+    if (inet_pton(AF_INET, config.gatewayIp.c_str(), &gwAddr) != 1) {
         Logger::Instance().Error("Invalid gateway IP: " + config.gatewayIp);
         return false;
     }
+    route.dwForwardNextHop = gwAddr.s_addr;
 
     DWORD bestInterface = 0;
     DWORD result = GetBestInterface(route.dwForwardNextHop, &bestInterface);
@@ -215,6 +221,12 @@ bool RouteController::AddSystemRouteOldAPI(const std::string& ip) {
     result = GetIpInterfaceEntry(&iface);
     if (result == NO_ERROR) {
         minMetric = iface.Metric + config.metric;
+        Logger::Instance().Info("Interface metric: " + std::to_string(iface.Metric) +
+            ", using route metric: " + std::to_string(minMetric));
+    }
+    else {
+        Logger::Instance().Warning("GetIpInterfaceEntry failed: " + std::to_string(result) +
+            ", using default metric");
     }
 
     route.dwForwardType = 4;
@@ -230,9 +242,11 @@ bool RouteController::AddSystemRouteOldAPI(const std::string& ip) {
     result = CreateIpForwardEntry(&route);
 
     if (result == NO_ERROR) {
+        Logger::Instance().Info("Successfully added route via old API: " + ip);
         return true;
     }
     else if (result == ERROR_OBJECT_ALREADY_EXISTS) {
+        Logger::Instance().Debug("Route already exists: " + ip);
         return true;
     }
     else {
@@ -245,14 +259,20 @@ bool RouteController::RemoveSystemRoute(const std::string& ip) {
     MIB_IPFORWARDROW route;
     ZeroMemory(&route, sizeof(MIB_IPFORWARDROW));
 
-    route.dwForwardDest = inet_addr(ip.c_str());
-    if (route.dwForwardDest == INADDR_NONE) {
+    struct in_addr addr;
+    if (inet_pton(AF_INET, ip.c_str(), &addr) != 1) {
         Logger::Instance().Error("Invalid IP address: " + ip);
         return false;
     }
+    route.dwForwardDest = addr.s_addr;
 
-    route.dwForwardMask = inet_addr("255.255.255.255");
-    route.dwForwardNextHop = inet_addr(config.gatewayIp.c_str());
+    struct in_addr maskAddr;
+    inet_pton(AF_INET, "255.255.255.255", &maskAddr);
+    route.dwForwardMask = maskAddr.s_addr;
+
+    struct in_addr gwAddr;
+    inet_pton(AF_INET, config.gatewayIp.c_str(), &gwAddr);
+    route.dwForwardNextHop = gwAddr.s_addr;
 
     ULONG bestInterface;
     if (GetBestInterface(route.dwForwardNextHop, &bestInterface) == NO_ERROR) {
@@ -262,9 +282,11 @@ bool RouteController::RemoveSystemRoute(const std::string& ip) {
     DWORD result = DeleteIpForwardEntry(&route);
 
     if (result == NO_ERROR) {
+        Logger::Instance().Debug("Successfully removed route via API: " + ip);
         return true;
     }
     else if (result == ERROR_NOT_FOUND) {
+        Logger::Instance().Debug("Route not found: " + ip);
         return true;
     }
     else {
@@ -275,45 +297,28 @@ bool RouteController::RemoveSystemRoute(const std::string& ip) {
 
 void RouteController::VerifyRoutesThreadFunc() {
     while (running.load()) {
-        for (int i = 0; i < Constants::ROUTE_VERIFY_INTERVAL_SEC; i++) {
-            if (!running.load()) break;
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
-
-        if (!running.load()) break;
+        std::this_thread::sleep_for(std::chrono::seconds(Constants::ROUTE_VERIFY_INTERVAL_SEC));
 
         if (!IsGatewayReachable()) {
             continue;
         }
 
         std::lock_guard<std::mutex> lock(routesMutex);
-
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::minutes>(now - lastSaveTime).count();
-
-        if (elapsed >= 10) {
-            SaveRoutesToDisk();
-            lastSaveTime = now;
-        }
-
-        for (const auto& [ip, route] : routes) {
-            AddSystemRoute(ip);
+        for (auto it = routes.begin(); it != routes.end(); ++it) {
+            AddSystemRoute(it->first);
         }
     }
 }
 
 void RouteController::SaveRoutesToDisk() {
-    if (routes.empty()) return;
-
-    Logger::Instance().Debug("Saving " + std::to_string(routes.size()) + " routes to disk");
-
     std::ofstream file(Constants::STATE_FILE + ".tmp");
     if (!file.is_open()) return;
 
     file << "version=1\n";
     file << "timestamp=" << std::chrono::system_clock::now().time_since_epoch().count() << "\n";
 
-    for (const auto& [ip, route] : routes) {
+    for (auto it = routes.begin(); it != routes.end(); ++it) {
+        RouteInfo* route = it->second.get();
         file << "route=" << route->ip << "," << route->processName << ","
             << route->createdAt.time_since_epoch().count() << "\n";
     }
@@ -347,12 +352,15 @@ void RouteController::LoadRoutesFromDisk() {
             }
         }
     }
-
-    Logger::Instance().Info("Loaded " + std::to_string(routes.size()) + " routes from disk");
 }
 
 bool RouteController::IsGatewayReachable() {
-    ULONG destAddr = inet_addr(config.gatewayIp.c_str());
+    struct in_addr addr;
+    if (inet_pton(AF_INET, config.gatewayIp.c_str(), &addr) != 1) {
+        return false;
+    }
+
+    ULONG destAddr = addr.s_addr;
     ULONG srcAddr = INADDR_ANY;
     ULONG bestIfIndex;
 
@@ -364,33 +372,18 @@ bool RouteController::IsGatewayReachable() {
 }
 
 void RouteController::PreloadAIRoutes() {
-    Logger::Instance().Info("PreloadAIRoutes - Starting AI routes preloading");
     auto aiRanges = GetAIServiceRanges();
-    int addedCount = 0;
-    int skippedCount = 0;
 
     for (const auto& service : aiRanges) {
         for (const auto& range : service.ranges) {
             if (range.find('/') != std::string::npos) {
-                auto result = AddCIDRRoutes(range, service.service);
-                addedCount += result.first;
-                skippedCount += result.second;
+                AddCIDRRoutes(range, service.service);
             }
             else {
-                if (!RouteExists(range)) {
-                    if (AddRoute(range, "AI-" + service.service)) {
-                        addedCount++;
-                    }
-                }
-                else {
-                    skippedCount++;
-                }
+                AddRoute(range, "AI-" + service.service);
             }
         }
     }
-
-    Logger::Instance().Info("PreloadAIRoutes - Completed: " + std::to_string(addedCount) +
-        " added, " + std::to_string(skippedCount) + " already existed");
 }
 
 std::vector<RouteController::AIServiceRange> RouteController::GetAIServiceRanges() {
@@ -417,68 +410,40 @@ std::vector<RouteController::AIServiceRange> RouteController::GetAIServiceRanges
     };
 }
 
-std::pair<int, int> RouteController::AddCIDRRoutes(const std::string& cidr, const std::string& service) {
-    int added = 0;
-    int skipped = 0;
-
+void RouteController::AddCIDRRoutes(const std::string& cidr, const std::string& service) {
     size_t slashPos = cidr.find('/');
-    if (slashPos == std::string::npos) return { 0, 0 };
+    if (slashPos == std::string::npos) return;
 
     std::string baseIp = cidr.substr(0, slashPos);
     int prefixLen = std::stoi(cidr.substr(slashPos + 1));
 
     if (prefixLen >= 24) {
-        if (!RouteExists(baseIp)) {
-            if (AddRoute(baseIp, "AI-" + service)) {
-                added++;
-            }
-        }
-        else {
-            skipped++;
-        }
-        return { added, skipped };
+        AddRoute(baseIp, "AI-" + service);
+        return;
     }
 
-    ULONG addr = inet_addr(baseIp.c_str());
-    addr = ntohl(addr);
+    struct in_addr addr;
+    if (inet_pton(AF_INET, baseIp.c_str(), &addr) != 1) {
+        return;
+    }
 
-    ULONG firstAddr = addr & (0xFFFFFFFF << (32 - prefixLen));
+    ULONG ipAddr = ntohl(addr.s_addr);
+
+    ULONG firstAddr = ipAddr & (0xFFFFFFFF << (32 - prefixLen));
     ULONG lastAddr = firstAddr | (0xFFFFFFFF >> prefixLen);
 
     in_addr inAddr;
+    char ipStr[INET_ADDRSTRLEN];
 
     inAddr.s_addr = htonl(firstAddr);
-    std::string firstIp = inet_ntoa(inAddr);
-    if (!RouteExists(firstIp)) {
-        if (AddRoute(firstIp, "AI-" + service)) {
-            added++;
-        }
-    }
-    else {
-        skipped++;
-    }
+    inet_ntop(AF_INET, &inAddr, ipStr, INET_ADDRSTRLEN);
+    AddRoute(ipStr, "AI-" + service);
 
     inAddr.s_addr = htonl(firstAddr + 1);
-    std::string secondIp = inet_ntoa(inAddr);
-    if (!RouteExists(secondIp)) {
-        if (AddRoute(secondIp, "AI-" + service)) {
-            added++;
-        }
-    }
-    else {
-        skipped++;
-    }
+    inet_ntop(AF_INET, &inAddr, ipStr, INET_ADDRSTRLEN);
+    AddRoute(ipStr, "AI-" + service);
 
     inAddr.s_addr = htonl(lastAddr - 1);
-    std::string lastIp = inet_ntoa(inAddr);
-    if (!RouteExists(lastIp)) {
-        if (AddRoute(lastIp, "AI-" + service)) {
-            added++;
-        }
-    }
-    else {
-        skipped++;
-    }
-
-    return { added, skipped };
+    inet_ntop(AF_INET, &inAddr, ipStr, INET_ADDRSTRLEN);
+    AddRoute(ipStr, "AI-" + service);
 }

@@ -66,16 +66,9 @@ void RouteTable::Refresh() {
 }
 
 void RouteTable::UpdateRouteList() {
-    size_t previousCount = routes.size();
-
     routes = serviceClient->GetRoutes();
 
     Logger::Instance().Debug("RouteTable::UpdateRouteList - Got " + std::to_string(routes.size()) + " routes");
-
-    std::sort(routes.begin(), routes.end(),
-        [](const RouteInfo& a, const RouteInfo& b) {
-            return a.createdAt > b.createdAt;
-        });
 
     SendMessage(listView, WM_SETREDRAW, FALSE, 0);
     ListView_DeleteAllItems(listView);
@@ -97,36 +90,23 @@ void RouteTable::UpdateRouteList() {
             ListView_SetItemText(listView, index, 1, const_cast<LPWSTR>(process.c_str()));
 
             auto now = std::chrono::system_clock::now();
-            auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - route.createdAt);
-
-            wchar_t timeStr[64];
+            auto duration = std::chrono::duration_cast<std::chrono::minutes>(now - route.createdAt);
+            std::wstringstream timeStr;
             if (duration.count() < 60) {
-                swprintf_s(timeStr, L"Just now");
-            }
-            else if (duration.count() < 3600) {
-                swprintf_s(timeStr, L"%lldm ago", duration.count() / 60);
-            }
-            else if (duration.count() < 86400) {
-                swprintf_s(timeStr, L"%lldh %lldm ago", duration.count() / 3600, (duration.count() % 3600) / 60);
+                timeStr << duration.count() << L"m ago";
             }
             else {
-                swprintf_s(timeStr, L"%lldd ago", duration.count() / 86400);
+                timeStr << duration.count() / 60 << L"h ago";
             }
+            ListView_SetItemText(listView, index, 2, const_cast<LPWSTR>(timeStr.str().c_str()));
 
-            ListView_SetItemText(listView, index, 2, timeStr);
-
-            wchar_t refs[32];
-            swprintf_s(refs, L"%d", route.refCount.load());
-            ListView_SetItemText(listView, index, 3, refs);
+            std::wstring refs = std::to_wstring(route.refCount.load());
+            ListView_SetItemText(listView, index, 3, const_cast<LPWSTR>(refs.c_str()));
         }
     }
 
     SendMessage(listView, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(listView, NULL, TRUE);
-
-    if (routes.size() > previousCount && routes.size() > 0) {
-        ListView_EnsureVisible(listView, 0, FALSE);
-    }
 }
 
 void RouteTable::HandleCommand(WPARAM wParam) {

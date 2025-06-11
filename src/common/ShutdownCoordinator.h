@@ -43,7 +43,10 @@ public:
         auto start = std::chrono::steady_clock::now();
 
         std::lock_guard<std::mutex> lock(threadMutex);
-        for (auto& [name, thread] : threads) {
+        for (auto it = threads.begin(); it != threads.end(); ++it) {
+            std::string name = it->first;
+            std::thread* thread = it->second;
+
             if (thread && thread->joinable()) {
                 auto remaining = timeout - std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - start);

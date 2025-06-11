@@ -1,5 +1,9 @@
 // src/ui/ProcessPanel.h
 #pragma once
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
 #include <windows.h>
 #include <commctrl.h>
 #include <vector>
@@ -12,6 +16,7 @@ class ServiceClient;
 struct ProcessDisplayInfo {
     std::wstring name;
     std::wstring path;
+    std::wstring type;
     bool isSelected;
     bool isRunning;
 };
