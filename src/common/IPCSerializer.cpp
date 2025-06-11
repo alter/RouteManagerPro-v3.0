@@ -1,4 +1,4 @@
-// src/common/IPCSerializer.cpp
+﻿// src/common/IPCSerializer.cpp
 #include "IPCProtocol.h"
 #include <cstring>
 
@@ -255,7 +255,7 @@ std::vector<uint8_t> IPCSerializer::SerializeRouteList(const std::vector<RouteIn
     size_t totalSize = sizeof(size_t);
     for (const auto& route : routes) {
         totalSize += sizeof(size_t) * 2 + route.ip.size() + route.processName.size() +
-            sizeof(int) + sizeof(int64_t);
+            sizeof(int) + sizeof(int64_t) + sizeof(int); // добавили sizeof(int) для prefixLength
     }
 
     data.resize(totalSize);
@@ -288,6 +288,10 @@ std::vector<uint8_t> IPCSerializer::SerializeRouteList(const std::vector<RouteIn
             route.createdAt.time_since_epoch()).count();
         memcpy(data.data() + offset, &createdAt, sizeof(int64_t));
         offset += sizeof(int64_t);
+
+        // Добавляем prefixLength
+        memcpy(data.data() + offset, &route.prefixLength, sizeof(int));
+        offset += sizeof(int);
     }
 
     return data;
@@ -325,7 +329,7 @@ std::vector<RouteInfo> IPCSerializer::DeserializeRouteList(const std::vector<uin
         std::string processName(reinterpret_cast<const char*>(data.data() + offset), processLen);
         offset += processLen;
 
-        if (offset + sizeof(int) + sizeof(int64_t) > data.size()) break;
+        if (offset + sizeof(int) + sizeof(int64_t) + sizeof(int) > data.size()) break;
 
         RouteInfo route(ip, processName);
 
@@ -338,6 +342,10 @@ std::vector<RouteInfo> IPCSerializer::DeserializeRouteList(const std::vector<uin
         memcpy(&createdAt, data.data() + offset, sizeof(int64_t));
         route.createdAt = std::chrono::system_clock::time_point(std::chrono::seconds(createdAt));
         offset += sizeof(int64_t);
+
+        // Читаем prefixLength
+        memcpy(&route.prefixLength, data.data() + offset, sizeof(int));
+        offset += sizeof(int);
 
         routes.push_back(route);
     }

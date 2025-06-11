@@ -1,6 +1,14 @@
 ﻿// src/ui/MainWindow.cpp
+#define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
+#include <shellapi.h>
+#include <commctrl.h>
+#include <windowsx.h>
+#include <sstream>
+#include <thread>
+
 #include "MainWindow.h"
 #include "ServiceClient.h"
 #include "SystemTray.h"
@@ -10,16 +18,13 @@
 #include "../common/Utils.h"
 #include "../common/Logger.h"
 #include "../common/ShutdownCoordinator.h"
-#include <commctrl.h>
-#include <windowsx.h>
-#include <sstream>
-#include <thread>
 
 #pragma comment(lib, "comctl32.lib")
 
 MainWindow* MainWindow::instance = nullptr;
 
-MainWindow::MainWindow(HINSTANCE hInst) : hwnd(nullptr), hInstance(hInst), isShuttingDown(false) {
+MainWindow::MainWindow(HINSTANCE hInst) : hwnd(nullptr), hInstance(hInst), isShuttingDown(false),
+lastWidth(850), lastHeight(650) {
     instance = this;
 }
 
@@ -210,6 +215,9 @@ LRESULT CALLBACK MainWindow::WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         if (wParam == SIZE_MINIMIZED) {
             ShowWindow(hwnd, SW_HIDE);
         }
+        else if (wParam == SIZE_RESTORED || wParam == SIZE_MAXIMIZED) {
+            instance->OnSize(LOWORD(lParam), HIWORD(lParam));
+        }
         return 0;
 
     case WM_NOTIFY: {
@@ -233,6 +241,28 @@ LRESULT CALLBACK MainWindow::WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
+void MainWindow::OnSize(int width, int height) {
+    if (width == 0 || height == 0) return;
+
+    lastWidth = width;
+    lastHeight = height;
+
+    int statusWidth = width - 230;
+    SetWindowPos(statusLabel, NULL, 230, 30, statusWidth - 10, 90, SWP_NOZORDER);
+
+    int panelWidth = width - 20;
+    if (processPanel) {
+        processPanel->Resize(10, 140, panelWidth, 240);
+    }
+
+    if (routeTable) {
+        routeTable->Resize(10, 390, panelWidth, height - 440);
+    }
+
+    SetWindowPos(minimizeButton, NULL, 10, height - 50, 120, 30, SWP_NOZORDER);
+    SetWindowPos(viewLogsButton, NULL, 140, height - 50, 100, 30, SWP_NOZORDER);
+}
+
 void MainWindow::OnClose() {
     Logger::Instance().Info("MainWindow::OnClose - Starting shutdown sequence");
 
@@ -249,9 +279,8 @@ void MainWindow::OnClose() {
     ShutdownCoordinator::Instance().InitiateShutdown();
 
     if (serviceClient && serviceClient->IsConnected()) {
-        Logger::Instance().Info("Saving configuration before shutdown");
-        serviceClient->SetConfig(config);
-
+        // НЕ сохраняем локальную config, так как она может быть устаревшей!
+        // Сервис уже имеет актуальную конфигурацию
         Logger::Instance().Info("Disconnecting from service");
         serviceClient->Disconnect();
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -305,6 +334,15 @@ void MainWindow::OnApplyConfig() {
     GetWindowTextA(metricEdit, buffer, sizeof(buffer));
     config.metric = std::stoi(buffer);
 
+    // Получаем актуальный список выбранных процессов с сервиса
+    if (serviceClient && serviceClient->IsConnected()) {
+        ServiceConfig currentConfig = serviceClient->GetConfig();
+        config.selectedProcesses = currentConfig.selectedProcesses;
+        config.startMinimized = currentConfig.startMinimized;
+        config.startWithWindows = currentConfig.startWithWindows;
+        config.aiPreloadEnabled = currentConfig.aiPreloadEnabled;
+    }
+
     serviceClient->SetConfig(config);
 }
 
@@ -321,6 +359,12 @@ void MainWindow::OnViewLogs() {
 
 void MainWindow::OnAIPreloadToggle() {
     bool checked = SendMessage(aiPreloadCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED;
+
+    // Получаем актуальную конфигурацию с сервиса перед изменением
+    if (serviceClient && serviceClient->IsConnected()) {
+        config = serviceClient->GetConfig();
+    }
+
     config.aiPreloadEnabled = checked;
     serviceClient->SetAIPreload(checked);
 }

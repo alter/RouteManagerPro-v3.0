@@ -1,16 +1,22 @@
 ﻿// src/ui/RouteTable.cpp
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <commctrl.h>
+#include <sstream>
+#include <iomanip>
+#include <chrono>
+
 #include "RouteTable.h"
 #include "ServiceClient.h"
 #include "../common/Utils.h"
 #include "../common/Logger.h"
-#include <commctrl.h>
-#include <sstream>
-#include <iomanip>
 
 #pragma comment(lib, "comctl32.lib")
 
 RouteTable::RouteTable(HWND parent, ServiceClient* client)
-    : parentWnd(parent), listView(nullptr), cleanRoutesButton(nullptr), serviceClient(client) {
+    : parentWnd(parent), listView(nullptr), cleanRoutesButton(nullptr), serviceClient(client), currentScrollPos(-1) {
 }
 
 RouteTable::~RouteTable() {
@@ -65,7 +71,26 @@ void RouteTable::Refresh() {
     UpdateRouteList();
 }
 
+void RouteTable::SaveScrollPosition() {
+    SCROLLINFO si;
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_POS;
+    if (GetScrollInfo(listView, SB_VERT, &si)) {
+        currentScrollPos = si.nPos;
+    }
+}
+
+void RouteTable::RestoreScrollPosition() {
+    if (currentScrollPos >= 0) {
+        ListView_EnsureVisible(listView, currentScrollPos, FALSE);
+        currentScrollPos = -1;
+    }
+}
+
+// src/ui/RouteTable.cpp - только метод UpdateRouteList
 void RouteTable::UpdateRouteList() {
+    SaveScrollPosition();
+
     routes = serviceClient->GetRoutes();
 
     Logger::Instance().Debug("RouteTable::UpdateRouteList - Got " + std::to_string(routes.size()) + " routes");
@@ -80,25 +105,59 @@ void RouteTable::UpdateRouteList() {
         item.mask = LVIF_TEXT;
         item.iItem = static_cast<int>(i);
 
-        std::wstring ip = Utils::StringToWString(route.ip);
+        std::wstring ipDisplay = Utils::StringToWString(route.ip) + L"/" + std::to_wstring(route.prefixLength);
         item.iSubItem = 0;
-        item.pszText = const_cast<LPWSTR>(ip.c_str());
+        item.pszText = const_cast<LPWSTR>(ipDisplay.c_str());
         int index = ListView_InsertItem(listView, &item);
 
         if (index != -1) {
             std::wstring process = Utils::StringToWString(route.processName);
             ListView_SetItemText(listView, index, 1, const_cast<LPWSTR>(process.c_str()));
 
+            // Форматируем время
             auto now = std::chrono::system_clock::now();
-            auto duration = std::chrono::duration_cast<std::chrono::minutes>(now - route.createdAt);
-            std::wstringstream timeStr;
-            if (duration.count() < 60) {
-                timeStr << duration.count() << L"m ago";
+            auto duration = now - route.createdAt;
+
+            std::wstring timeStr;
+
+            // Проверяем что время создания валидное (не в будущем и не слишком старое)
+            if (duration.count() < 0 || duration > std::chrono::hours(24 * 365 * 10)) {
+                // Если время невалидное, показываем "Just now"
+                timeStr = L"Just now";
             }
             else {
-                timeStr << duration.count() / 60 << L"h ago";
+                auto seconds = std::chrono::duration_cast<std::chrono::seconds>(duration).count();
+                auto minutes = std::chrono::duration_cast<std::chrono::minutes>(duration).count();
+                auto hours = std::chrono::duration_cast<std::chrono::hours>(duration).count();
+                auto days = hours / 24;
+                auto weeks = days / 7;
+                auto months = days / 30;
+                auto years = days / 365;
+
+                if (seconds < 60) {
+                    timeStr = L"Just now";
+                }
+                else if (minutes < 60) {
+                    timeStr = std::to_wstring(minutes) + L"m ago";
+                }
+                else if (hours < 24) {
+                    timeStr = std::to_wstring(hours) + L"h ago";
+                }
+                else if (days < 7) {
+                    timeStr = std::to_wstring(days) + L"d ago";
+                }
+                else if (weeks < 4) {
+                    timeStr = std::to_wstring(weeks) + L"w ago";
+                }
+                else if (months < 12) {
+                    timeStr = std::to_wstring(months) + L"mo ago";
+                }
+                else {
+                    timeStr = std::to_wstring(years) + L"y ago";
+                }
             }
-            ListView_SetItemText(listView, index, 2, const_cast<LPWSTR>(timeStr.str().c_str()));
+
+            ListView_SetItemText(listView, index, 2, const_cast<LPWSTR>(timeStr.c_str()));
 
             std::wstring refs = std::to_wstring(route.refCount.load());
             ListView_SetItemText(listView, index, 3, const_cast<LPWSTR>(refs.c_str()));
@@ -107,6 +166,8 @@ void RouteTable::UpdateRouteList() {
 
     SendMessage(listView, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(listView, NULL, TRUE);
+
+    RestoreScrollPosition();
 }
 
 void RouteTable::HandleCommand(WPARAM wParam) {
@@ -129,4 +190,25 @@ void RouteTable::OnCleanAllRoutes() {
         MessageBox(parentWnd, L"All routes have been removed.", L"Success", MB_OK | MB_ICONINFORMATION);
         Refresh();
     }
+}
+
+void RouteTable::Resize(int x, int y, int width, int height) {
+    SetWindowPos(listView, NULL, x + 10, y + 25, width - 20, height - 65, SWP_NOZORDER);
+    SetWindowPos(cleanRoutesButton, NULL, x + 10, y + height - 35, 120, 25, SWP_NOZORDER);
+
+    LVCOLUMN column = { 0 };
+    column.mask = LVCF_WIDTH;
+
+    int totalWidth = width - 20 - GetSystemMetrics(SM_CXVSCROLL);
+    column.cx = 150;
+    ListView_SetColumn(listView, 0, &column);
+
+    column.cx = totalWidth - 150 - 100 - 50;
+    ListView_SetColumn(listView, 1, &column);
+
+    column.cx = 100;
+    ListView_SetColumn(listView, 2, &column);
+
+    column.cx = 50;
+    ListView_SetColumn(listView, 3, &column);
 }

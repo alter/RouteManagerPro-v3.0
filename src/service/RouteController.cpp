@@ -9,6 +9,7 @@
 #include <netioapi.h>
 #include <sstream>
 #include <fstream>
+#include <filesystem>
 #include <chrono>
 
 #pragma comment(lib, "iphlpapi.lib")
@@ -31,24 +32,32 @@ RouteController::~RouteController() {
 }
 
 bool RouteController::AddRoute(const std::string& ip, const std::string& processName) {
+    return AddRouteWithMask(ip, 32, processName);
+}
+
+bool RouteController::AddRouteWithMask(const std::string& ip, int prefixLength, const std::string& processName) {
     if (!Utils::IsValidIPv4(ip)) return false;
 
     std::lock_guard<std::mutex> lock(routesMutex);
+
+    std::string routeKey = ip + "/" + std::to_string(prefixLength);
 
     if (routes.size() >= Constants::MAX_ROUTES) {
         CleanupOldRoutes();
     }
 
-    auto it = routes.find(ip);
+    auto it = routes.find(routeKey);
     if (it != routes.end()) {
         it->second->refCount++;
-        Logger::Instance().Info("Route already exists, incrementing ref count: " + ip + " (refs: " + std::to_string(it->second->refCount.load()) + ")");
+        Logger::Instance().Info("Route already exists, incrementing ref count: " + routeKey + " (refs: " + std::to_string(it->second->refCount.load()) + ")");
         return true;
     }
 
-    if (AddSystemRoute(ip)) {
-        routes[ip] = std::make_unique<RouteInfo>(ip, processName);
-        Logger::Instance().Info("Added new route: " + ip + " for process: " + processName);
+    if (AddSystemRouteWithMask(ip, prefixLength)) {
+        auto routeInfo = std::make_unique<RouteInfo>(ip, processName);
+        routeInfo->prefixLength = prefixLength;
+        routes[routeKey] = std::move(routeInfo);
+        Logger::Instance().Info("Added new route: " + routeKey + " for process: " + processName);
         SaveRoutesToDisk();
         return true;
     }
@@ -57,14 +66,19 @@ bool RouteController::AddRoute(const std::string& ip, const std::string& process
 }
 
 bool RouteController::RemoveRoute(const std::string& ip) {
+    return RemoveRouteWithMask(ip, 32);
+}
+
+bool RouteController::RemoveRouteWithMask(const std::string& ip, int prefixLength) {
     std::lock_guard<std::mutex> lock(routesMutex);
 
-    auto it = routes.find(ip);
+    std::string routeKey = ip + "/" + std::to_string(prefixLength);
+    auto it = routes.find(routeKey);
     if (it == routes.end()) return false;
 
     if (--it->second->refCount <= 0) {
-        if (RemoveSystemRoute(ip)) {
-            Logger::Instance().Info("Removed route: " + ip);
+        if (RemoveSystemRouteWithMask(ip, prefixLength)) {
+            Logger::Instance().Info("Removed route: " + routeKey);
             routes.erase(it);
             SaveRoutesToDisk();
             return true;
@@ -78,11 +92,10 @@ void RouteController::CleanupAllRoutes() {
     Logger::Instance().Info("CleanupAllRoutes - Starting cleanup of all routes");
     std::lock_guard<std::mutex> lock(routesMutex);
 
-    for (auto it = routes.begin(); it != routes.end(); ++it) {
-        std::string ip = it->first;
-        Logger::Instance().Info("Removing Windows route for: " + ip);
-        if (!RemoveSystemRoute(ip)) {
-            Logger::Instance().Error("Failed to remove Windows route for: " + ip);
+    for (const auto& [routeKey, route] : routes) {
+        Logger::Instance().Info("Removing Windows route for: " + routeKey);
+        if (!RemoveSystemRouteWithMask(route->ip, route->prefixLength)) {
+            Logger::Instance().Error("Failed to remove Windows route for: " + routeKey);
         }
     }
 
@@ -98,7 +111,7 @@ void RouteController::CleanupOldRoutes() {
 
     for (auto it = routes.begin(); it != routes.end();) {
         if (it->second->createdAt < cutoff) {
-            RemoveSystemRoute(it->first);
+            RemoveSystemRouteWithMask(it->second->ip, it->second->prefixLength);
             it = routes.erase(it);
         }
         else {
@@ -116,14 +129,24 @@ std::vector<RouteInfo> RouteController::GetActiveRoutes() const {
     std::lock_guard<std::mutex> lock(routesMutex);
     std::vector<RouteInfo> result;
 
-    for (auto it = routes.begin(); it != routes.end(); ++it) {
-        result.push_back(*(it->second));
+    for (auto& [routeKey, route] : routes) {
+        result.push_back(*route);
     }
+
+    // Сортируем по времени создания - самые новые сверху
+    std::sort(result.begin(), result.end(),
+        [](const RouteInfo& a, const RouteInfo& b) {
+            return a.createdAt > b.createdAt;  // Обратный порядок - новые сверху
+        });
 
     return result;
 }
 
 bool RouteController::AddSystemRoute(const std::string& ip) {
+    return AddSystemRouteWithMask(ip, 32);
+}
+
+bool RouteController::AddSystemRouteWithMask(const std::string& ip, int prefixLength) {
     MIB_IPFORWARD_ROW2 route;
     InitializeIpForwardEntry(&route);
 
@@ -151,30 +174,30 @@ bool RouteController::AddSystemRoute(const std::string& ip) {
 
     route.InterfaceIndex = bestInterface;
     route.DestinationPrefix.Prefix = destAddr;
-    route.DestinationPrefix.PrefixLength = 32;
+    route.DestinationPrefix.PrefixLength = prefixLength;
     route.NextHop = nextHop;
     route.Protocol = MIB_IPPROTO_NETMGMT;
     route.Metric = config.metric;
 
-    Logger::Instance().Debug("Adding route via CreateIpForwardEntry2: " + ip +
+    Logger::Instance().Debug("Adding route via CreateIpForwardEntry2: " + ip + "/" + std::to_string(prefixLength) +
         " -> " + config.gatewayIp +
         " (interface: " + std::to_string(bestInterface) + ")");
 
     result = CreateIpForwardEntry2(&route);
 
     if (result == NO_ERROR) {
-        Logger::Instance().Info("Successfully added route: " + ip + " -> " + config.gatewayIp);
+        Logger::Instance().Info("Successfully added route: " + ip + "/" + std::to_string(prefixLength) + " -> " + config.gatewayIp);
         return true;
     }
     else if (result == ERROR_OBJECT_ALREADY_EXISTS) {
-        Logger::Instance().Debug("Route already exists: " + ip);
+        Logger::Instance().Debug("Route already exists: " + ip + "/" + std::to_string(prefixLength));
         return true;
     }
     else {
         Logger::Instance().Error("CreateIpForwardEntry2 failed: " + std::to_string(result));
 
         if (result == ERROR_NOT_FOUND || result == ERROR_INVALID_FUNCTION) {
-            return AddSystemRouteOldAPI(ip);
+            return AddSystemRouteOldAPIWithMask(ip, prefixLength);
         }
 
         return false;
@@ -182,26 +205,31 @@ bool RouteController::AddSystemRoute(const std::string& ip) {
 }
 
 bool RouteController::AddSystemRouteOldAPI(const std::string& ip) {
+    return AddSystemRouteOldAPIWithMask(ip, 32);
+}
+
+bool RouteController::AddSystemRouteOldAPIWithMask(const std::string& ip, int prefixLength) {
     Logger::Instance().Info("Falling back to old API for compatibility");
 
     MIB_IPFORWARDROW route = { 0 };
 
-    struct in_addr addr;
-    if (inet_pton(AF_INET, ip.c_str(), &addr) != 1) {
+    route.dwForwardDest = inet_addr(ip.c_str());
+    if (route.dwForwardDest == INADDR_NONE) {
         Logger::Instance().Error("Invalid IP address: " + ip);
         return false;
     }
-    route.dwForwardDest = addr.s_addr;
 
-    route.dwForwardMask = 0xFFFFFFFF;
+    // Calculate subnet mask from prefix length
+    DWORD mask = prefixLength == 0 ? 0 : (0xFFFFFFFF << (32 - prefixLength));
+    route.dwForwardMask = htonl(mask);
+
     route.dwForwardPolicy = 0;
+    route.dwForwardNextHop = inet_addr(config.gatewayIp.c_str());
 
-    struct in_addr gwAddr;
-    if (inet_pton(AF_INET, config.gatewayIp.c_str(), &gwAddr) != 1) {
+    if (route.dwForwardNextHop == INADDR_NONE) {
         Logger::Instance().Error("Invalid gateway IP: " + config.gatewayIp);
         return false;
     }
-    route.dwForwardNextHop = gwAddr.s_addr;
 
     DWORD bestInterface = 0;
     DWORD result = GetBestInterface(route.dwForwardNextHop, &bestInterface);
@@ -242,11 +270,11 @@ bool RouteController::AddSystemRouteOldAPI(const std::string& ip) {
     result = CreateIpForwardEntry(&route);
 
     if (result == NO_ERROR) {
-        Logger::Instance().Info("Successfully added route via old API: " + ip);
+        Logger::Instance().Info("Successfully added route via old API: " + ip + "/" + std::to_string(prefixLength));
         return true;
     }
     else if (result == ERROR_OBJECT_ALREADY_EXISTS) {
-        Logger::Instance().Debug("Route already exists: " + ip);
+        Logger::Instance().Debug("Route already exists: " + ip + "/" + std::to_string(prefixLength));
         return true;
     }
     else {
@@ -256,23 +284,24 @@ bool RouteController::AddSystemRouteOldAPI(const std::string& ip) {
 }
 
 bool RouteController::RemoveSystemRoute(const std::string& ip) {
+    return RemoveSystemRouteWithMask(ip, 32);
+}
+
+bool RouteController::RemoveSystemRouteWithMask(const std::string& ip, int prefixLength) {
     MIB_IPFORWARDROW route;
     ZeroMemory(&route, sizeof(MIB_IPFORWARDROW));
 
-    struct in_addr addr;
-    if (inet_pton(AF_INET, ip.c_str(), &addr) != 1) {
+    route.dwForwardDest = inet_addr(ip.c_str());
+    if (route.dwForwardDest == INADDR_NONE) {
         Logger::Instance().Error("Invalid IP address: " + ip);
         return false;
     }
-    route.dwForwardDest = addr.s_addr;
 
-    struct in_addr maskAddr;
-    inet_pton(AF_INET, "255.255.255.255", &maskAddr);
-    route.dwForwardMask = maskAddr.s_addr;
+    // Calculate subnet mask from prefix length
+    DWORD mask = prefixLength == 0 ? 0 : (0xFFFFFFFF << (32 - prefixLength));
+    route.dwForwardMask = htonl(mask);
 
-    struct in_addr gwAddr;
-    inet_pton(AF_INET, config.gatewayIp.c_str(), &gwAddr);
-    route.dwForwardNextHop = gwAddr.s_addr;
+    route.dwForwardNextHop = inet_addr(config.gatewayIp.c_str());
 
     ULONG bestInterface;
     if (GetBestInterface(route.dwForwardNextHop, &bestInterface) == NO_ERROR) {
@@ -282,15 +311,15 @@ bool RouteController::RemoveSystemRoute(const std::string& ip) {
     DWORD result = DeleteIpForwardEntry(&route);
 
     if (result == NO_ERROR) {
-        Logger::Instance().Debug("Successfully removed route via API: " + ip);
+        Logger::Instance().Debug("Successfully removed route via API: " + ip + "/" + std::to_string(prefixLength));
         return true;
     }
     else if (result == ERROR_NOT_FOUND) {
-        Logger::Instance().Debug("Route not found: " + ip);
+        Logger::Instance().Debug("Route not found: " + ip + "/" + std::to_string(prefixLength));
         return true;
     }
     else {
-        Logger::Instance().Error("Failed to remove route via API: " + ip + ", error: " + std::to_string(result));
+        Logger::Instance().Error("Failed to remove route via API: " + ip + "/" + std::to_string(prefixLength) + ", error: " + std::to_string(result));
         return false;
     }
 }
@@ -304,8 +333,8 @@ void RouteController::VerifyRoutesThreadFunc() {
         }
 
         std::lock_guard<std::mutex> lock(routesMutex);
-        for (auto it = routes.begin(); it != routes.end(); ++it) {
-            AddSystemRoute(it->first);
+        for (const auto& [routeKey, route] : routes) {
+            AddSystemRouteWithMask(route->ip, route->prefixLength);
         }
     }
 }
@@ -314,23 +343,30 @@ void RouteController::SaveRoutesToDisk() {
     std::ofstream file(Constants::STATE_FILE + ".tmp");
     if (!file.is_open()) return;
 
-    file << "version=1\n";
-    file << "timestamp=" << std::chrono::system_clock::now().time_since_epoch().count() << "\n";
+    file << "version=2\n";
 
-    for (auto it = routes.begin(); it != routes.end(); ++it) {
-        RouteInfo* route = it->second.get();
+    // Сохраняем текущее время в секундах с эпохи Unix
+    auto now = std::chrono::system_clock::now();
+    auto nowSeconds = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+    file << "timestamp=" << nowSeconds << "\n";
+
+    for (auto& [routeKey, route] : routes) {
+        // Конвертируем время создания в секунды с эпохи Unix
+        auto createdSeconds = std::chrono::duration_cast<std::chrono::seconds>(
+            route->createdAt.time_since_epoch()).count();
+
         file << "route=" << route->ip << "," << route->processName << ","
-            << route->createdAt.time_since_epoch().count() << "\n";
+            << createdSeconds << "," << route->prefixLength << "\n";
     }
 
     file.close();
 
-    if (std::rename((Constants::STATE_FILE + ".tmp").c_str(), Constants::STATE_FILE.c_str()) != 0) {
-        MoveFileExA((Constants::STATE_FILE + ".tmp").c_str(), Constants::STATE_FILE.c_str(),
-            MOVEFILE_REPLACE_EXISTING);
+    if (std::filesystem::exists(Constants::STATE_FILE + ".tmp")) {
+        std::filesystem::rename(Constants::STATE_FILE + ".tmp", Constants::STATE_FILE);
     }
 }
 
+// src/service/RouteController.cpp - только метод LoadRoutesFromDisk
 void RouteController::LoadRoutesFromDisk() {
     if (!Utils::FileExists(Constants::STATE_FILE)) return;
 
@@ -345,9 +381,42 @@ void RouteController::LoadRoutesFromDisk() {
             if (parts.size() >= 2) {
                 std::string ip = parts[0];
                 std::string process = parts[1];
+                int prefixLength = 32;
 
-                if (AddSystemRoute(ip)) {
-                    routes[ip] = std::make_unique<RouteInfo>(ip, process);
+                // По умолчанию используем текущее время
+                std::chrono::system_clock::time_point createdAt = std::chrono::system_clock::now();
+
+                // Загружаем время создания
+                if (parts.size() >= 3 && !parts[2].empty()) {
+                    try {
+                        int64_t timestamp = std::stoll(parts[2]);
+                        // Проверяем что timestamp разумный (не 0 и не слишком большой)
+                        if (timestamp > 0 && timestamp < 9999999999LL) { // до 2286 года
+                            createdAt = std::chrono::system_clock::time_point(
+                                std::chrono::seconds(timestamp));
+                        }
+                    }
+                    catch (...) {
+                        Logger::Instance().Warning("Failed to parse timestamp for route: " + ip);
+                    }
+                }
+
+                // Загружаем длину префикса
+                if (parts.size() >= 4) {
+                    try {
+                        prefixLength = std::stoi(parts[3]);
+                    }
+                    catch (...) {
+                        Logger::Instance().Warning("Failed to parse prefix length for route: " + ip);
+                    }
+                }
+
+                if (AddSystemRouteWithMask(ip, prefixLength)) {
+                    std::string routeKey = ip + "/" + std::to_string(prefixLength);
+                    auto routeInfo = std::make_unique<RouteInfo>(ip, process);
+                    routeInfo->prefixLength = prefixLength;
+                    routeInfo->createdAt = createdAt;
+                    routes[routeKey] = std::move(routeInfo);
                 }
             }
         }
@@ -355,12 +424,7 @@ void RouteController::LoadRoutesFromDisk() {
 }
 
 bool RouteController::IsGatewayReachable() {
-    struct in_addr addr;
-    if (inet_pton(AF_INET, config.gatewayIp.c_str(), &addr) != 1) {
-        return false;
-    }
-
-    ULONG destAddr = addr.s_addr;
+    ULONG destAddr = inet_addr(config.gatewayIp.c_str());
     ULONG srcAddr = INADDR_ANY;
     ULONG bestIfIndex;
 
@@ -372,18 +436,26 @@ bool RouteController::IsGatewayReachable() {
 }
 
 void RouteController::PreloadAIRoutes() {
+    Logger::Instance().Info("PreloadAIRoutes - Starting preload of AI service routes");
     auto aiRanges = GetAIServiceRanges();
 
+    int totalRoutes = 0;
     for (const auto& service : aiRanges) {
+        Logger::Instance().Info("Processing " + service.service + " ranges");
         for (const auto& range : service.ranges) {
             if (range.find('/') != std::string::npos) {
-                AddCIDRRoutes(range, service.service);
+                if (AddCIDRRoute(range, service.service)) {
+                    totalRoutes++;
+                }
             }
             else {
-                AddRoute(range, "AI-" + service.service);
+                if (AddRoute(range, "AI-" + service.service)) {
+                    totalRoutes++;
+                }
             }
         }
     }
+    Logger::Instance().Info("PreloadAIRoutes - Completed, added " + std::to_string(totalRoutes) + " routes");
 }
 
 std::vector<RouteController::AIServiceRange> RouteController::GetAIServiceRanges() {
@@ -410,40 +482,15 @@ std::vector<RouteController::AIServiceRange> RouteController::GetAIServiceRanges
     };
 }
 
-void RouteController::AddCIDRRoutes(const std::string& cidr, const std::string& service) {
+bool RouteController::AddCIDRRoute(const std::string& cidr, const std::string& service) {
     size_t slashPos = cidr.find('/');
-    if (slashPos == std::string::npos) return;
+    if (slashPos == std::string::npos) return false;
 
     std::string baseIp = cidr.substr(0, slashPos);
     int prefixLen = std::stoi(cidr.substr(slashPos + 1));
 
-    if (prefixLen >= 24) {
-        AddRoute(baseIp, "AI-" + service);
-        return;
-    }
+    Logger::Instance().Info("Adding CIDR route: " + cidr + " for " + service);
 
-    struct in_addr addr;
-    if (inet_pton(AF_INET, baseIp.c_str(), &addr) != 1) {
-        return;
-    }
-
-    ULONG ipAddr = ntohl(addr.s_addr);
-
-    ULONG firstAddr = ipAddr & (0xFFFFFFFF << (32 - prefixLen));
-    ULONG lastAddr = firstAddr | (0xFFFFFFFF >> prefixLen);
-
-    in_addr inAddr;
-    char ipStr[INET_ADDRSTRLEN];
-
-    inAddr.s_addr = htonl(firstAddr);
-    inet_ntop(AF_INET, &inAddr, ipStr, INET_ADDRSTRLEN);
-    AddRoute(ipStr, "AI-" + service);
-
-    inAddr.s_addr = htonl(firstAddr + 1);
-    inet_ntop(AF_INET, &inAddr, ipStr, INET_ADDRSTRLEN);
-    AddRoute(ipStr, "AI-" + service);
-
-    inAddr.s_addr = htonl(lastAddr - 1);
-    inet_ntop(AF_INET, &inAddr, ipStr, INET_ADDRSTRLEN);
-    AddRoute(ipStr, "AI-" + service);
+    // Add the subnet route directly
+    return AddRouteWithMask(baseIp, prefixLen, "AI-" + service);
 }

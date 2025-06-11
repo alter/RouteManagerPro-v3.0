@@ -1,9 +1,5 @@
 // src/ui/ProcessPanel.h
 #pragma once
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <winsock2.h>
 #include <windows.h>
 #include <commctrl.h>
 #include <vector>
@@ -16,7 +12,6 @@ class ServiceClient;
 struct ProcessDisplayInfo {
     std::wstring name;
     std::wstring path;
-    std::wstring type;
     bool isSelected;
     bool isRunning;
 };
@@ -30,6 +25,7 @@ public:
     void Refresh();
     void HandleCommand(WPARAM wParam);
     void HandleNotify(LPNMHDR pnmh);
+    void Resize(int x, int y, int width, int height);
 
 private:
     HWND parentWnd;
@@ -37,13 +33,16 @@ private:
     HWND searchEdit;
     HWND listView;
     ServiceClient* serviceClient;
-    std::vector<ProcessDisplayInfo> processes;
+    std::vector<ProcessDisplayInfo> filteredProcesses;
     std::vector<std::string> selectedProcesses;
     bool isUpdating;
+    int currentScrollPos;
 
     void CreateControls(int x, int y, int width, int height);
     void UpdateProcessList();
     void OnProcessToggle(int index);
     void OnSearchChanged();
     void FilterProcesses(const std::string& filter);
+    void SaveScrollPosition();
+    void RestoreScrollPosition();
 };

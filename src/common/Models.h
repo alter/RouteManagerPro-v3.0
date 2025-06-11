@@ -1,8 +1,5 @@
 ﻿// src/common/Models.h
 #pragma once
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
 #include <winsock2.h>
 #include <windows.h>
 #include <string>
@@ -24,15 +21,16 @@ struct RouteInfo {
     std::string processName;
     std::atomic<int> refCount;
     std::chrono::system_clock::time_point createdAt;
+    int prefixLength;
 
-    RouteInfo() : refCount(1), createdAt(std::chrono::system_clock::now()) {}
+    RouteInfo() : refCount(1), createdAt(std::chrono::system_clock::now()), prefixLength(32) {}
     RouteInfo(const std::string& ip, const std::string& process)
-        : ip(ip), processName(process), refCount(1), createdAt(std::chrono::system_clock::now()) {
+        : ip(ip), processName(process), refCount(1), createdAt(std::chrono::system_clock::now()), prefixLength(32) {
     }
 
     RouteInfo(const RouteInfo& other)
         : ip(other.ip), processName(other.processName),
-        refCount(other.refCount.load()), createdAt(other.createdAt) {
+        refCount(other.refCount.load()), createdAt(other.createdAt), prefixLength(other.prefixLength) {
     }
 
     RouteInfo& operator=(const RouteInfo& other) {
@@ -41,6 +39,7 @@ struct RouteInfo {
             processName = other.processName;
             refCount = other.refCount.load();
             createdAt = other.createdAt;
+            prefixLength = other.prefixLength;
         }
         return *this;
     }

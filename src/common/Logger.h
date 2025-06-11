@@ -5,8 +5,8 @@
 #include <mutex>
 #include <chrono>
 #include <sstream>
-#include <windows.h>
-#include <direct.h>
+#include <filesystem>
+#include <ctime>
 
 class Logger {
 public:
@@ -18,7 +18,7 @@ public:
     void Log(const std::string& message) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!logFile_.is_open()) {
-            _mkdir("logs");
+            std::filesystem::create_directories("logs");
             logFile_.open("logs/route_manager.log", std::ios::app);
         }
 

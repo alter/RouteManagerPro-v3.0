@@ -1,9 +1,5 @@
 // src/ui/RouteTable.h
 #pragma once
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <winsock2.h>
 #include <windows.h>
 #include <commctrl.h>
 #include <vector>
@@ -19,6 +15,7 @@ public:
     void Create(int x, int y, int width, int height);
     void Refresh();
     void HandleCommand(WPARAM wParam);
+    void Resize(int x, int y, int width, int height);
 
 private:
     HWND parentWnd;
@@ -26,8 +23,11 @@ private:
     HWND cleanRoutesButton;
     ServiceClient* serviceClient;
     std::vector<RouteInfo> routes;
+    int currentScrollPos;
 
     void CreateControls(int x, int y, int width, int height);
     void UpdateRouteList();
     void OnCleanAllRoutes();
+    void SaveScrollPosition();
+    void RestoreScrollPosition();
 };

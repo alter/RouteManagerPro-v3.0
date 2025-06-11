@@ -1,17 +1,20 @@
 ﻿// src/ui/ProcessPanel.cpp
+#define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
+#include <windowsx.h>
+#include <commctrl.h>
+#include <tlhelp32.h>
+#include <psapi.h>
+#include <algorithm>
+#include <unordered_set>
+#include <unordered_map>
+
 #include "ProcessPanel.h"
 #include "ServiceClient.h"
 #include "../common/Utils.h"
 #include "../common/Logger.h"
-#include <algorithm>
-#include <windowsx.h>
-#include <commctrl.h>
-#include <unordered_set>
-#include <unordered_map>
-#include <tlhelp32.h>
-#include <psapi.h>
 
 #pragma comment(lib, "psapi.lib")
 
@@ -21,7 +24,7 @@
 
 ProcessPanel::ProcessPanel(HWND parent, ServiceClient* client)
     : parentWnd(parent), serviceClient(client), groupBox(nullptr), searchEdit(nullptr),
-    listView(nullptr), isUpdating(false) {
+    listView(nullptr), isUpdating(false), currentScrollPos(-1) {
 }
 
 ProcessPanel::~ProcessPanel() {
@@ -72,16 +75,12 @@ void ProcessPanel::CreateControls(int x, int y, int width, int height) {
     column.mask = LVCF_TEXT | LVCF_WIDTH;
 
     column.pszText = (LPWSTR)L"Process Name";
-    column.cx = 200;
+    column.cx = 300;
     ListView_InsertColumn(listView, 0, &column);
-
-    column.pszText = (LPWSTR)L"Type";
-    column.cx = 100;
-    ListView_InsertColumn(listView, 1, &column);
 
     column.pszText = (LPWSTR)L"Path";
     column.cx = width - 340;
-    ListView_InsertColumn(listView, 2, &column);
+    ListView_InsertColumn(listView, 1, &column);
 }
 
 void ProcessPanel::Refresh() {
@@ -94,10 +93,33 @@ void ProcessPanel::Refresh() {
     UpdateProcessList();
 }
 
+void ProcessPanel::SaveScrollPosition() {
+    SCROLLINFO si;
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_POS;
+    if (GetScrollInfo(listView, SB_VERT, &si)) {
+        currentScrollPos = si.nPos;
+    }
+}
+
+void ProcessPanel::RestoreScrollPosition() {
+    if (currentScrollPos >= 0) {
+        ListView_EnsureVisible(listView, currentScrollPos, FALSE);
+        currentScrollPos = -1;
+    }
+}
+
 void ProcessPanel::UpdateProcessList() {
     isUpdating = true;
 
+    SaveScrollPosition();
+
     Logger::Instance().Info("ProcessPanel::UpdateProcessList - Starting with " + std::to_string(selectedProcesses.size()) + " selected processes");
+
+    char searchText[256] = "";
+    GetWindowTextA(searchEdit, searchText, sizeof(searchText));
+    std::string searchFilter = searchText;
+    std::transform(searchFilter.begin(), searchFilter.end(), searchFilter.begin(), ::tolower);
 
     std::unordered_map<std::wstring, ProcessDisplayInfo> uniqueProcessesMap;
 
@@ -109,19 +131,6 @@ void ProcessPanel::UpdateProcessList() {
         info.path = L"(Not running)";
         info.isSelected = true;
         info.isRunning = false;
-
-        if (Utils::IsDiscordProcess(selectedName)) {
-            info.type = L"Discord (5ms)";
-        }
-        else if (Utils::IsGameProcess(selectedName)) {
-            info.type = L"Game (10ms)";
-        }
-        else if (Utils::IsDevProcess(selectedName)) {
-            info.type = L"Dev (25ms)";
-        }
-        else {
-            info.type = L"App (50ms)";
-        }
 
         uniqueProcessesMap[wideName] = info;
         Logger::Instance().Debug("Added selected process: " + selectedName);
@@ -174,24 +183,24 @@ void ProcessPanel::UpdateProcessList() {
                     bool hasPath = QueryFullProcessImageNameW(process, 0, path, &size);
                     CloseHandle(process);
 
+                    // Фильтруем процессы из Windows\System32
+                    if (hasPath) {
+                        std::wstring pathStr = path;
+                        std::transform(pathStr.begin(), pathStr.end(), pathStr.begin(), ::tolower);
+
+                        // Проверяем, содержит ли путь windows\system32
+                        if (pathStr.find(L"windows\\system32") != std::wstring::npos ||
+                            pathStr.find(L"windows\\syswow64") != std::wstring::npos ||
+                            pathStr.find(L"\\windowsapps\\") != std::wstring::npos) {
+                            continue; // Пропускаем системные процессы
+                        }
+                    }
+
                     ProcessDisplayInfo info;
                     info.name = processName;
                     info.path = hasPath ? path : L"";
                     info.isSelected = isSelected;
                     info.isRunning = true;
-
-                    if (Utils::IsDiscordProcess(processNameStr)) {
-                        info.type = L"Discord (5ms)";
-                    }
-                    else if (Utils::IsGameProcess(processNameStr)) {
-                        info.type = L"Game (10ms)";
-                    }
-                    else if (Utils::IsDevProcess(processNameStr)) {
-                        info.type = L"Dev (25ms)";
-                    }
-                    else {
-                        info.type = L"App (50ms)";
-                    }
 
                     uniqueProcessesMap[processName] = info;
                 }
@@ -202,21 +211,22 @@ void ProcessPanel::UpdateProcessList() {
         CloseHandle(snapshot);
     }
 
-    std::vector<ProcessDisplayInfo> displayProcesses;
+    filteredProcesses.clear();
     for (const auto& pair : uniqueProcessesMap) {
-        displayProcesses.push_back(pair.second);
+        if (!searchFilter.empty()) {
+            std::string processName = Utils::WStringToString(pair.second.name);
+            std::transform(processName.begin(), processName.end(), processName.begin(), ::tolower);
+            if (processName.find(searchFilter) == std::string::npos) {
+                continue;
+            }
+        }
+        filteredProcesses.push_back(pair.second);
     }
 
-    std::sort(displayProcesses.begin(), displayProcesses.end(),
+    std::sort(filteredProcesses.begin(), filteredProcesses.end(),
         [](const ProcessDisplayInfo& a, const ProcessDisplayInfo& b) {
             if (a.isSelected && !b.isSelected) return true;
             if (!a.isSelected && b.isSelected) return false;
-
-            if (a.type == L"Discord (5ms)" && b.type != L"Discord (5ms)") return true;
-            if (a.type != L"Discord (5ms)" && b.type == L"Discord (5ms)") return false;
-            if (a.type == L"Game (10ms)" && b.type != L"Game (10ms)") return true;
-            if (a.type != L"Game (10ms)" && b.type == L"Game (10ms)") return false;
-
             return _wcsicmp(a.name.c_str(), b.name.c_str()) < 0;
         });
 
@@ -224,8 +234,8 @@ void ProcessPanel::UpdateProcessList() {
     ListView_DeleteAllItems(listView);
 
     int checkedCount = 0;
-    for (size_t i = 0; i < displayProcesses.size(); i++) {
-        const auto& proc = displayProcesses[i];
+    for (size_t i = 0; i < filteredProcesses.size(); i++) {
+        const auto& proc = filteredProcesses[i];
 
         LVITEM item = { 0 };
         item.mask = LVIF_TEXT;
@@ -235,8 +245,7 @@ void ProcessPanel::UpdateProcessList() {
         int index = ListView_InsertItem(listView, &item);
         if (index == -1) continue;
 
-        ListView_SetItemText(listView, index, 1, const_cast<LPWSTR>(proc.type.c_str()));
-        ListView_SetItemText(listView, index, 2, const_cast<LPWSTR>(proc.path.c_str()));
+        ListView_SetItemText(listView, index, 1, const_cast<LPWSTR>(proc.path.c_str()));
 
         ListView_SetCheckState(listView, index, proc.isSelected ? TRUE : FALSE);
 
@@ -249,14 +258,14 @@ void ProcessPanel::UpdateProcessList() {
     SendMessage(listView, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(listView, NULL, TRUE);
 
-    processes = displayProcesses;
+    RestoreScrollPosition();
+
     isUpdating = false;
 
     Logger::Instance().Info("ProcessPanel::UpdateProcessList completed - " +
-        std::to_string(displayProcesses.size()) + " processes, " +
+        std::to_string(filteredProcesses.size()) + " processes, " +
         std::to_string(checkedCount) + " checked");
 }
-
 void ProcessPanel::HandleCommand(WPARAM wParam) {
     WORD id = LOWORD(wParam);
     WORD notifyCode = HIWORD(wParam);
@@ -286,9 +295,9 @@ void ProcessPanel::HandleNotify(LPNMHDR pnmh) {
 }
 
 void ProcessPanel::OnProcessToggle(int index) {
-    if (index >= 0 && index < processes.size()) {
+    if (index >= 0 && index < filteredProcesses.size()) {
         bool checked = ListView_GetCheckState(listView, index);
-        std::string processName = Utils::WStringToString(processes[index].name);
+        std::string processName = Utils::WStringToString(filteredProcesses[index].name);
 
         Logger::Instance().Info("Process toggled: " + processName + " = " + (checked ? "ON" : "OFF"));
 
@@ -312,44 +321,22 @@ void ProcessPanel::OnProcessToggle(int index) {
 }
 
 void ProcessPanel::OnSearchChanged() {
-    char searchText[256];
-    GetWindowTextA(searchEdit, searchText, sizeof(searchText));
-    FilterProcesses(searchText);
+    UpdateProcessList();
 }
 
 void ProcessPanel::FilterProcesses(const std::string& filter) {
-    if (filter.empty()) {
-        UpdateProcessList();
-        return;
-    }
+    UpdateProcessList();
+}
 
-    std::string lowerFilter = filter;
-    std::transform(lowerFilter.begin(), lowerFilter.end(), lowerFilter.begin(), ::tolower);
+void ProcessPanel::Resize(int x, int y, int width, int height) {
+    SetWindowPos(groupBox, NULL, x, y, width, height, SWP_NOZORDER);
+    SetWindowPos(searchEdit, NULL, x + 10, y + 25, width - 20, 22, SWP_NOZORDER);
+    SetWindowPos(listView, NULL, x + 10, y + 55, width - 20, height - 70, SWP_NOZORDER);
 
-    isUpdating = true;
-    SendMessage(listView, WM_SETREDRAW, FALSE, 0);
-    ListView_DeleteAllItems(listView);
-
-    int index = 0;
-    for (size_t i = 0; i < processes.size(); i++) {
-        std::string processName = Utils::WStringToString(processes[i].name);
-        std::transform(processName.begin(), processName.end(), processName.begin(), ::tolower);
-
-        if (processName.find(lowerFilter) != std::string::npos) {
-            LVITEM item = { 0 };
-            item.mask = LVIF_TEXT;
-            item.iItem = index;
-            item.pszText = const_cast<LPWSTR>(processes[i].name.c_str());
-
-            int itemIndex = ListView_InsertItem(listView, &item);
-
-            ListView_SetItemText(listView, itemIndex, 1, const_cast<LPWSTR>(processes[i].type.c_str()));
-            ListView_SetItemText(listView, itemIndex, 2, const_cast<LPWSTR>(processes[i].path.c_str()));
-            ListView_SetCheckState(listView, itemIndex, processes[i].isSelected);
-            index++;
-        }
-    }
-
-    SendMessage(listView, WM_SETREDRAW, TRUE, 0);
-    isUpdating = false;
+    LVCOLUMN column = { 0 };
+    column.mask = LVCF_WIDTH;
+    column.cx = 300;
+    ListView_SetColumn(listView, 0, &column);
+    column.cx = width - 340;
+    ListView_SetColumn(listView, 1, &column);
 }
