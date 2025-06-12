@@ -85,13 +85,30 @@ bool MainWindow::CreateMainWindow(int nCmdShow) {
     }
 
     serviceClient = std::make_unique<ServiceClient>();
+
+    // Connect to service with retry loop to avoid race condition
+    Logger::Instance().Info("MainWindow: Connecting to service...");
+    int retryCount = 0;
+    const int maxRetries = 10;
+    while (!serviceClient->Connect() && retryCount < maxRetries) {
+        Logger::Instance().Debug("MainWindow: Connection attempt " + std::to_string(retryCount + 1) + " failed, retrying...");
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        retryCount++;
+    }
+
+    if (!serviceClient->IsConnected()) {
+        Logger::Instance().Warning("MainWindow: Could not connect to service after " + std::to_string(maxRetries) + " attempts");
+        MessageBox(hwnd, L"Warning: Could not connect to service.\nSome features may not work correctly.", L"Connection Warning", MB_OK | MB_ICONWARNING);
+    }
+    else {
+        Logger::Instance().Info("MainWindow: Successfully connected to service");
+    }
+
     systemTray = std::make_unique<SystemTray>(hwnd);
     processPanel = std::make_unique<ProcessPanel>(hwnd, serviceClient.get());
     routeTable = std::make_unique<RouteTable>(hwnd, serviceClient.get());
 
     CreateControls();
-
-    serviceClient->Connect();
 
     LoadConfiguration();
     UpdateStatus();

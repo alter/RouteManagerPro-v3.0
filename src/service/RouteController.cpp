@@ -14,8 +14,6 @@
 #include <chrono>
 #include <json/json.h>
 
-static_assert(sizeof(Logger) > 0, "Logger class is visible");
-
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
 
@@ -214,22 +212,46 @@ bool RouteController::RemoveRouteWithMask(const std::string& ip, int prefixLengt
 
 void RouteController::CleanupAllRoutes() {
     Logger::Instance().Info("CleanupAllRoutes - Starting cleanup of all routes");
-    std::lock_guard<std::mutex> lock(routesMutex);
 
-    for (const auto& [routeKey, route] : routes) {
-        Logger::Instance().Info("Removing Windows route for: " + routeKey);
-        if (!RemoveSystemRouteWithMask(route->ip, route->prefixLength)) {
-            Logger::Instance().Error("Failed to remove Windows route for: " + routeKey);
+    // 1. Collect route information and clear internal cache under lock
+    std::vector<std::pair<std::string, int>> routesToDelete;
+    {
+        std::lock_guard<std::mutex> lock(routesMutex);
+        if (routes.empty()) {
+            Logger::Instance().Info("CleanupAllRoutes - No routes to clean");
+            return;
         }
+
+        // Collect routes to delete
+        for (const auto& [routeKey, route] : routes) {
+            routesToDelete.emplace_back(route->ip, route->prefixLength);
+        }
+
+        // Clear internal cache immediately
+        routes.clear();
+        routesDirty = true;
     }
 
-    routes.clear();
-    routesDirty = true;  // Mark as dirty
+    // 2. Delete system routes WITHOUT holding the lock
+    int successCount = 0;
+    int failCount = 0;
+
+    for (const auto& [ip, prefixLength] : routesToDelete) {
+        Logger::Instance().Info("Removing Windows route for: " + ip + "/" + std::to_string(prefixLength));
+        if (RemoveSystemRouteWithMask(ip, prefixLength)) {
+            successCount++;
+        }
+        else {
+            Logger::Instance().Error("Failed to remove Windows route for: " + ip + "/" + std::to_string(prefixLength));
+            failCount++;
+        }
+    }
 
     // Force immediate save for cleanup
     SaveRoutesToDisk();
 
-    Logger::Instance().Info("CleanupAllRoutes - Completed, all routes removed");
+    Logger::Instance().Info("CleanupAllRoutes - Completed. Removed: " + std::to_string(successCount) +
+        ", Failed: " + std::to_string(failCount));
 }
 
 void RouteController::CleanupOldRoutes() {
@@ -557,6 +579,9 @@ void RouteController::LoadRoutesFromDisk() {
     if (!file.is_open()) return;
 
     std::string line;
+    int loadedCount = 0;
+    int skippedPreloadCount = 0;
+
     while (std::getline(file, line)) {
         if (line.substr(0, 6) == "route=") {
             std::string routeData = line.substr(6);
@@ -565,6 +590,12 @@ void RouteController::LoadRoutesFromDisk() {
                 std::string ip = parts[0];
                 std::string process = parts[1];
                 int prefixLength = 32;
+
+                // Skip preload routes - they will be loaded from preload_ips.json
+                if (process.find("Preload-") == 0) {
+                    skippedPreloadCount++;
+                    continue;
+                }
 
                 std::chrono::system_clock::time_point createdAt = std::chrono::system_clock::now();
 
@@ -596,10 +627,14 @@ void RouteController::LoadRoutesFromDisk() {
                     routeInfo->prefixLength = prefixLength;
                     routeInfo->createdAt = createdAt;
                     routes[routeKey] = std::move(routeInfo);
+                    loadedCount++;
                 }
             }
         }
     }
+
+    Logger::Instance().Info("LoadRoutesFromDisk - Loaded " + std::to_string(loadedCount) +
+        " routes, skipped " + std::to_string(skippedPreloadCount) + " preload routes");
 
     // Reset dirty flag after loading
     routesDirty = false;
