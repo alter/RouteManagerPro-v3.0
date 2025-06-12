@@ -14,6 +14,8 @@
 #include <chrono>
 #include <json/json.h>
 
+static_assert(sizeof(Logger) > 0, "Logger class is visible");
+
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
 

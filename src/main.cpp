@@ -38,6 +38,11 @@ void RunServiceLogic() {
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+#ifdef NDEBUG
+    Logger::Instance().SetLogLevel(Logger::LogLevel::LEVEL_INFO);
+#else
+    Logger::Instance().SetLogLevel(Logger::LogLevel::LEVEL_DEBUG);
+#endif
     Logger::Instance().Info("WinMain - Application started.");
 
     // The application requires administrator privileges to manage network routes.
