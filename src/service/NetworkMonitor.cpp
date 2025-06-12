@@ -16,8 +16,8 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "WinDivert.lib")
 
-NetworkMonitor::NetworkMonitor(RouteController* rc, ProcessManager* pm, PacketInterceptor* pi)
-    : routeController(rc), processManager(pm), packetInterceptor(pi),
+NetworkMonitor::NetworkMonitor(RouteController* rc, ProcessManager* pm)
+    : routeController(rc), processManager(pm),
     divertHandle(INVALID_HANDLE_VALUE), running(false), active(false) {
     Logger::Instance().Info("NetworkMonitor created");
 }
@@ -41,7 +41,7 @@ void NetworkMonitor::Start() {
     Logger::Instance().Info("WinDivert handle opened successfully");
 
     WinDivertSetParam(divertHandle, WINDIVERT_PARAM_QUEUE_LENGTH, 16384);
-    WinDivertSetParam(divertHandle, WINDIVERT_PARAM_QUEUE_TIME, 1000); // 1 second for responsive shutdown
+    WinDivertSetParam(divertHandle, WINDIVERT_PARAM_QUEUE_TIME, 50);
     WinDivertSetParam(divertHandle, WINDIVERT_PARAM_QUEUE_SIZE, 8388608);
 
     running = true;
@@ -53,14 +53,12 @@ void NetworkMonitor::Start() {
 void NetworkMonitor::Stop() {
     Logger::Instance().Info("NetworkMonitor::Stop called");
 
-    // First, signal the thread to stop
     running = false;
     active = false;
 
     if (divertHandle != INVALID_HANDLE_VALUE) {
         Logger::Instance().Info("Shutting down WinDivert handle");
 
-        // Shutdown will cause WinDivertRecv to return with ERROR_NO_DATA
         if (!WinDivertShutdown(divertHandle, WINDIVERT_SHUTDOWN_BOTH)) {
             DWORD error = GetLastError();
             Logger::Instance().Warning("WinDivertShutdown failed: " + std::to_string(error));
@@ -69,7 +67,6 @@ void NetworkMonitor::Stop() {
         if (monitorThread.joinable()) {
             Logger::Instance().Info("Waiting for monitor thread to complete");
 
-            // Should complete within 1 second due to QUEUE_TIME setting
             if (monitorThread.joinable()) {
                 monitorThread.join();
                 Logger::Instance().Info("Monitor thread joined successfully");
@@ -96,29 +93,24 @@ void NetworkMonitor::MonitorThreadFunc() {
     while (running.load() && !ShutdownCoordinator::Instance().isShuttingDown) {
         UINT recvLen = 0;
 
-        // WinDivertRecv will return after QUEUE_TIME even if no packets
         if (!WinDivertRecv(divertHandle, NULL, 0, &recvLen, &addr)) {
             DWORD error = GetLastError();
 
-            // Check if we're shutting down
             if (!running.load() || ShutdownCoordinator::Instance().isShuttingDown) {
                 Logger::Instance().Info("Monitor thread: Shutdown detected during recv, exiting");
                 break;
             }
 
             if (error == ERROR_NO_DATA) {
-                // Handle was shut down
                 Logger::Instance().Info("Monitor thread: WinDivert handle shut down (ERROR_NO_DATA)");
                 break;
             }
             else if (error == ERROR_INVALID_PARAMETER) {
-                // Handle was closed
                 Logger::Instance().Info("Monitor thread: WinDivert handle closed");
                 break;
             }
             else if (error != ERROR_INSUFFICIENT_BUFFER) {
                 Logger::Instance().Error("WinDivertRecv failed: " + std::to_string(error));
-                // Continue trying unless it's a fatal error
                 if (error == ERROR_INVALID_HANDLE) {
                     break;
                 }
@@ -126,7 +118,6 @@ void NetworkMonitor::MonitorThreadFunc() {
             continue;
         }
 
-        // Check shutdown again after successful receive
         if (!running.load() || ShutdownCoordinator::Instance().isShuttingDown) {
             Logger::Instance().Info("Monitor thread: Shutdown detected after recv, exiting");
             break;
@@ -165,8 +156,13 @@ void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr) {
     WinDivertHelperFormatIPv6Address(addr.Flow.RemoteAddr, remoteStr, sizeof(remoteStr));
 
     std::string remoteIp = remoteStr;
+
     if (remoteIp.substr(0, 7) == "::ffff:") {
         remoteIp = remoteIp.substr(7);
+    }
+    else if (remoteIp.find(':') != std::string::npos) {
+        Logger::Instance().Debug("Skipping IPv6 address: " + remoteIp + " for process: " + processName);
+        return;
     }
 
     std::stringstream logMsg;
@@ -253,21 +249,4 @@ std::string NetworkMonitor::GetProcessPathFromFlowId(UINT64 flowId, UINT32 proce
 
     CloseHandle(process);
     return std::string(path);
-}
-
-PacketPriority NetworkMonitor::DeterminePacketPriority(const std::string& processName, UINT16 port) {
-    if (Utils::IsDiscordProcess(processName)) {
-        Logger::Instance().Debug("Discord process detected, assigning Discord priority");
-        return PacketPriority::Discord;
-    }
-
-    if (Utils::IsGameProcess(processName)) {
-        return PacketPriority::Gaming;
-    }
-
-    if (Utils::IsDevProcess(processName)) {
-        return PacketPriority::Development;
-    }
-
-    return PacketPriority::Normal;
 }

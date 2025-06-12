@@ -71,21 +71,3 @@ struct ServiceStatus {
     size_t memoryUsageMB;
     std::chrono::seconds uptime;
 };
-
-enum class PacketPriority {
-    Discord = 0,
-    Gaming = 1,
-    Development = 2,
-    Normal = 3
-};
-
-struct PacketInfo {
-    UINT64 flowId;
-    std::string srcIp;
-    std::string dstIp;
-    UINT16 srcPort;
-    UINT16 dstPort;
-    UINT8 protocol;
-    std::string processPath;
-    PacketPriority priority;
-};

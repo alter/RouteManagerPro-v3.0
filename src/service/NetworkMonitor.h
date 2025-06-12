@@ -11,11 +11,10 @@
 
 class RouteController;
 class ProcessManager;
-class PacketInterceptor;
 
 class NetworkMonitor {
 public:
-    NetworkMonitor(RouteController* routeController, ProcessManager* processManager, PacketInterceptor* packetInterceptor);
+    NetworkMonitor(RouteController* routeController, ProcessManager* processManager);
     ~NetworkMonitor();
 
     void Start();
@@ -25,7 +24,6 @@ public:
 private:
     RouteController* routeController;
     ProcessManager* processManager;
-    PacketInterceptor* packetInterceptor;
 
     HANDLE divertHandle;
     std::atomic<bool> running;
@@ -49,6 +47,5 @@ private:
     bool VerifyProcessIdentity(DWORD pid, const FILETIME& expectedTime);
     void CleanupOldConnections();
     std::string GetProcessPathFromFlowId(UINT64 flowId, UINT32 processId);
-    PacketPriority DeterminePacketPriority(const std::string& processName, UINT16 port);
     void LogDetailedStats();
 };

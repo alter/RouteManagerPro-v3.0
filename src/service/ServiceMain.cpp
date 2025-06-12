@@ -13,7 +13,6 @@
 #include "../common/ShutdownCoordinator.h"
 #include <thread>
 
-// Static members for direct mode operation
 HANDLE ServiceMain::stopEvent = nullptr;
 
 ServiceMain::ServiceMain() : running(false), pipeThread(nullptr) {
@@ -22,7 +21,6 @@ ServiceMain::ServiceMain() : running(false), pipeThread(nullptr) {
 
 ServiceMain::~ServiceMain() {
     Logger::Instance().Debug("ServiceMain::~ServiceMain() - Destructor called");
-    // StopDirect should be called explicitly by the owner before destruction
 }
 
 void ServiceMain::StartDirect() {
@@ -50,7 +48,7 @@ void ServiceMain::StartDirect() {
 
         Logger::Instance().Debug("ServiceMain::StartDirect - Creating NetworkMonitor");
         networkMonitor = std::make_unique<NetworkMonitor>(
-            routeController.get(), processManager.get(), nullptr);
+            routeController.get(), processManager.get());
 
         Logger::Instance().Debug("ServiceMain::StartDirect - Creating Watchdog");
         watchdog = std::make_unique<Watchdog>(this);
@@ -67,13 +65,11 @@ void ServiceMain::StartDirect() {
         running = true;
         Logger::Instance().Info("ServiceMain::StartDirect - Service logic is running");
 
-        // Wait for the stop signal
         WaitForSingleObject(stopEvent, INFINITE);
         Logger::Instance().Debug("ServiceMain::StartDirect - Stop event signaled, exiting StartDirect()");
     }
     catch (const std::exception& e) {
         Logger::Instance().Error("ServiceMain::StartDirect - Exception: " + std::string(e.what()));
-        // Ensure graceful shutdown even on exception
         StopDirect();
         throw;
     }
@@ -101,17 +97,13 @@ void ServiceMain::StopDirect() {
     Logger::Instance().Debug("ServiceMain::StopDirect - Initiating shutdown coordinator");
     ShutdownCoordinator::Instance().InitiateShutdown();
 
-    // Signal the main loop in StartDirect to unblock
     if (stopEvent) {
         SetEvent(stopEvent);
     }
 
     try {
-        // Stop components in reverse order of creation
-
         if (pipeThread) {
             Logger::Instance().Info("Stopping pipe server thread");
-            // Force close any active pipe connections
             HANDLE tempPipe = CreateFileA(
                 Constants::PIPE_NAME.c_str(),
                 GENERIC_READ | GENERIC_WRITE,
