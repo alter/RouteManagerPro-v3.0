@@ -1,13 +1,13 @@
 ﻿// src/service/RouteController.cpp
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#include <netioapi.h>
 #include "RouteController.h"
 #include "../common/Constants.h"
 #include "../common/Utils.h"
 #include "../common/Logger.h"
 #include "../common/ShutdownCoordinator.h"
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <iphlpapi.h>
-#include <netioapi.h>
 #include <sstream>
 #include <fstream>
 #include <filesystem>
@@ -18,7 +18,7 @@
 #pragma comment(lib, "ws2_32.lib")
 
 RouteController::RouteController(const ServiceConfig& cfg) : config(cfg), running(true),
-lastSaveTime(std::chrono::steady_clock::now()) {
+lastSaveTime(std::chrono::steady_clock::now()), cachedInterfaceIndex(0) {
     LoadRoutesFromDisk();
     verifyThread = std::thread(&RouteController::VerifyRoutesThreadFunc, this);
     persistThread = std::thread(&RouteController::PersistenceThreadFunc, this);
@@ -64,6 +64,12 @@ RouteController::~RouteController() {
     }
 
     Logger::Instance().Info("RouteController destructor - completed");
+}
+
+void RouteController::InvalidateInterfaceCache() {
+    std::lock_guard<std::mutex> lock(interfaceCacheMutex);
+    cachedInterfaceIndex = 0;
+    Logger::Instance().Info("Interface cache invalidated");
 }
 
 void RouteController::PersistenceThreadFunc() {
@@ -290,10 +296,21 @@ bool RouteController::AddSystemRouteWithMask(const std::string& ip, int prefixLe
     }
 
     NET_IFINDEX bestInterface = 0;
-    DWORD result = GetBestInterface(nextHop.Ipv4.sin_addr.s_addr, &bestInterface);
-    if (result != NO_ERROR) {
-        Logger::Instance().Error("GetBestInterface failed: " + std::to_string(result));
-        return false;
+    {
+        std::lock_guard<std::mutex> lock(interfaceCacheMutex);
+        if (cachedInterfaceIndex != 0) {
+            bestInterface = cachedInterfaceIndex;
+        }
+    }
+
+    if (bestInterface == 0) {
+        DWORD result = GetBestInterface(nextHop.Ipv4.sin_addr.s_addr, &bestInterface);
+        if (result != NO_ERROR) {
+            Logger::Instance().Error("GetBestInterface failed: " + std::to_string(result));
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(interfaceCacheMutex);
+        cachedInterfaceIndex = bestInterface;
     }
 
     route.InterfaceIndex = bestInterface;
@@ -307,7 +324,7 @@ bool RouteController::AddSystemRouteWithMask(const std::string& ip, int prefixLe
         " -> " + config.gatewayIp +
         " (interface: " + std::to_string(bestInterface) + ")");
 
-    result = CreateIpForwardEntry2(&route);
+    DWORD result = CreateIpForwardEntry2(&route);
 
     if (result == NO_ERROR) {
         Logger::Instance().Info("Successfully added route: " + ip + "/" + std::to_string(prefixLength) + " -> " + config.gatewayIp);
@@ -463,6 +480,7 @@ void RouteController::VerifyRoutesThreadFunc() {
             }
 
             if (!IsGatewayReachable()) {
+                InvalidateInterfaceCache();
                 continue;
             }
 

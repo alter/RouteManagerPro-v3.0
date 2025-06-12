@@ -7,6 +7,8 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <winsock2.h>
+#include <netioapi.h>
 #include "../common/Models.h"
 
 class RouteController {
@@ -32,6 +34,9 @@ private:
     std::thread verifyThread;
     std::thread persistThread;
 
+    NET_IFINDEX cachedInterfaceIndex;
+    std::mutex interfaceCacheMutex;
+
     // Persistence optimization
     std::atomic<bool> routesDirty{ false };
     std::chrono::steady_clock::time_point lastSaveTime;
@@ -49,6 +54,7 @@ private:
     void SaveRoutesToDiskAsync();
     void LoadRoutesFromDisk();
     bool IsGatewayReachable();
+    void InvalidateInterfaceCache();
 
     struct AIServiceRange {
         std::string service;

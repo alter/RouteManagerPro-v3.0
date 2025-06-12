@@ -113,6 +113,7 @@ public:
 
     std::vector<ProcessInfo> GetAllProcesses() const;
     bool IsProcessSelected(const std::string& processName) const;
+    bool IsSelectedProcessByPid(DWORD pid);
 
     std::optional<CachedProcessInfo> GetCachedInfo(DWORD pid);
     std::optional<CachedProcessInfo> CheckProcessAndCache(DWORD pid);

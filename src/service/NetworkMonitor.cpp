@@ -41,7 +41,7 @@ void NetworkMonitor::Start() {
     Logger::Instance().Info("WinDivert handle opened successfully");
 
     WinDivertSetParam(divertHandle, WINDIVERT_PARAM_QUEUE_LENGTH, 16384);
-    WinDivertSetParam(divertHandle, WINDIVERT_PARAM_QUEUE_TIME, 50);
+    WinDivertSetParam(divertHandle, WINDIVERT_PARAM_QUEUE_TIME, 1);
     WinDivertSetParam(divertHandle, WINDIVERT_PARAM_QUEUE_SIZE, 8388608);
 
     running = true;
@@ -146,10 +146,14 @@ void NetworkMonitor::MonitorThreadFunc() {
 }
 
 void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr) {
-    std::string processPath = GetProcessPathFromFlowId(0, addr.Flow.ProcessId);
-    if (processPath.empty()) return;
+    bool isSelected = processManager->IsSelectedProcessByPid(addr.Flow.ProcessId);
+    if (!isSelected) {
+        return;
+    }
 
-    std::string processName = Utils::GetProcessNameFromPath(processPath);
+    auto cachedInfo = processManager->GetCachedInfo(addr.Flow.ProcessId);
+    std::string processName = cachedInfo.has_value() ?
+        Utils::WStringToString(cachedInfo->name) : "Unknown";
 
     char localStr[INET6_ADDRSTRLEN], remoteStr[INET6_ADDRSTRLEN];
     WinDivertHelperFormatIPv6Address(addr.Flow.LocalAddr, localStr, sizeof(localStr));
@@ -174,12 +178,6 @@ void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr) {
 
     if (Utils::IsPrivateIP(remoteIp)) {
         Logger::Instance().Debug("Skipping private IP: " + remoteIp);
-        return;
-    }
-
-    bool isSelected = processManager->IsProcessSelected(processName);
-    if (!isSelected) {
-        Logger::Instance().Debug("Process not selected: " + processName);
         return;
     }
 

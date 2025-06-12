@@ -42,6 +42,25 @@ ProcessManager::~ProcessManager() {
     }
 }
 
+bool ProcessManager::IsSelectedProcessByPid(DWORD pid) {
+    auto cachedInfo = GetCachedInfo(pid);
+    if (cachedInfo.has_value()) {
+        stats.hits.fetch_add(1);
+        return cachedInfo->isSelected;
+    }
+
+    auto info = GetCompleteProcessInfo(pid);
+    if (info.has_value()) {
+        m_pidMissCache.put(pid, *info);
+        stats.misses.fetch_add(1);
+        stats.newProcessChecks.fetch_add(1);
+        return info->isSelected;
+    }
+
+    stats.misses.fetch_add(1);
+    return false;
+}
+
 std::optional<CachedProcessInfo> ProcessManager::GetCachedInfo(DWORD pid) {
     {
         std::shared_lock lock(cachesMutex);
