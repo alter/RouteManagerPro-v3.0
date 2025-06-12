@@ -13,251 +13,98 @@
 #include "../common/ShutdownCoordinator.h"
 #include <thread>
 
-ServiceMain* ServiceMain::instance = nullptr;
-SERVICE_STATUS_HANDLE ServiceMain::statusHandle = nullptr;
-SERVICE_STATUS ServiceMain::serviceStatus = { 0 };
+// Static members for direct mode operation
 HANDLE ServiceMain::stopEvent = nullptr;
 
 ServiceMain::ServiceMain() : running(false), pipeThread(nullptr) {
     Logger::Instance().Debug("ServiceMain::ServiceMain() - Constructor called");
-    instance = this;
 }
 
 ServiceMain::~ServiceMain() {
     Logger::Instance().Debug("ServiceMain::~ServiceMain() - Destructor called");
-    Stop();
-    instance = nullptr;
-}
-
-int ServiceMain::Run() {
-    Logger::Instance().Info("ServiceMain::Run - Starting service control dispatcher");
-
-    SERVICE_TABLE_ENTRYW serviceTable[] = {
-        { const_cast<LPWSTR>(Constants::SERVICE_NAME.c_str()), ServiceMainEntry },
-        { nullptr, nullptr }
-    };
-
-    if (!StartServiceCtrlDispatcherW(serviceTable)) {
-        DWORD error = GetLastError();
-        Logger::Instance().Error("ServiceMain::Run - StartServiceCtrlDispatcher failed: " + std::to_string(error));
-        return error;
-    }
-
-    return 0;
-}
-
-int ServiceMain::Install() {
-    SC_HANDLE scManager = OpenSCManager(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
-    if (!scManager) {
-        return GetLastError();
-    }
-
-    wchar_t path[MAX_PATH];
-    GetModuleFileNameW(nullptr, path, MAX_PATH);
-    std::wstring servicePath = std::wstring(path) + L" --service";
-
-    SC_HANDLE service = CreateServiceW(
-        scManager,
-        Constants::SERVICE_NAME.c_str(),
-        Constants::SERVICE_DISPLAY_NAME.c_str(),
-        SERVICE_ALL_ACCESS,
-        SERVICE_WIN32_OWN_PROCESS,
-        SERVICE_AUTO_START,
-        SERVICE_ERROR_NORMAL,
-        servicePath.c_str(),
-        nullptr,
-        nullptr,
-        L"",
-        nullptr,
-        nullptr
-    );
-
-    DWORD error = 0;
-    if (!service) {
-        error = GetLastError();
-    }
-    else {
-        SERVICE_DESCRIPTIONW desc;
-        desc.lpDescription = const_cast<LPWSTR>(Constants::SERVICE_DESCRIPTION.c_str());
-        ChangeServiceConfig2W(service, SERVICE_CONFIG_DESCRIPTION, &desc);
-
-        SERVICE_FAILURE_ACTIONSW failureActions = { 0 };
-        SC_ACTION actions[3] = {
-            { SC_ACTION_RESTART, 60000 },
-            { SC_ACTION_RESTART, 120000 },
-            { SC_ACTION_NONE, 0 }
-        };
-        failureActions.dwResetPeriod = 86400;
-        failureActions.lpRebootMsg = nullptr;
-        failureActions.lpCommand = nullptr;
-        failureActions.cActions = 3;
-        failureActions.lpsaActions = actions;
-
-        ChangeServiceConfig2W(service, SERVICE_CONFIG_FAILURE_ACTIONS, &failureActions);
-
-        CloseServiceHandle(service);
-    }
-
-    CloseServiceHandle(scManager);
-    return error;
-}
-
-int ServiceMain::Uninstall() {
-    SC_HANDLE scManager = OpenSCManager(nullptr, nullptr, SC_MANAGER_CONNECT);
-    if (!scManager) {
-        return GetLastError();
-    }
-
-    SC_HANDLE service = OpenServiceW(scManager, Constants::SERVICE_NAME.c_str(), DELETE);
-    DWORD error = 0;
-    if (!service) {
-        error = GetLastError();
-    }
-    else {
-        if (!DeleteService(service)) {
-            error = GetLastError();
-        }
-        CloseServiceHandle(service);
-    }
-
-    CloseServiceHandle(scManager);
-    return error;
-}
-
-VOID WINAPI ServiceMain::ServiceMainEntry(DWORD argc, LPWSTR* argv) {
-    statusHandle = RegisterServiceCtrlHandlerW(Constants::SERVICE_NAME.c_str(), ServiceCtrlHandler);
-    if (!statusHandle) {
-        return;
-    }
-
-    serviceStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
-    serviceStatus.dwCurrentState = SERVICE_START_PENDING;
-    serviceStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
-    SetServiceStatus(statusHandle, &serviceStatus);
-
-    instance = new ServiceMain();
-    instance->Start();
-
-    serviceStatus.dwCurrentState = SERVICE_STOPPED;
-    SetServiceStatus(statusHandle, &serviceStatus);
-
-    delete instance;
-    instance = nullptr;
-}
-
-VOID WINAPI ServiceMain::ServiceCtrlHandler(DWORD ctrlCode) {
-    switch (ctrlCode) {
-    case SERVICE_CONTROL_STOP:
-    case SERVICE_CONTROL_SHUTDOWN:
-        if (instance) {
-            instance->ReportStatus(SERVICE_STOP_PENDING);
-            instance->Stop();
-        }
-        break;
-    case SERVICE_CONTROL_INTERROGATE:
-        break;
-    default:
-        break;
-    }
+    // StopDirect should be called explicitly by the owner before destruction
 }
 
 void ServiceMain::StartDirect() {
-    Logger::Instance().Info("ServiceMain::StartDirect - Starting service directly");
-
-    if (!stopEvent) {
-        stopEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-        Logger::Instance().Debug("ServiceMain::StartDirect - Created stop event");
-    }
-
-    instance = this;
-    Start();
-}
-
-void ServiceMain::StopDirect() {
-    Logger::Instance().Info("ServiceMain::StopDirect - Stopping service directly");
-
-    if (stopEvent) {
-        Logger::Instance().Debug("ServiceMain::StopDirect - Setting stop event");
-        SetEvent(stopEvent);
-    }
-
-    Stop();
-}
-
-void ServiceMain::Start() {
-    Logger::Instance().Info("ServiceMain::Start - Starting service");
+    Logger::Instance().Info("ServiceMain::StartDirect - Starting service logic");
 
     if (!stopEvent) {
         stopEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
     }
 
     if (!stopEvent) {
-        ReportStatus(SERVICE_STOPPED, GetLastError());
+        Logger::Instance().Error("ServiceMain::StartDirect - Failed to create stop event");
         return;
     }
 
     try {
-        Logger::Instance().Debug("ServiceMain::Start - Creating ConfigManager");
+        Logger::Instance().Debug("ServiceMain::StartDirect - Creating ConfigManager");
         configManager = std::make_unique<ConfigManager>();
         auto config = configManager->GetConfig();
 
-        Logger::Instance().Debug("ServiceMain::Start - Creating RouteController");
+        Logger::Instance().Debug("ServiceMain::StartDirect - Creating RouteController");
         routeController = std::make_unique<RouteController>(config);
 
-        Logger::Instance().Debug("ServiceMain::Start - Creating ProcessManager");
+        Logger::Instance().Debug("ServiceMain::StartDirect - Creating ProcessManager");
         processManager = std::make_unique<ProcessManager>(config);
 
-        Logger::Instance().Debug("ServiceMain::Start - Creating NetworkMonitor");
+        Logger::Instance().Debug("ServiceMain::StartDirect - Creating NetworkMonitor");
         networkMonitor = std::make_unique<NetworkMonitor>(
             routeController.get(), processManager.get(), nullptr);
 
-        Logger::Instance().Debug("ServiceMain::Start - Creating Watchdog");
+        Logger::Instance().Debug("ServiceMain::StartDirect - Creating Watchdog");
         watchdog = std::make_unique<Watchdog>(this);
 
-        Logger::Instance().Debug("ServiceMain::Start - Starting NetworkMonitor");
+        Logger::Instance().Debug("ServiceMain::StartDirect - Starting NetworkMonitor");
         networkMonitor->Start();
 
-        Logger::Instance().Debug("ServiceMain::Start - Starting Watchdog");
+        Logger::Instance().Debug("ServiceMain::StartDirect - Starting Watchdog");
         watchdog->Start();
 
-        Logger::Instance().Debug("ServiceMain::Start - Creating pipe server thread");
+        Logger::Instance().Debug("ServiceMain::StartDirect - Creating pipe server thread");
         pipeThread = CreateThread(nullptr, 0, PipeServerThread, this, 0, nullptr);
 
         running = true;
-        ReportStatus(SERVICE_RUNNING);
+        Logger::Instance().Info("ServiceMain::StartDirect - Service logic is running");
 
-        Logger::Instance().Info("ServiceMain::Start - Service is running");
-
+        // Wait for the stop signal
         WaitForSingleObject(stopEvent, INFINITE);
-        Logger::Instance().Debug("ServiceMain::Start - Stop event signaled, exiting Start()");
+        Logger::Instance().Debug("ServiceMain::StartDirect - Stop event signaled, exiting StartDirect()");
     }
     catch (const std::exception& e) {
-        Logger::Instance().Error("ServiceMain::Start - Exception: " + std::string(e.what()));
+        Logger::Instance().Error("ServiceMain::StartDirect - Exception: " + std::string(e.what()));
+        // Ensure graceful shutdown even on exception
+        StopDirect();
         throw;
     }
 }
 
-void ServiceMain::Stop() {
-    Logger::Instance().Info("ServiceMain::Stop - Starting graceful shutdown");
+void ServiceMain::StopDirect() {
+    Logger::Instance().Info("ServiceMain::StopDirect - Starting graceful shutdown");
 
     static std::atomic<bool> stopInProgress(false);
     bool expected = false;
     if (!stopInProgress.compare_exchange_strong(expected, true)) {
-        Logger::Instance().Warning("ServiceMain::Stop - Already in progress, returning");
+        Logger::Instance().Warning("ServiceMain::StopDirect - Already in progress, returning");
         return;
     }
 
-    if (!running) {
-        Logger::Instance().Warning("Service already stopped");
+    if (!running.load()) {
+        Logger::Instance().Warning("Service logic already stopped");
         stopInProgress = false;
         return;
     }
 
-    Logger::Instance().Debug("ServiceMain::Stop - Setting running to false");
+    Logger::Instance().Debug("ServiceMain::StopDirect - Setting running to false");
     running = false;
 
-    Logger::Instance().Debug("ServiceMain::Stop - Initiating shutdown coordinator");
+    Logger::Instance().Debug("ServiceMain::StopDirect - Initiating shutdown coordinator");
     ShutdownCoordinator::Instance().InitiateShutdown();
+
+    // Signal the main loop in StartDirect to unblock
+    if (stopEvent) {
+        SetEvent(stopEvent);
+    }
 
     try {
         if (networkMonitor) {
@@ -286,12 +133,7 @@ void ServiceMain::Stop() {
             pipeThread = nullptr;
         }
 
-        if (stopEvent) {
-            Logger::Instance().Debug("ServiceMain::Stop - Setting stop event");
-            SetEvent(stopEvent);
-        }
-
-        Logger::Instance().Debug("ServiceMain::Stop - Resetting unique_ptrs");
+        Logger::Instance().Debug("ServiceMain::StopDirect - Resetting unique_ptrs");
         networkMonitor.reset();
         processManager.reset();
         routeController.reset();
@@ -299,47 +141,21 @@ void ServiceMain::Stop() {
         configManager.reset();
 
         if (stopEvent) {
-            Logger::Instance().Debug("ServiceMain::Stop - Closing stop event handle");
+            Logger::Instance().Debug("ServiceMain::StopDirect - Closing stop event handle");
             CloseHandle(stopEvent);
             stopEvent = nullptr;
         }
 
-        Logger::Instance().Info("ServiceMain::Stop - Service stopped successfully");
+        Logger::Instance().Info("ServiceMain::StopDirect - Service logic stopped successfully");
     }
     catch (const std::exception& e) {
-        Logger::Instance().Error("ServiceMain::Stop - Exception during shutdown: " + std::string(e.what()));
+        Logger::Instance().Error("ServiceMain::StopDirect - Exception during shutdown: " + std::string(e.what()));
     }
     catch (...) {
-        Logger::Instance().Error("ServiceMain::Stop - Unknown exception during shutdown");
+        Logger::Instance().Error("ServiceMain::StopDirect - Unknown exception during shutdown");
     }
 
     stopInProgress = false;
-}
-
-void ServiceMain::ReportStatus(DWORD currentState, DWORD exitCode, DWORD waitHint) {
-    static DWORD checkPoint = 1;
-
-    Logger::Instance().Debug("ServiceMain::ReportStatus - State: " + std::to_string(currentState));
-
-    serviceStatus.dwCurrentState = currentState;
-    serviceStatus.dwWin32ExitCode = exitCode;
-    serviceStatus.dwWaitHint = waitHint;
-
-    if (currentState == SERVICE_START_PENDING) {
-        serviceStatus.dwControlsAccepted = 0;
-    }
-    else {
-        serviceStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
-    }
-
-    if (currentState == SERVICE_RUNNING || currentState == SERVICE_STOPPED) {
-        serviceStatus.dwCheckPoint = 0;
-    }
-    else {
-        serviceStatus.dwCheckPoint = checkPoint++;
-    }
-
-    SetServiceStatus(statusHandle, &serviceStatus);
 }
 
 DWORD WINAPI ServiceMain::PipeServerThread(LPVOID param) {
@@ -474,10 +290,6 @@ void ServiceMain::HandlePipeClient(HANDLE pipe) {
 
             case IPCMessageType::ClearRoutes: {
                 routeController->CleanupAllRoutes();
-                break;
-            }
-
-            case IPCMessageType::RestartService: {
                 break;
             }
 

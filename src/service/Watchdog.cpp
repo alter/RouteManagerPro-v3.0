@@ -61,7 +61,6 @@ void Watchdog::WatchThreadFunc() {
     while (running.load() && !ShutdownCoordinator::Instance().isShuttingDown) {
         try {
             CheckMemoryUsage();
-            CheckComponentHealth();
         }
         catch (const std::exception& e) {
             Logger::Instance().Error("Watchdog::WatchThreadFunc - Exception: " + std::string(e.what()));
@@ -91,34 +90,6 @@ void Watchdog::CheckMemoryUsage() {
             Logger::Instance().Error("Watchdog::CheckMemoryUsage - Memory still high after GC");
         }
     }
-}
-
-void Watchdog::CheckComponentHealth() {
-    std::lock_guard<std::mutex> lock(componentsMutex);
-
-    auto now = std::chrono::system_clock::now();
-    for (auto it = components.begin(); it != components.end(); ++it) {
-        std::string name = it->first;
-        ComponentHealth& health = it->second;
-
-        auto duration = std::chrono::duration_cast<std::chrono::seconds>(
-            now - health.lastActivity);
-        int64_t timeSinceActivity = duration.count();
-
-        if (timeSinceActivity > 60 && health.isHealthy) {
-            health.isHealthy = false;
-            Logger::Instance().Warning("Watchdog::CheckComponentHealth - Component unhealthy: " + name);
-
-            if (health.restartCount < Constants::SERVICE_RESTART_MAX) {
-                RestartComponent(name);
-                health.restartCount++;
-            }
-        }
-    }
-}
-
-void Watchdog::RestartComponent(const std::string& name) {
-    Logger::Instance().Info("Watchdog::RestartComponent - Restarting: " + name);
 }
 
 void Watchdog::ForceGarbageCollection() {

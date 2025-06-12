@@ -42,7 +42,7 @@ void SystemTray::CreateContextMenu() {
     AppendMenu(contextMenu, MF_STRING, 2001, L"Show/Hide Window");
     AppendMenu(contextMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenu(contextMenu, MF_STRING, 2003, L"View Active Routes");
-    AppendMenu(contextMenu, MF_STRING, 2004, L"Restart Service");
+    // AppendMenu(contextMenu, MF_STRING, 2004, L"Restart Service"); // Removed
     AppendMenu(contextMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenu(contextMenu, MF_STRING, 2005, L"Exit");
 }
@@ -60,11 +60,15 @@ void SystemTray::ShowContextMenu() {
         ShowWindow(hwnd, IsWindowVisible(hwnd) ? SW_HIDE : SW_SHOW);
         break;
     case 2003:
-        SendMessage(hwnd, WM_COMMAND, 1004, 0);
+        // This command ID should ideally be defined in a shared constants header for UI
+        // Assuming 1004 is "View Logs" or similar. Let's make it more explicit.
+        // For now, let's assume it should open the route table or main window.
+        ShowWindow(hwnd, SW_SHOW);
+        SetForegroundWindow(hwnd);
         break;
-    case 2004:
-        SendMessage(hwnd, WM_COMMAND, 1007, 0);
-        break;
+        // case 2004: // Removed
+        //    SendMessage(hwnd, WM_COMMAND, 1007, 0);
+        //    break;
     case 2005:
         PostMessage(hwnd, WM_CLOSE, 0, 0);
         break;

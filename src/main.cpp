@@ -14,114 +14,36 @@
 #include "common/Utils.h"
 #include "common/ShutdownCoordinator.h"
 
-std::thread g_serviceThread;
-std::atomic<bool> g_serviceRunning(false);
-ServiceMain* g_service = nullptr;
-std::mutex g_serviceMutex;
-HANDLE g_shutdownEvent = nullptr;
+// Global thread to run the service logic
+std::thread g_serviceLogicThread;
 
-void RunServiceInThread() {
-    Logger::Instance().Info("RunServiceInThread - Starting service in background thread");
-    g_serviceRunning = true;
-
+// This function contains the entire lifecycle of the service logic.
+// It creates the main service object on its own stack and runs it.
+// The StartDirect() call is blocking and will only return upon shutdown.
+void RunServiceLogic() {
+    Logger::Instance().Info("RunServiceLogic - Starting service logic in background thread.");
     try {
-        Logger::Instance().Debug("RunServiceInThread - Creating ServiceMain instance");
-        g_service = new ServiceMain();
-
-        Logger::Instance().Debug("RunServiceInThread - Calling StartDirect");
-        g_service->StartDirect();
-
-        Logger::Instance().Debug("RunServiceInThread - StartDirect returned, deleting service");
-        delete g_service;
-        g_service = nullptr;
+        ServiceMain serviceLogic;
+        serviceLogic.StartDirect(); // This blocks until StopDirect is called and shutdown is complete.
     }
     catch (const std::exception& e) {
-        Logger::Instance().Error("RunServiceInThread - Exception: " + std::string(e.what()));
-        if (g_service) {
-            delete g_service;
-            g_service = nullptr;
-        }
+        Logger::Instance().Error("RunServiceLogic - Exception: " + std::string(e.what()));
+        MessageBoxA(NULL, ("A critical error occurred in the background service: " + std::string(e.what())).c_str(), "Critical Error", MB_OK | MB_ICONERROR);
     }
     catch (...) {
-        Logger::Instance().Error("RunServiceInThread - Unknown exception");
-        if (g_service) {
-            delete g_service;
-            g_service = nullptr;
-        }
+        Logger::Instance().Error("RunServiceLogic - Unknown exception.");
+        MessageBoxA(NULL, "An unknown critical error occurred in the background service.", "Critical Error", MB_OK | MB_ICONERROR);
     }
-
-    g_serviceRunning = false;
-    Logger::Instance().Info("RunServiceInThread - Service thread ended");
-
-    if (g_shutdownEvent) {
-        Logger::Instance().Debug("RunServiceInThread - Setting shutdown event");
-        SetEvent(g_shutdownEvent);
-    }
+    Logger::Instance().Info("RunServiceLogic - Service logic thread has finished.");
 }
 
-void StopServiceThread() {
-    Logger::Instance().Info("StopServiceThread - Called");
-
-    std::lock_guard<std::mutex> lock(g_serviceMutex);
-
-    if (!g_service) {
-        Logger::Instance().Warning("StopServiceThread - No service to stop");
-        return;
-    }
-
-    const auto maxShutdownTime = std::chrono::seconds(10);
-    auto shutdownStart = std::chrono::steady_clock::now();
-
-    try {
-        Logger::Instance().Info("StopServiceThread - Calling StopDirect");
-        g_service->StopDirect();
-
-        auto elapsed = std::chrono::steady_clock::now() - shutdownStart;
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-            maxShutdownTime - elapsed);
-
-        if (remaining.count() > 0) {
-            Logger::Instance().Debug("StopServiceThread - Waiting for threads with timeout: " + std::to_string(remaining.count()) + "ms");
-            ShutdownCoordinator::Instance().WaitForThreads(remaining);
-        }
-
-        if (g_shutdownEvent) {
-            Logger::Instance().Debug("StopServiceThread - Waiting for shutdown event");
-            DWORD result = WaitForSingleObject(g_shutdownEvent, 5000);
-            if (result == WAIT_TIMEOUT) {
-                Logger::Instance().Warning("StopServiceThread - Service thread did not complete within timeout");
-            }
-            else {
-                Logger::Instance().Debug("StopServiceThread - Shutdown event signaled");
-            }
-        }
-
-        if (g_serviceThread.joinable()) {
-            Logger::Instance().Debug("StopServiceThread - Joining service thread");
-            g_serviceThread.join();
-            Logger::Instance().Debug("StopServiceThread - Service thread joined");
-        }
-
-    }
-    catch (const std::exception& e) {
-        Logger::Instance().Error("StopServiceThread - Exception during shutdown: " + std::string(e.what()));
-    }
-    catch (...) {
-        Logger::Instance().Error("StopServiceThread - Unknown exception during shutdown");
-    }
-
-    Logger::Instance().Debug("StopServiceThread - Deleting service instance");
-    delete g_service;
-    g_service = nullptr;
-
-    Logger::Instance().Info("StopServiceThread - Completed");
-}
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
-    Logger::Instance().Info("WinMain - Application started");
+    Logger::Instance().Info("WinMain - Application started.");
 
+    // The application requires administrator privileges to manage network routes.
     if (!Utils::IsRunAsAdmin()) {
-        Logger::Instance().Warning("WinMain - Not running as admin");
+        Logger::Instance().Warning("WinMain - Not running as admin. Prompting for elevation.");
         int result = MessageBoxW(NULL,
             L"Route Manager Pro requires administrator privileges to manage network routes.\n\n"
             L"Would you like to restart with administrator rights?",
@@ -144,50 +66,52 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    HANDLE mutex = CreateMutexW(NULL, TRUE, L"RouteManagerPro");
+    // Ensure only one instance of the application is running.
+    HANDLE mutex = CreateMutexW(NULL, TRUE, L"RouteManagerProInstanceMutex");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        Logger::Instance().Warning("WinMain - Another instance already running");
+        Logger::Instance().Warning("WinMain - Another instance is already running.");
         MessageBoxW(NULL, L"Route Manager Pro is already running!", L"Error", MB_OK | MB_ICONWARNING);
         if (mutex) CloseHandle(mutex);
         return 1;
     }
 
-    Logger::Instance().Debug("WinMain - Creating shutdown event");
-    g_shutdownEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-
     int result = 0;
-
     try {
-        Logger::Instance().Debug("WinMain - Starting service thread");
-        g_serviceThread = std::thread(RunServiceInThread);
+        Logger::Instance().Debug("WinMain - Starting service logic thread.");
+        g_serviceLogicThread = std::thread(RunServiceLogic);
 
-        Logger::Instance().Debug("WinMain - Starting MainWindow");
+        // A small delay to ensure the pipe server has a chance to start.
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        Logger::Instance().Debug("WinMain - Starting MainWindow.");
         result = MainWindow::Run(hInstance, nCmdShow);
         Logger::Instance().Debug("WinMain - MainWindow returned with code: " + std::to_string(result));
     }
     catch (const std::exception& e) {
-        Logger::Instance().Error("WinMain - Exception: " + std::string(e.what()));
+        Logger::Instance().Error("WinMain - Exception during startup or UI run: " + std::string(e.what()));
         result = 1;
     }
     catch (...) {
-        Logger::Instance().Error("WinMain - Unknown exception");
+        Logger::Instance().Error("WinMain - Unknown exception during startup or UI run.");
         result = 1;
     }
 
-    Logger::Instance().Info("WinMain - Stopping service before exit");
-    StopServiceThread();
+    // After the UI closes, we must signal the background thread to shut down.
+    Logger::Instance().Info("WinMain - UI has closed. Initiating shutdown of service logic.");
+    ShutdownCoordinator::Instance().InitiateShutdown();
 
-    if (g_shutdownEvent) {
-        Logger::Instance().Debug("WinMain - Closing shutdown event");
-        CloseHandle(g_shutdownEvent);
-        g_shutdownEvent = nullptr;
+    // Wait for the service logic thread to finish its cleanup and exit.
+    if (g_serviceLogicThread.joinable()) {
+        Logger::Instance().Debug("WinMain - Joining service logic thread.");
+        g_serviceLogicThread.join();
+        Logger::Instance().Debug("WinMain - Service logic thread joined.");
     }
 
     if (mutex) {
-        Logger::Instance().Debug("WinMain - Closing mutex");
+        ReleaseMutex(mutex);
         CloseHandle(mutex);
     }
 
-    Logger::Instance().Info("WinMain - Application shutting down cleanly");
+    Logger::Instance().Info("WinMain - Application shutting down cleanly.");
     return result;
 }

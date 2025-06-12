@@ -15,17 +15,10 @@ public:
     ServiceMain();
     ~ServiceMain();
 
-    static int Run();
-    static int Install();
-    static int Uninstall();
-
     void StartDirect();
     void StopDirect();
 
 private:
-    static ServiceMain* instance;
-    static SERVICE_STATUS_HANDLE statusHandle;
-    static SERVICE_STATUS serviceStatus;
     static HANDLE stopEvent;
 
     std::unique_ptr<NetworkMonitor> networkMonitor;
@@ -35,16 +28,8 @@ private:
     std::unique_ptr<ConfigManager> configManager;
 
     std::atomic<bool> running;
-    std::atomic<bool> isShuttingDown;
-    std::atomic<bool> pipeServerRunning;
     HANDLE pipeThread;
 
-    static VOID WINAPI ServiceMainEntry(DWORD argc, LPWSTR* argv);
-    static VOID WINAPI ServiceCtrlHandler(DWORD ctrlCode);
     static DWORD WINAPI PipeServerThread(LPVOID param);
-
-    void Start();
-    void Stop();
-    void ReportStatus(DWORD currentState, DWORD exitCode = NO_ERROR, DWORD waitHint = 0);
     void HandlePipeClient(HANDLE pipe);
 };

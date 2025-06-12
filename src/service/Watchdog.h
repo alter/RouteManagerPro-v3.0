@@ -21,22 +21,10 @@ public:
 private:
     ServiceMain* service;
     std::atomic<bool> running;
-    std::atomic<bool> isStoppingFlag;
     std::thread watchThread;
     std::chrono::system_clock::time_point startTime;
 
-    struct ComponentHealth {
-        std::chrono::system_clock::time_point lastActivity;
-        int restartCount;
-        bool isHealthy;
-    };
-
-    std::unordered_map<std::string, ComponentHealth> components;
-    mutable std::mutex componentsMutex;
-
     void WatchThreadFunc();
     void CheckMemoryUsage();
-    void CheckComponentHealth();
-    void RestartComponent(const std::string& name);
     void ForceGarbageCollection();
 };

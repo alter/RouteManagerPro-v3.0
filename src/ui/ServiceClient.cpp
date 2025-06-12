@@ -88,28 +88,20 @@ IPCResponse ServiceClient::SendMessage(const IPCMessage& message) {
         return response;
     }
 
-    // Увеличиваем размер буфера для чтения больших объемов данных
-    const size_t INITIAL_BUFFER_SIZE = 65536; // 64KB вместо 4KB
+    const size_t INITIAL_BUFFER_SIZE = 65536;
     buffer.resize(INITIAL_BUFFER_SIZE);
     DWORD bytesRead = 0;
 
-    // Читаем данные с возможностью увеличения буфера
     BOOL readResult = ReadFile(pipe, buffer.data(), static_cast<DWORD>(buffer.size()), &bytesRead, nullptr);
 
     if (!readResult) {
         DWORD error = GetLastError();
-
-        // ERROR_MORE_DATA (234) означает, что есть еще данные
         if (error == ERROR_MORE_DATA) {
             Logger::Instance().Debug("ServiceClient::SendMessage - More data available, resizing buffer");
-
-            // Узнаем размер оставшихся данных
             DWORD bytesAvailable = 0;
             if (PeekNamedPipe(pipe, nullptr, 0, nullptr, &bytesAvailable, nullptr) && bytesAvailable > 0) {
                 size_t totalSize = bytesRead + bytesAvailable;
                 buffer.resize(totalSize);
-
-                // Читаем оставшиеся данные
                 DWORD additionalBytesRead = 0;
                 if (ReadFile(pipe, buffer.data() + bytesRead, bytesAvailable, &additionalBytesRead, nullptr)) {
                     bytesRead += additionalBytesRead;
@@ -249,15 +241,6 @@ void ServiceClient::ClearRoutes() {
 
     IPCMessage msg;
     msg.type = IPCMessageType::ClearRoutes;
-
-    SendMessage(msg);
-}
-
-void ServiceClient::RestartService() {
-    if (!connected) return;
-
-    IPCMessage msg;
-    msg.type = IPCMessageType::RestartService;
 
     SendMessage(msg);
 }

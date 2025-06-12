@@ -4,11 +4,12 @@
 #include <windows.h>
 #include <string>
 
-namespace Constants {
-    const std::wstring SERVICE_NAME = L"RouteManagerPro";
-    const std::wstring SERVICE_DISPLAY_NAME = L"Route Manager Pro Service";
-    const std::wstring SERVICE_DESCRIPTION = L"Automatic VPN routing for selected applications";
+// Removed service-specific constants
+// const std::wstring SERVICE_NAME = L"RouteManagerPro";
+// const std::wstring SERVICE_DISPLAY_NAME = L"Route Manager Pro Service";
+// const std::wstring SERVICE_DESCRIPTION = L"Automatic VPN routing for selected applications";
 
+namespace Constants {
     const std::string PIPE_NAME = "\\\\.\\pipe\\RouteManagerPro";
     const std::string CONFIG_FILE = "config.json";
     const std::string STATE_FILE = "state.json";
@@ -30,9 +31,9 @@ namespace Constants {
     const int QUEUE_SIZE_NORMAL = 500;
 
     const int WM_TRAY_ICON = WM_USER + 1;
-    const int WM_SERVICE_STATUS = WM_USER + 2;
+    // const int WM_SERVICE_STATUS = WM_USER + 2; // Removed
 
-    const int SERVICE_RESTART_MAX = 3;
+    // const int SERVICE_RESTART_MAX = 3; // Removed
     const int CONNECTION_CLEANUP_HOURS = 1;
     const int ROUTE_CLEANUP_HOURS = 48;
 }
