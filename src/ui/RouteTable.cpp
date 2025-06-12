@@ -15,6 +15,8 @@
 
 #pragma comment(lib, "comctl32.lib")
 
+#define WM_ROUTES_CLEARED (WM_USER + 100)
+
 RouteTable::RouteTable(HWND parent, ServiceClient* client)
     : parentWnd(parent), groupBox(nullptr), listView(nullptr), cleanRoutesButton(nullptr), serviceClient(client), currentScrollPos(-1) {
 }
@@ -184,6 +186,10 @@ void RouteTable::OnCleanAllRoutes() {
     if (result == IDYES) {
         serviceClient->ClearRoutes();
         MessageBox(parentWnd, L"All routes have been removed.", L"Success", MB_OK | MB_ICONINFORMATION);
+
+        // Notify parent window that routes were cleared
+        PostMessage(parentWnd, WM_ROUTES_CLEARED, 0, 0);
+
         Refresh();
     }
 }

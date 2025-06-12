@@ -215,6 +215,7 @@ void RouteController::CleanupAllRoutes() {
 
     // 1. Collect route information and clear internal cache under lock
     std::vector<std::pair<std::string, int>> routesToDelete;
+    bool hadPreloadRoutes = false;
     {
         std::lock_guard<std::mutex> lock(routesMutex);
         if (routes.empty()) {
@@ -222,9 +223,12 @@ void RouteController::CleanupAllRoutes() {
             return;
         }
 
-        // Collect routes to delete
+        // Collect routes to delete and check for preload routes
         for (const auto& [routeKey, route] : routes) {
             routesToDelete.emplace_back(route->ip, route->prefixLength);
+            if (route->processName.find("Preload-") == 0) {
+                hadPreloadRoutes = true;
+            }
         }
 
         // Clear internal cache immediately
@@ -245,6 +249,12 @@ void RouteController::CleanupAllRoutes() {
             Logger::Instance().Error("Failed to remove Windows route for: " + ip + "/" + std::to_string(prefixLength));
             failCount++;
         }
+    }
+
+    // 3. If we had preload routes, disable AI preload in config
+    if (hadPreloadRoutes) {
+        config.aiPreloadEnabled = false;
+        Logger::Instance().Info("CleanupAllRoutes - Disabled AI preload since preload routes were removed");
     }
 
     // Force immediate save for cleanup

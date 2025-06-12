@@ -250,6 +250,16 @@ LRESULT CALLBACK MainWindow::WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         return 0;
     }
 
+    case WM_USER + 100: // WM_ROUTES_CLEARED
+        // Routes were cleared, refresh configuration and UI
+        if (instance->serviceClient && instance->serviceClient->IsConnected()) {
+            instance->config = instance->serviceClient->GetConfig();
+            SendMessage(instance->aiPreloadCheckbox, BM_SETCHECK,
+                instance->config.aiPreloadEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+            Logger::Instance().Info("MainWindow: Updated AI preload checkbox after route cleanup");
+        }
+        return 0;
+
     case WM_CLOSE: {
         instance->OnClose();
         return 0;

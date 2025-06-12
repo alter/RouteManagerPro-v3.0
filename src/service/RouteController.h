@@ -25,6 +25,7 @@ public:
     size_t GetRouteCount() const;
     std::vector<RouteInfo> GetActiveRoutes() const;
     void PreloadAIRoutes();
+    ServiceConfig GetConfig() const { return config; }
 
 private:
     ServiceConfig config;

@@ -310,6 +310,14 @@ void ServiceMain::HandlePipeClient(HANDLE pipe) {
 
             case IPCMessageType::ClearRoutes: {
                 routeController->CleanupAllRoutes();
+                // Check if AI preload was disabled and update config
+                auto currentConfig = configManager->GetConfig();
+                auto routeConfig = routeController->GetConfig();
+                if (currentConfig.aiPreloadEnabled && !routeConfig.aiPreloadEnabled) {
+                    currentConfig.aiPreloadEnabled = false;
+                    configManager->SetConfig(currentConfig);
+                    Logger::Instance().Info("ServiceMain: Disabled AI preload in config after route cleanup");
+                }
                 break;
             }
 
