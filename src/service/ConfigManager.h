@@ -2,6 +2,9 @@
 #pragma once
 #include <string>
 #include <mutex>
+#include <atomic>
+#include <chrono>
+#include <thread>
 #include "../common/Models.h"
 
 class ConfigManager {
@@ -18,7 +21,15 @@ private:
     ServiceConfig config;
     std::string configPath;
 
+    // Persistence optimization
+    std::atomic<bool> configDirty{ false };
+    std::chrono::steady_clock::time_point lastSaveTime;
+    static constexpr auto SAVE_INTERVAL = std::chrono::minutes(10);
+    std::atomic<bool> running{ true };
+    std::thread persistThread;
+
     void LoadConfig();
     void SaveConfig();
     ServiceConfig GetDefaultConfig();
+    void PersistenceThreadFunc();
 };

@@ -50,9 +50,11 @@
     <ClInclude Include="src\common\Models.h" />
     <ClInclude Include="src\common\ShutdownCoordinator.h" />
     <ClInclude Include="src\common\Utils.h" />
+    <ClInclude Include="src\common\WinHandles.h" />
     <ClInclude Include="src\service\ConfigManager.h" />
     <ClInclude Include="src\service\NetworkMonitor.h" />
     <ClInclude Include="src\service\ProcessManager.h" />
+    <ClInclude Include="src\service\ProcessManager.hpp" />
     <ClInclude Include="src\service\RouteController.h" />
     <ClInclude Include="src\service\ServiceMain.h" />
     <ClInclude Include="src\service\Watchdog.h" />

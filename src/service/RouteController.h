@@ -6,6 +6,7 @@
 #include <mutex>
 #include <thread>
 #include <atomic>
+#include <chrono>
 #include "../common/Models.h"
 
 class RouteController {
@@ -29,6 +30,12 @@ private:
     mutable std::mutex routesMutex;
     std::atomic<bool> running;
     std::thread verifyThread;
+    std::thread persistThread;
+
+    // Persistence optimization
+    std::atomic<bool> routesDirty{ false };
+    std::chrono::steady_clock::time_point lastSaveTime;
+    static constexpr auto SAVE_INTERVAL = std::chrono::minutes(10);
 
     bool AddSystemRoute(const std::string& ip);
     bool AddSystemRouteWithMask(const std::string& ip, int prefixLength);
@@ -37,7 +44,9 @@ private:
     bool RemoveSystemRoute(const std::string& ip);
     bool RemoveSystemRouteWithMask(const std::string& ip, int prefixLength);
     void VerifyRoutesThreadFunc();
+    void PersistenceThreadFunc();
     void SaveRoutesToDisk();
+    void SaveRoutesToDiskAsync();
     void LoadRoutesFromDisk();
     bool IsGatewayReachable();
 

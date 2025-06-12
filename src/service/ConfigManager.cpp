@@ -3,16 +3,69 @@
 #include "../common/Constants.h"
 #include "../common/Utils.h"
 #include "../common/Logger.h"
+#include "../common/ShutdownCoordinator.h"
 #include <fstream>
 #include <json/json.h>
+#include <chrono>
+#include <thread>
+#include <filesystem>
 
-ConfigManager::ConfigManager() {
+ConfigManager::ConfigManager() : configDirty(false),
+lastSaveTime(std::chrono::steady_clock::now()),
+persistThread(&ConfigManager::PersistenceThreadFunc, this) {
     configPath = Utils::GetCurrentDirectory() + "\\" + Constants::CONFIG_FILE;
     LoadConfig();
 }
 
 ConfigManager::~ConfigManager() {
-    SaveConfig();
+    running = false;
+    if (persistThread.joinable()) {
+        persistThread.join();
+    }
+
+    // Final save on shutdown
+    if (configDirty.load()) {
+        Logger::Instance().Info("ConfigManager shutdown: Saving config to disk");
+        SaveConfig();
+    }
+}
+
+void ConfigManager::PersistenceThreadFunc() {
+    Logger::Instance().Info("ConfigManager persistence thread started");
+
+    try {
+        while (running.load() && !ShutdownCoordinator::Instance().isShuttingDown) {
+            // Check every minute
+            for (int i = 0; i < 60 && running.load() && !ShutdownCoordinator::Instance().isShuttingDown; i++) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+
+            if (!running.load() || ShutdownCoordinator::Instance().isShuttingDown) {
+                break;
+            }
+
+            auto now = std::chrono::steady_clock::now();
+            auto timeSinceLastSave = now - lastSaveTime;
+
+            // Save if dirty and 10 minutes have passed
+            if (configDirty.load() && timeSinceLastSave >= SAVE_INTERVAL) {
+                Logger::Instance().Info("Periodic save of config (dirty flag set)");
+                SaveConfig();
+            }
+        }
+
+        // Final save on thread exit
+        if (configDirty.load()) {
+            Logger::Instance().Info("ConfigManager persistence thread: Final save of config");
+            SaveConfig();
+        }
+    }
+    catch (const std::exception& e) {
+        Logger::Instance().Error("ConfigManager::PersistenceThreadFunc exception: " + std::string(e.what()));
+    }
+
+    // Log AFTER all work is done, right before thread exits
+    Logger::Instance().Info("ConfigManager persistence thread exiting");
 }
 
 ServiceConfig ConfigManager::GetConfig() const {
@@ -23,10 +76,10 @@ ServiceConfig ConfigManager::GetConfig() const {
 void ConfigManager::SetConfig(const ServiceConfig& newConfig) {
     std::lock_guard<std::mutex> lock(configMutex);
     config = newConfig;
-    SaveConfig();
+    configDirty = true;  // Mark as dirty instead of saving immediately
 
-    Logger::Instance().Info("ConfigManager::SetConfig - Saved " +
-        std::to_string(config.selectedProcesses.size()) + " selected processes");
+    Logger::Instance().Info("ConfigManager::SetConfig - Updated " +
+        std::to_string(config.selectedProcesses.size()) + " selected processes (marked dirty)");
     for (const auto& proc : config.selectedProcesses) {
         Logger::Instance().Debug("  - " + proc);
     }
@@ -35,14 +88,14 @@ void ConfigManager::SetConfig(const ServiceConfig& newConfig) {
 void ConfigManager::SetAIPreloadEnabled(bool enabled) {
     std::lock_guard<std::mutex> lock(configMutex);
     config.aiPreloadEnabled = enabled;
-    SaveConfig();
+    configDirty = true;  // Mark as dirty instead of saving immediately
 }
 
 void ConfigManager::LoadConfig() {
     if (!Utils::FileExists(configPath)) {
         Logger::Instance().Info("ConfigManager::LoadConfig - Config file not found, using defaults");
         config = GetDefaultConfig();
-        SaveConfig();
+        SaveConfig();  // Save defaults immediately
         return;
     }
 
@@ -84,29 +137,38 @@ void ConfigManager::LoadConfig() {
     }
 
     file.close();
+    configDirty = false;  // Reset dirty flag after loading
 }
 
 void ConfigManager::SaveConfig() {
     Logger::Instance().Info("ConfigManager::SaveConfig - Saving configuration with " +
         std::to_string(config.selectedProcesses.size()) + " selected processes");
 
+    // Create a copy of config under lock
+    ServiceConfig configCopy;
+    {
+        std::lock_guard<std::mutex> lock(configMutex);
+        configCopy = config;
+    }
+
+    // Save without holding the lock
     Json::Value root;
-    root["gatewayIp"] = config.gatewayIp;
-    root["metric"] = config.metric;
-    root["startMinimized"] = config.startMinimized;
-    root["startWithWindows"] = config.startWithWindows;
-    root["aiPreloadEnabled"] = config.aiPreloadEnabled;
+    root["gatewayIp"] = configCopy.gatewayIp;
+    root["metric"] = configCopy.metric;
+    root["startMinimized"] = configCopy.startMinimized;
+    root["startWithWindows"] = configCopy.startWithWindows;
+    root["aiPreloadEnabled"] = configCopy.aiPreloadEnabled;
 
     Json::Value processes(Json::arrayValue);
-    for (const auto& process : config.selectedProcesses) {
+    for (const auto& process : configCopy.selectedProcesses) {
         processes.append(process);
         Logger::Instance().Debug("  Saving process: " + process);
     }
     root["selectedProcesses"] = processes;
 
-    std::ofstream file(configPath);
+    std::ofstream file(configPath + ".tmp");
     if (!file.is_open()) {
-        Logger::Instance().Error("ConfigManager::SaveConfig - Failed to open file: " + configPath);
+        Logger::Instance().Error("ConfigManager::SaveConfig - Failed to open file: " + configPath + ".tmp");
         return;
     }
 
@@ -114,6 +176,14 @@ void ConfigManager::SaveConfig() {
     std::unique_ptr<Json::StreamWriter> writer(builder.newStreamWriter());
     writer->write(root, &file);
     file.close();
+
+    // Atomic rename
+    if (std::filesystem::exists(configPath + ".tmp")) {
+        std::filesystem::rename(configPath + ".tmp", configPath);
+    }
+
+    configDirty = false;
+    lastSaveTime = std::chrono::steady_clock::now();
 
     Logger::Instance().Debug("ConfigManager::SaveConfig - Saved to " + configPath);
 }

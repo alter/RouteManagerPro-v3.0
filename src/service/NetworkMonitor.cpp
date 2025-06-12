@@ -41,7 +41,7 @@ void NetworkMonitor::Start() {
     Logger::Instance().Info("WinDivert handle opened successfully");
 
     WinDivertSetParam(divertHandle, WINDIVERT_PARAM_QUEUE_LENGTH, 16384);
-    WinDivertSetParam(divertHandle, WINDIVERT_PARAM_QUEUE_TIME, 128);
+    WinDivertSetParam(divertHandle, WINDIVERT_PARAM_QUEUE_TIME, 1000); // 1 second for responsive shutdown
     WinDivertSetParam(divertHandle, WINDIVERT_PARAM_QUEUE_SIZE, 8388608);
 
     running = true;
@@ -52,22 +52,35 @@ void NetworkMonitor::Start() {
 
 void NetworkMonitor::Stop() {
     Logger::Instance().Info("NetworkMonitor::Stop called");
+
+    // First, signal the thread to stop
     running = false;
+    active = false;
 
     if (divertHandle != INVALID_HANDLE_VALUE) {
         Logger::Instance().Info("Shutting down WinDivert handle");
-        WinDivertShutdown(divertHandle, WINDIVERT_SHUTDOWN_BOTH);
+
+        // Shutdown will cause WinDivertRecv to return with ERROR_NO_DATA
+        if (!WinDivertShutdown(divertHandle, WINDIVERT_SHUTDOWN_BOTH)) {
+            DWORD error = GetLastError();
+            Logger::Instance().Warning("WinDivertShutdown failed: " + std::to_string(error));
+        }
 
         if (monitorThread.joinable()) {
             Logger::Instance().Info("Waiting for monitor thread to complete");
-            monitorThread.join();
+
+            // Should complete within 1 second due to QUEUE_TIME setting
+            if (monitorThread.joinable()) {
+                monitorThread.join();
+                Logger::Instance().Info("Monitor thread joined successfully");
+            }
         }
 
+        Logger::Instance().Info("Closing WinDivert handle");
         WinDivertClose(divertHandle);
         divertHandle = INVALID_HANDLE_VALUE;
     }
 
-    active = false;
     Logger::Instance().Info("NetworkMonitor stopped");
 }
 
@@ -81,17 +94,42 @@ void NetworkMonitor::MonitorThreadFunc() {
     Logger::Instance().Info("Monitor thread started - waiting for FLOW events");
 
     while (running.load() && !ShutdownCoordinator::Instance().isShuttingDown) {
-        if (!WinDivertRecv(divertHandle, NULL, 0, NULL, &addr)) {
+        UINT recvLen = 0;
+
+        // WinDivertRecv will return after QUEUE_TIME even if no packets
+        if (!WinDivertRecv(divertHandle, NULL, 0, &recvLen, &addr)) {
             DWORD error = GetLastError();
-            if (error == ERROR_NO_DATA) {
+
+            // Check if we're shutting down
+            if (!running.load() || ShutdownCoordinator::Instance().isShuttingDown) {
+                Logger::Instance().Info("Monitor thread: Shutdown detected during recv, exiting");
                 break;
             }
-            if (error != ERROR_INSUFFICIENT_BUFFER) {
-                Logger::Instance().Error("WinDivertRecv failed: " + std::to_string(error));
-                active = false;
+
+            if (error == ERROR_NO_DATA) {
+                // Handle was shut down
+                Logger::Instance().Info("Monitor thread: WinDivert handle shut down (ERROR_NO_DATA)");
                 break;
+            }
+            else if (error == ERROR_INVALID_PARAMETER) {
+                // Handle was closed
+                Logger::Instance().Info("Monitor thread: WinDivert handle closed");
+                break;
+            }
+            else if (error != ERROR_INSUFFICIENT_BUFFER) {
+                Logger::Instance().Error("WinDivertRecv failed: " + std::to_string(error));
+                // Continue trying unless it's a fatal error
+                if (error == ERROR_INVALID_HANDLE) {
+                    break;
+                }
             }
             continue;
+        }
+
+        // Check shutdown again after successful receive
+        if (!running.load() || ShutdownCoordinator::Instance().isShuttingDown) {
+            Logger::Instance().Info("Monitor thread: Shutdown detected after recv, exiting");
+            break;
         }
 
         if (addr.Layer == WINDIVERT_LAYER_FLOW) {
@@ -112,7 +150,8 @@ void NetworkMonitor::MonitorThreadFunc() {
         }
     }
 
-    Logger::Instance().Info("Monitor thread stopped after processing " + std::to_string(eventCount) + " events");
+    active = false;
+    Logger::Instance().Info("Monitor thread exiting cleanly after processing " + std::to_string(eventCount) + " events");
 }
 
 void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr) {

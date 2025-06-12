@@ -14,17 +14,17 @@
 #include "common/Utils.h"
 #include "common/ShutdownCoordinator.h"
 
-// Global thread to run the service logic
+// Global service instance
+ServiceMain* g_pServiceMain = nullptr;
 std::thread g_serviceLogicThread;
 
-// This function contains the entire lifecycle of the service logic.
-// It creates the main service object on its own stack and runs it.
-// The StartDirect() call is blocking and will only return upon shutdown.
 void RunServiceLogic() {
     Logger::Instance().Info("RunServiceLogic - Starting service logic in background thread.");
     try {
-        ServiceMain serviceLogic;
-        serviceLogic.StartDirect(); // This blocks until StopDirect is called and shutdown is complete.
+        g_pServiceMain = new ServiceMain();
+        g_pServiceMain->StartDirect(); // This blocks until StopDirect is called
+        delete g_pServiceMain;
+        g_pServiceMain = nullptr;
     }
     catch (const std::exception& e) {
         Logger::Instance().Error("RunServiceLogic - Exception: " + std::string(e.what()));
@@ -36,7 +36,6 @@ void RunServiceLogic() {
     }
     Logger::Instance().Info("RunServiceLogic - Service logic thread has finished.");
 }
-
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     Logger::Instance().Info("WinMain - Application started.");
@@ -80,8 +79,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         Logger::Instance().Debug("WinMain - Starting service logic thread.");
         g_serviceLogicThread = std::thread(RunServiceLogic);
 
-        // A small delay to ensure the pipe server has a chance to start.
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        // Wait a bit for service to initialize
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
         Logger::Instance().Debug("WinMain - Starting MainWindow.");
         result = MainWindow::Run(hInstance, nCmdShow);
@@ -98,13 +97,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // After the UI closes, we must signal the background thread to shut down.
     Logger::Instance().Info("WinMain - UI has closed. Initiating shutdown of service logic.");
+
+    // Signal shutdown
     ShutdownCoordinator::Instance().InitiateShutdown();
+
+    // Call StopDirect if service is still running
+    if (g_pServiceMain) {
+        Logger::Instance().Info("WinMain - Calling StopDirect on service");
+        g_pServiceMain->StopDirect();
+    }
 
     // Wait for the service logic thread to finish its cleanup and exit.
     if (g_serviceLogicThread.joinable()) {
-        Logger::Instance().Debug("WinMain - Joining service logic thread.");
-        g_serviceLogicThread.join();
-        Logger::Instance().Debug("WinMain - Service logic thread joined.");
+        Logger::Instance().Debug("WinMain - Waiting for service logic thread.");
+        try {
+            // Just join without timeout - the service should exit quickly now
+            g_serviceLogicThread.join();
+            Logger::Instance().Debug("WinMain - Service logic thread joined successfully.");
+        }
+        catch (const std::exception& e) {
+            Logger::Instance().Error("WinMain - Exception joining service thread: " + std::string(e.what()));
+        }
     }
 
     if (mutex) {
@@ -113,5 +126,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     Logger::Instance().Info("WinMain - Application shutting down cleanly.");
+
+    // Force flush logs
+    Logger::Instance().Info("=== END OF LOG ===");
+
     return result;
 }

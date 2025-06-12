@@ -107,21 +107,21 @@ void ServiceMain::StopDirect() {
     }
 
     try {
-        if (networkMonitor) {
-            Logger::Instance().Info("Stopping NetworkMonitor");
-            networkMonitor->Stop();
-            Logger::Instance().Debug("NetworkMonitor stopped successfully");
-        }
-
-        if (watchdog) {
-            Logger::Instance().Info("Stopping Watchdog");
-            watchdog->Stop();
-            Logger::Instance().Debug("Watchdog stopped successfully");
-        }
+        // Stop components in reverse order of creation
 
         if (pipeThread) {
             Logger::Instance().Info("Stopping pipe server thread");
-            DWORD result = WaitForSingleObject(pipeThread, 5000);
+            // Force close any active pipe connections
+            HANDLE tempPipe = CreateFileA(
+                Constants::PIPE_NAME.c_str(),
+                GENERIC_READ | GENERIC_WRITE,
+                0, nullptr, OPEN_EXISTING, 0, nullptr
+            );
+            if (tempPipe != INVALID_HANDLE_VALUE) {
+                CloseHandle(tempPipe);
+            }
+
+            DWORD result = WaitForSingleObject(pipeThread, 3000);
             if (result == WAIT_TIMEOUT) {
                 Logger::Instance().Warning("Pipe thread did not exit in time, terminating");
                 TerminateThread(pipeThread, 1);
@@ -133,12 +133,39 @@ void ServiceMain::StopDirect() {
             pipeThread = nullptr;
         }
 
-        Logger::Instance().Debug("ServiceMain::StopDirect - Resetting unique_ptrs");
-        networkMonitor.reset();
-        processManager.reset();
-        routeController.reset();
-        watchdog.reset();
-        configManager.reset();
+        if (watchdog) {
+            Logger::Instance().Info("Stopping Watchdog");
+            watchdog->Stop();
+            Logger::Instance().Debug("Waiting for watchdog destruction");
+            watchdog.reset();
+            Logger::Instance().Debug("Watchdog destroyed successfully");
+        }
+
+        if (networkMonitor) {
+            Logger::Instance().Info("Stopping NetworkMonitor");
+            networkMonitor->Stop();
+            Logger::Instance().Debug("Waiting for network monitor destruction");
+            networkMonitor.reset();
+            Logger::Instance().Debug("NetworkMonitor destroyed successfully");
+        }
+
+        if (processManager) {
+            Logger::Instance().Info("Destroying ProcessManager");
+            processManager.reset();
+            Logger::Instance().Debug("ProcessManager destroyed successfully");
+        }
+
+        if (routeController) {
+            Logger::Instance().Info("Destroying RouteController");
+            routeController.reset();
+            Logger::Instance().Debug("RouteController destroyed successfully");
+        }
+
+        if (configManager) {
+            Logger::Instance().Info("Destroying ConfigManager");
+            configManager.reset();
+            Logger::Instance().Debug("ConfigManager destroyed successfully");
+        }
 
         if (stopEvent) {
             Logger::Instance().Debug("ServiceMain::StopDirect - Closing stop event handle");
@@ -156,6 +183,7 @@ void ServiceMain::StopDirect() {
     }
 
     stopInProgress = false;
+    Logger::Instance().Info("ServiceMain::StopDirect - Completed");
 }
 
 DWORD WINAPI ServiceMain::PipeServerThread(LPVOID param) {

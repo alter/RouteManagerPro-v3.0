@@ -45,7 +45,10 @@ private:
 
     void MonitorThreadFunc();
     void ProcessFlowEvent(const WINDIVERT_ADDRESS& addr);
+    void HandleNewProcess(DWORD pid, const std::string& remoteIp, WINDIVERT_EVENT event);
+    bool VerifyProcessIdentity(DWORD pid, const FILETIME& expectedTime);
     void CleanupOldConnections();
     std::string GetProcessPathFromFlowId(UINT64 flowId, UINT32 processId);
     PacketPriority DeterminePacketPriority(const std::string& processName, UINT16 port);
+    void LogDetailedStats();
 };
