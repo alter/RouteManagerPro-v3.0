@@ -46,6 +46,14 @@ private:
         std::vector<std::string> ranges;
     };
 
-    std::vector<AIServiceRange> GetAIServiceRanges();
+    struct PreloadService {
+        std::string name;
+        bool enabled;
+        std::vector<std::string> ranges;
+    };
+
+    std::vector<PreloadService> LoadPreloadConfig();
+    void CreateDefaultPreloadConfig(const std::string& path);
+    std::vector<PreloadService> GetDefaultPreloadServices();
     bool AddCIDRRoute(const std::string& cidr, const std::string& service);
 };

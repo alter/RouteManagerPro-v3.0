@@ -28,10 +28,13 @@ private:
     std::unique_ptr<ProcessPanel> processPanel;
     std::unique_ptr<RouteTable> routeTable;
 
+    HWND configGroupBox;
+    HWND statusGroupBox;
     HWND gatewayEdit;
     HWND metricEdit;
     HWND applyButton;
     HWND aiPreloadCheckbox;
+    HWND editPreloadButton;
     HWND statusLabel;
     HWND minimizeButton;
     HWND viewLogsButton;
@@ -55,4 +58,5 @@ private:
     void LoadConfiguration();
     void OnClose();
     void OnSize(int width, int height);
+    void OnEditPreload();
 };

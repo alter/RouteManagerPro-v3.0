@@ -11,6 +11,7 @@
 #include <fstream>
 #include <filesystem>
 #include <chrono>
+#include <json/json.h>
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
@@ -133,10 +134,9 @@ std::vector<RouteInfo> RouteController::GetActiveRoutes() const {
         result.push_back(*route);
     }
 
-    // Сортируем по времени создания - самые новые сверху
     std::sort(result.begin(), result.end(),
         [](const RouteInfo& a, const RouteInfo& b) {
-            return a.createdAt > b.createdAt;  // Обратный порядок - новые сверху
+            return a.createdAt > b.createdAt;
         });
 
     return result;
@@ -219,7 +219,6 @@ bool RouteController::AddSystemRouteOldAPIWithMask(const std::string& ip, int pr
         return false;
     }
 
-    // Calculate subnet mask from prefix length
     DWORD mask = prefixLength == 0 ? 0 : (0xFFFFFFFF << (32 - prefixLength));
     route.dwForwardMask = htonl(mask);
 
@@ -297,7 +296,6 @@ bool RouteController::RemoveSystemRouteWithMask(const std::string& ip, int prefi
         return false;
     }
 
-    // Calculate subnet mask from prefix length
     DWORD mask = prefixLength == 0 ? 0 : (0xFFFFFFFF << (32 - prefixLength));
     route.dwForwardMask = htonl(mask);
 
@@ -345,13 +343,11 @@ void RouteController::SaveRoutesToDisk() {
 
     file << "version=2\n";
 
-    // Сохраняем текущее время в секундах с эпохи Unix
     auto now = std::chrono::system_clock::now();
     auto nowSeconds = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
     file << "timestamp=" << nowSeconds << "\n";
 
     for (auto& [routeKey, route] : routes) {
-        // Конвертируем время создания в секунды с эпохи Unix
         auto createdSeconds = std::chrono::duration_cast<std::chrono::seconds>(
             route->createdAt.time_since_epoch()).count();
 
@@ -366,7 +362,6 @@ void RouteController::SaveRoutesToDisk() {
     }
 }
 
-// src/service/RouteController.cpp - только метод LoadRoutesFromDisk
 void RouteController::LoadRoutesFromDisk() {
     if (!Utils::FileExists(Constants::STATE_FILE)) return;
 
@@ -383,15 +378,12 @@ void RouteController::LoadRoutesFromDisk() {
                 std::string process = parts[1];
                 int prefixLength = 32;
 
-                // По умолчанию используем текущее время
                 std::chrono::system_clock::time_point createdAt = std::chrono::system_clock::now();
 
-                // Загружаем время создания
                 if (parts.size() >= 3 && !parts[2].empty()) {
                     try {
                         int64_t timestamp = std::stoll(parts[2]);
-                        // Проверяем что timestamp разумный (не 0 и не слишком большой)
-                        if (timestamp > 0 && timestamp < 9999999999LL) { // до 2286 года
+                        if (timestamp > 0 && timestamp < 9999999999LL) {
                             createdAt = std::chrono::system_clock::time_point(
                                 std::chrono::seconds(timestamp));
                         }
@@ -401,7 +393,6 @@ void RouteController::LoadRoutesFromDisk() {
                     }
                 }
 
-                // Загружаем длину префикса
                 if (parts.size() >= 4) {
                     try {
                         prefixLength = std::stoi(parts[3]);
@@ -436,49 +427,124 @@ bool RouteController::IsGatewayReachable() {
 }
 
 void RouteController::PreloadAIRoutes() {
-    Logger::Instance().Info("PreloadAIRoutes - Starting preload of AI service routes");
-    auto aiRanges = GetAIServiceRanges();
+    Logger::Instance().Info("PreloadRoutes - Starting preload of IP ranges from config");
+
+    auto services = LoadPreloadConfig();
 
     int totalRoutes = 0;
-    for (const auto& service : aiRanges) {
-        Logger::Instance().Info("Processing " + service.service + " ranges");
+    for (const auto& service : services) {
+        if (!service.enabled) {
+            Logger::Instance().Info("Skipping disabled service: " + service.name);
+            continue;
+        }
+
+        Logger::Instance().Info("Processing " + service.name + " ranges");
         for (const auto& range : service.ranges) {
             if (range.find('/') != std::string::npos) {
-                if (AddCIDRRoute(range, service.service)) {
+                if (AddCIDRRoute(range, service.name)) {
                     totalRoutes++;
                 }
             }
             else {
-                if (AddRoute(range, "AI-" + service.service)) {
+                if (AddRoute(range, "Preload-" + service.name)) {
                     totalRoutes++;
                 }
             }
         }
     }
-    Logger::Instance().Info("PreloadAIRoutes - Completed, added " + std::to_string(totalRoutes) + " routes");
+    Logger::Instance().Info("PreloadRoutes - Completed, added " + std::to_string(totalRoutes) + " routes");
 }
 
-std::vector<RouteController::AIServiceRange> RouteController::GetAIServiceRanges() {
+std::vector<RouteController::PreloadService> RouteController::LoadPreloadConfig() {
+    std::vector<PreloadService> services;
+
+    std::string configPath = Utils::GetCurrentDirectory() + "\\preload_ips.json";
+
+    if (!Utils::FileExists(configPath)) {
+        CreateDefaultPreloadConfig(configPath);
+    }
+
+    std::ifstream file(configPath);
+    if (!file.is_open()) {
+        Logger::Instance().Error("Failed to open preload config: " + configPath);
+        return GetDefaultPreloadServices();
+    }
+
+    Json::Value root;
+    Json::CharReaderBuilder builder;
+    std::string errors;
+
+    if (!Json::parseFromStream(builder, file, &root, &errors)) {
+        Logger::Instance().Error("Failed to parse preload config: " + errors);
+        return GetDefaultPreloadServices();
+    }
+
+    const Json::Value& servicesJson = root["services"];
+    if (!servicesJson.isArray()) {
+        Logger::Instance().Error("Invalid preload config format");
+        return GetDefaultPreloadServices();
+    }
+
+    for (const auto& serviceJson : servicesJson) {
+        PreloadService service;
+        service.name = serviceJson.get("name", "").asString();
+        service.enabled = serviceJson.get("enabled", true).asBool();
+
+        const Json::Value& rangesJson = serviceJson["ranges"];
+        if (rangesJson.isArray()) {
+            for (const auto& range : rangesJson) {
+                service.ranges.push_back(range.asString());
+            }
+        }
+
+        if (!service.name.empty() && !service.ranges.empty()) {
+            services.push_back(service);
+        }
+    }
+
+    Logger::Instance().Info("Loaded " + std::to_string(services.size()) + " services from preload config");
+    return services;
+}
+
+void RouteController::CreateDefaultPreloadConfig(const std::string& path) {
+    std::string sourceFile = Utils::GetCurrentDirectory() + "\\config\\preload_ips.json";
+
+    if (Utils::FileExists(sourceFile)) {
+        std::ifstream src(sourceFile, std::ios::binary);
+        if (src.is_open()) {
+            std::ofstream dst(path, std::ios::binary);
+            if (dst.is_open()) {
+                dst << src.rdbuf();
+                Logger::Instance().Info("Copied default preload config from: " + sourceFile);
+                return;
+            }
+        }
+    }
+
+    Logger::Instance().Warning("Could not copy default config from " + sourceFile + ", using fallback");
+
+    std::ofstream file(path);
+    if (file.is_open()) {
+        file << R"({
+  "version": 1,
+  "services": [
+    {
+      "name": "Discord",
+      "enabled": true,
+      "ranges": [
+        "162.159.128.0/19"
+      ]
+    }
+  ]
+})";
+        file.close();
+        Logger::Instance().Info("Created minimal fallback preload config: " + path);
+    }
+}
+
+std::vector<RouteController::PreloadService> RouteController::GetDefaultPreloadServices() {
     return {
-        {"Claude (Anthropic)", {
-            "160.79.104.0/23",
-            "160.79.104.10"
-        }},
-        {"ChatGPT (OpenAI)", {
-            "23.102.140.112/28",
-            "13.66.11.96/28",
-            "104.210.133.240/28",
-            "23.98.142.176/28",
-            "40.84.180.224/28",
-            "52.230.152.0/24",
-            "52.233.106.0/24"
-        }},
-        {"Cloudflare CDN", {
-            "104.16.0.0/12",
-            "162.158.0.0/15",
-            "172.64.0.0/13",
-            "173.245.48.0/20"
-        }}
+        {"Discord", true, { "162.159.128.0/19" }}
     };
 }
 
@@ -491,6 +557,5 @@ bool RouteController::AddCIDRRoute(const std::string& cidr, const std::string& s
 
     Logger::Instance().Info("Adding CIDR route: " + cidr + " for " + service);
 
-    // Add the subnet route directly
-    return AddRouteWithMask(baseIp, prefixLen, "AI-" + service);
+    return AddRouteWithMask(baseIp, prefixLen, "Preload-" + service);
 }

@@ -31,6 +31,7 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="config\default_config.json" />
+    <None Include="config\preload_ips.json" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="app.rc">

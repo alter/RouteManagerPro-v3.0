@@ -4,7 +4,7 @@
   "gamingMode": true,
   "startMinimized": false,
   "startWithWindows": true,
-  "aiPreloadEnabled": false,
+  "aiPreloadEnabled": true,
   "selectedProcesses": [
     "Discord.exe"
   ]

@@ -19,6 +19,7 @@ public:
 
 private:
     HWND parentWnd;
+    HWND groupBox;
     HWND listView;
     HWND cleanRoutesButton;
     ServiceClient* serviceClient;

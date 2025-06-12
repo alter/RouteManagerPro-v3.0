@@ -108,7 +108,7 @@ bool MainWindow::CreateMainWindow(int nCmdShow) {
 void MainWindow::CreateControls() {
     HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
 
-    CreateWindow(L"BUTTON", L"Configuration", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+    configGroupBox = CreateWindow(L"BUTTON", L"Configuration", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
         10, 10, 200, 120, hwnd, nullptr, hInstance, nullptr);
 
     CreateWindow(L"STATIC", L"Gateway:", WS_CHILD | WS_VISIBLE,
@@ -129,11 +129,15 @@ void MainWindow::CreateControls() {
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
         140, 59, 60, 22, hwnd, (HMENU)1001, hInstance, nullptr);
 
-    aiPreloadCheckbox = CreateWindow(L"BUTTON", L"Preload AI IPs",
+    aiPreloadCheckbox = CreateWindow(L"BUTTON", L"Preload IPs",
         WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-        20, 90, 180, 20, hwnd, (HMENU)1002, hInstance, nullptr);
+        20, 90, 90, 20, hwnd, (HMENU)1002, hInstance, nullptr);
 
-    CreateWindow(L"BUTTON", L"Status", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+    editPreloadButton = CreateWindow(L"BUTTON", L"Edit Preload",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        115, 88, 85, 23, hwnd, (HMENU)1005, hInstance, nullptr);
+
+    statusGroupBox = CreateWindow(L"BUTTON", L"Status", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
         220, 10, 610, 120, hwnd, nullptr, hInstance, nullptr);
 
     statusLabel = CreateWindow(L"STATIC",
@@ -176,6 +180,7 @@ LRESULT CALLBACK MainWindow::WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         case 1002: instance->OnAIPreloadToggle(); break;
         case 1003: instance->OnMinimizeToTray(); break;
         case 1004: instance->OnViewLogs(); break;
+        case 1005: instance->OnEditPreload(); break;
         default:
             if (instance->processPanel) {
                 instance->processPanel->HandleCommand(wParam);
@@ -241,6 +246,20 @@ LRESULT CALLBACK MainWindow::WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
+void MainWindow::OnEditPreload() {
+    std::string configPath = Utils::GetCurrentDirectory() + "\\preload_ips.json";
+
+    if (!Utils::FileExists(configPath)) {
+        MessageBox(hwnd,
+            L"Preload configuration file will be created.\n"
+            L"You can edit it to add or remove IP ranges.",
+            L"Information", MB_OK | MB_ICONINFORMATION);
+    }
+
+    std::wstring wideConfigPath = Utils::StringToWString(configPath);
+    ShellExecuteW(nullptr, L"open", wideConfigPath.c_str(), nullptr, nullptr, SW_SHOW);
+}
+
 void MainWindow::OnSize(int width, int height) {
     if (width == 0 || height == 0) return;
 
@@ -248,6 +267,7 @@ void MainWindow::OnSize(int width, int height) {
     lastHeight = height;
 
     int statusWidth = width - 230;
+    SetWindowPos(statusGroupBox, NULL, 220, 10, statusWidth, 120, SWP_NOZORDER);
     SetWindowPos(statusLabel, NULL, 230, 30, statusWidth - 10, 90, SWP_NOZORDER);
 
     int panelWidth = width - 20;
@@ -279,8 +299,6 @@ void MainWindow::OnClose() {
     ShutdownCoordinator::Instance().InitiateShutdown();
 
     if (serviceClient && serviceClient->IsConnected()) {
-        // НЕ сохраняем локальную config, так как она может быть устаревшей!
-        // Сервис уже имеет актуальную конфигурацию
         Logger::Instance().Info("Disconnecting from service");
         serviceClient->Disconnect();
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -334,7 +352,6 @@ void MainWindow::OnApplyConfig() {
     GetWindowTextA(metricEdit, buffer, sizeof(buffer));
     config.metric = std::stoi(buffer);
 
-    // Получаем актуальный список выбранных процессов с сервиса
     if (serviceClient && serviceClient->IsConnected()) {
         ServiceConfig currentConfig = serviceClient->GetConfig();
         config.selectedProcesses = currentConfig.selectedProcesses;
@@ -360,7 +377,6 @@ void MainWindow::OnViewLogs() {
 void MainWindow::OnAIPreloadToggle() {
     bool checked = SendMessage(aiPreloadCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED;
 
-    // Получаем актуальную конфигурацию с сервиса перед изменением
     if (serviceClient && serviceClient->IsConnected()) {
         config = serviceClient->GetConfig();
     }

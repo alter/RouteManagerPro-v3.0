@@ -16,7 +16,7 @@
 #pragma comment(lib, "comctl32.lib")
 
 RouteTable::RouteTable(HWND parent, ServiceClient* client)
-    : parentWnd(parent), listView(nullptr), cleanRoutesButton(nullptr), serviceClient(client), currentScrollPos(-1) {
+    : parentWnd(parent), groupBox(nullptr), listView(nullptr), cleanRoutesButton(nullptr), serviceClient(client), currentScrollPos(-1) {
 }
 
 RouteTable::~RouteTable() {
@@ -30,7 +30,7 @@ void RouteTable::Create(int x, int y, int width, int height) {
 void RouteTable::CreateControls(int x, int y, int width, int height) {
     HINSTANCE hInstance = (HINSTANCE)GetWindowLongPtr(parentWnd, GWLP_HINSTANCE);
 
-    CreateWindow(L"BUTTON", L"Active Routes",
+    groupBox = CreateWindow(L"BUTTON", L"Active Routes",
         WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
         x, y, width, height, parentWnd, nullptr, hInstance, nullptr);
 
@@ -87,7 +87,6 @@ void RouteTable::RestoreScrollPosition() {
     }
 }
 
-// src/ui/RouteTable.cpp - только метод UpdateRouteList
 void RouteTable::UpdateRouteList() {
     SaveScrollPosition();
 
@@ -114,15 +113,12 @@ void RouteTable::UpdateRouteList() {
             std::wstring process = Utils::StringToWString(route.processName);
             ListView_SetItemText(listView, index, 1, const_cast<LPWSTR>(process.c_str()));
 
-            // Форматируем время
             auto now = std::chrono::system_clock::now();
             auto duration = now - route.createdAt;
 
             std::wstring timeStr;
 
-            // Проверяем что время создания валидное (не в будущем и не слишком старое)
             if (duration.count() < 0 || duration > std::chrono::hours(24 * 365 * 10)) {
-                // Если время невалидное, показываем "Just now"
                 timeStr = L"Just now";
             }
             else {
@@ -193,6 +189,7 @@ void RouteTable::OnCleanAllRoutes() {
 }
 
 void RouteTable::Resize(int x, int y, int width, int height) {
+    SetWindowPos(groupBox, NULL, x, y, width, height, SWP_NOZORDER);
     SetWindowPos(listView, NULL, x + 10, y + 25, width - 20, height - 65, SWP_NOZORDER);
     SetWindowPos(cleanRoutesButton, NULL, x + 10, y + height - 35, 120, 25, SWP_NOZORDER);
 
