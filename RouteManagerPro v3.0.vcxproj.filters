@@ -140,5 +140,13 @@
     <ClInclude Include="src\common\WinHandles.h">
       <Filter>Header Files\common</Filter>
     </ClInclude>
+    <ClInclude Include="src\common\resource.h">
+      <Filter>Header Files\common</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="app.ico">
+      <Filter>Resource Files</Filter>
+    </Image>
   </ItemGroup>
 </Project>

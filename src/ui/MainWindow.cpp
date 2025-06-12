@@ -18,6 +18,7 @@
 #include "../common/Utils.h"
 #include "../common/Logger.h"
 #include "../common/ShutdownCoordinator.h"
+#include "../common/resource.h"
 
 #pragma comment(lib, "comctl32.lib")
 
@@ -57,11 +58,11 @@ bool MainWindow::CreateMainWindow(int nCmdShow) {
     wcex.style = CS_HREDRAW | CS_VREDRAW;
     wcex.lpfnWndProc = WindowProc;
     wcex.hInstance = hInstance;
-    wcex.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_MAINICON));
     wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     wcex.lpszClassName = L"RouteManagerProWindow";
-    wcex.hIconSm = wcex.hIcon;
+    wcex.hIconSm = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_MAINICON)); // Используем ту же иконку для маленького размера
 
     if (!RegisterClassExW(&wcex)) {
         return false;

@@ -8,6 +8,8 @@
 #include <shellapi.h>
 #include <string>
 
+#pragma comment(lib, "shell32.lib")
+
 class SystemTray {
 public:
     SystemTray(HWND parentWindow);

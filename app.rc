@@ -1,7 +1,9 @@
 ﻿#include <windows.h>
+#include "src/common/resource.h" 
 
 // Иконка приложения (закомментировано, если нет файла иконки)
-// IDI_ICON1 ICON "app.ico"
+IDI_MAINICON    ICON    "app.ico"
+IDI_SMALL       ICON    "app.ico"
 
 // Информация о версии
 VS_VERSION_INFO VERSIONINFO

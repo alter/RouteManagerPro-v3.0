@@ -48,6 +48,7 @@
     <ClInclude Include="src\common\IPCProtocol.h" />
     <ClInclude Include="src\common\Logger.h" />
     <ClInclude Include="src\common\Models.h" />
+    <ClInclude Include="src\common\resource.h" />
     <ClInclude Include="src\common\ShutdownCoordinator.h" />
     <ClInclude Include="src\common\Utils.h" />
     <ClInclude Include="src\common\WinHandles.h" />
@@ -63,6 +64,9 @@
     <ClInclude Include="src\ui\RouteTable.h" />
     <ClInclude Include="src\ui\ServiceClient.h" />
     <ClInclude Include="src\ui\SystemTray.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="app.ico" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>17.0</VCProjectVersion>
