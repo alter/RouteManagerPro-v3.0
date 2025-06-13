@@ -18,6 +18,20 @@ struct ProcessDisplayInfo {
 
 class ProcessPanel {
 public:
+    // Enhanced scroll position preservation
+    struct ScrollState {
+        int topIndex;
+        int pixelOffset;
+        SCROLLINFO scrollInfo;
+        std::wstring selectedItemName;
+        std::wstring focusedItemName;
+        bool hasSelection;
+
+        ScrollState() : topIndex(-1), pixelOffset(0), hasSelection(false) {
+            scrollInfo.cbSize = sizeof(SCROLLINFO);
+        }
+    };
+
     ProcessPanel(HWND parent, ServiceClient* client);
     ~ProcessPanel();
 
@@ -27,22 +41,54 @@ public:
     void HandleNotify(LPNMHDR pnmh);
     void Resize(int x, int y, int width, int height);
 
+    // Public scroll restoration for message handling
+    void RestoreDetailedScrollPosition(HWND listView, const ScrollState& state);
+
 private:
     HWND parentWnd;
     HWND groupBox;
     HWND searchEdit;
-    HWND listView;
+    HWND availableListView;
+    HWND selectedListView;
+    HWND addButton;
+    HWND removeButton;
+    HWND addAllButton;
+    HWND removeAllButton;
+
     ServiceClient* serviceClient;
-    std::vector<ProcessDisplayInfo> filteredProcesses;
+
+    std::vector<ProcessDisplayInfo> availableProcesses;
+    std::vector<ProcessDisplayInfo> selectedProcessesDisplay;
     std::vector<std::string> selectedProcesses;
+
     bool isUpdating;
-    int currentScrollPos;
+
+    // User interaction tracking
+    DWORD lastInteractionTime;
+    bool isUserInteracting;
+
+    std::string lastSearchFilter;
 
     void CreateControls(int x, int y, int width, int height);
     void UpdateProcessList();
-    void OnProcessToggle(int index);
+    void OnAddProcess();
+    void OnRemoveProcess();
+    void OnAddAllProcesses();
+    void OnRemoveAllProcesses();
     void OnSearchChanged();
     void FilterProcesses(const std::string& filter);
-    void SaveScrollPosition();
-    void RestoreScrollPosition();
+
+    // Enhanced scroll position helpers
+    ScrollState SaveDetailedScrollPosition(HWND listView);
+
+    // User interaction detection
+    bool IsUserInteracting() const;
+    void OnUserInteraction();
+
+    // ListView helpers
+    int GetSelectedIndex(HWND listView);
+    std::wstring GetItemText(HWND listView, int index);
+
+    // Helper to extract base process name from display name
+    std::wstring GetBaseProcessNameFromDisplayName(const std::wstring& displayName);
 };
