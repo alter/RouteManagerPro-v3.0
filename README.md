@@ -117,8 +117,8 @@ CreateIpForwardEntry(&route);   // Fallback for older Windows
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/route-manager-pro.git
-cd route-manager-pro
+git clone https://github.com/alter/RouteManagerPro-v3.0
+cd RouteManagerPro-v3.0
 
 # Create build directory
 mkdir build && cd build
