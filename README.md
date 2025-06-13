@@ -14,7 +14,7 @@ Route Manager Pro automatically routes network traffic from selected application
 - **Multiple VPN Support** - Easy gateway switching with automatic route migration
 - **System Tray Integration** - Minimizes to system tray for background operation
 - **Route Persistence** - Saves and restores routes across application restarts
-- **AI Service Preloading** - Optional preloading of IP ranges for services like Discord
+- **IP Service Preloading** - Optional preloading of IP ranges for services like Discord
 
 ## How It Works
 
