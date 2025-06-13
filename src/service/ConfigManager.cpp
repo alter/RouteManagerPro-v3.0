@@ -35,8 +35,8 @@ void ConfigManager::PersistenceThreadFunc() {
 
     try {
         while (running.load() && !ShutdownCoordinator::Instance().isShuttingDown) {
-            // Check every minute
-            for (int i = 0; i < 60 && running.load() && !ShutdownCoordinator::Instance().isShuttingDown; i++) {
+            // Check every 10 minutes for backup save
+            for (int i = 0; i < 600 && running.load() && !ShutdownCoordinator::Instance().isShuttingDown; i++) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
 
@@ -44,19 +44,8 @@ void ConfigManager::PersistenceThreadFunc() {
                 break;
             }
 
-            auto now = std::chrono::steady_clock::now();
-            auto timeSinceLastSave = now - lastSaveTime;
-
-            // Save if dirty and 10 minutes have passed
-            if (configDirty.load() && timeSinceLastSave >= SAVE_INTERVAL) {
-                Logger::Instance().Info("Periodic save of config (dirty flag set)");
-                SaveConfig();
-            }
-        }
-
-        // Final save on thread exit
-        if (configDirty.load()) {
-            Logger::Instance().Info("ConfigManager persistence thread: Final save of config");
+            // Periodic backup save (config is already saved on each change)
+            Logger::Instance().Debug("ConfigManager: Periodic backup save");
             SaveConfig();
         }
     }
@@ -74,21 +63,29 @@ ServiceConfig ConfigManager::GetConfig() const {
 }
 
 void ConfigManager::SetConfig(const ServiceConfig& newConfig) {
-    std::lock_guard<std::mutex> lock(configMutex);
-    config = newConfig;
-    configDirty = true;  // Mark as dirty instead of saving immediately
+    {
+        std::lock_guard<std::mutex> lock(configMutex);
+        config = newConfig;
+    }
+
+    // Save immediately instead of marking dirty
+    SaveConfig();
 
     Logger::Instance().Info("ConfigManager::SetConfig - Updated " +
-        std::to_string(config.selectedProcesses.size()) + " selected processes (marked dirty)");
+        std::to_string(config.selectedProcesses.size()) + " selected processes (saved immediately)");
     for (const auto& proc : config.selectedProcesses) {
         Logger::Instance().Debug("  - " + proc);
     }
 }
 
 void ConfigManager::SetAIPreloadEnabled(bool enabled) {
-    std::lock_guard<std::mutex> lock(configMutex);
-    config.aiPreloadEnabled = enabled;
-    configDirty = true;  // Mark as dirty instead of saving immediately
+    {
+        std::lock_guard<std::mutex> lock(configMutex);
+        config.aiPreloadEnabled = enabled;
+    }
+
+    // Save immediately instead of marking dirty
+    SaveConfig();
 }
 
 void ConfigManager::LoadConfig() {

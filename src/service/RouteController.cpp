@@ -72,6 +72,65 @@ void RouteController::InvalidateInterfaceCache() {
     Logger::Instance().Info("Interface cache invalidated");
 }
 
+void RouteController::UpdateConfig(const ServiceConfig& newConfig) {
+    std::lock_guard<std::mutex> lock(routesMutex);
+
+    // Check what changed
+    bool gatewayChanged = (config.gatewayIp != newConfig.gatewayIp);
+    bool metricChanged = (config.metric != newConfig.metric);
+
+    std::string oldGateway = config.gatewayIp;
+
+    // Update entire config
+    config = newConfig;
+
+    // Handle changes
+    if (gatewayChanged) {
+        Logger::Instance().Info("Gateway changed from " + oldGateway + " to " + config.gatewayIp);
+        InvalidateInterfaceCache(); // Critical!
+        MigrateExistingRoutes(oldGateway, config.gatewayIp);
+    }
+    else if (metricChanged) {
+        Logger::Instance().Info("Metric changed, updating all routes");
+        MigrateExistingRoutes(config.gatewayIp, config.gatewayIp); // Re-add with new metric
+    }
+}
+
+void RouteController::MigrateExistingRoutes(const std::string& oldGateway, const std::string& newGateway) {
+    // Collect routes without holding lock during system calls
+    std::vector<std::pair<std::string, int>> routesToMigrate;
+    for (const auto& [key, route] : routes) {
+        routesToMigrate.emplace_back(route->ip, route->prefixLength);
+    }
+
+    Logger::Instance().Info("Migrating " + std::to_string(routesToMigrate.size()) + " routes from gateway " +
+        oldGateway + " to " + newGateway);
+
+    int successCount = 0;
+    int failCount = 0;
+
+    for (const auto& [ip, prefix] : routesToMigrate) {
+        // CRITICAL FIX: Remove with OLD gateway
+        RemoveSystemRouteWithMask(ip, prefix, oldGateway);
+
+        // Add with new gateway (uses current config.gatewayIp)
+        if (AddSystemRouteWithMask(ip, prefix)) {
+            successCount++;
+        }
+        else {
+            failCount++;
+            Logger::Instance().Error("Failed to migrate route: " + ip + "/" + std::to_string(prefix));
+        }
+    }
+
+    Logger::Instance().Info("Migration complete. Success: " + std::to_string(successCount) +
+        ", Failed: " + std::to_string(failCount));
+
+    if (failCount > 0) {
+        // Could notify UI about failures
+    }
+}
+
 void RouteController::PersistenceThreadFunc() {
     Logger::Instance().Info("RouteController persistence thread started");
 
@@ -127,18 +186,19 @@ void RouteController::SaveRoutesToDiskAsync() {
         return;
     }
 
-    file << "version=2\n";
+    file << "version=3\n";
 
     auto now = std::chrono::system_clock::now();
     auto nowSeconds = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
     file << "timestamp=" << nowSeconds << "\n";
+    file << "gateway=" << config.gatewayIp << "\n";
 
     for (const auto& [routeKey, route] : snapshot) {
         auto createdSeconds = std::chrono::duration_cast<std::chrono::seconds>(
             route.createdAt.time_since_epoch()).count();
 
         file << "route=" << route.ip << "," << route.processName << ","
-            << createdSeconds << "," << route.prefixLength << "\n";
+            << createdSeconds << "," << route.prefixLength << "," << config.gatewayIp << "\n";
     }
 
     file.close();
@@ -199,7 +259,8 @@ bool RouteController::RemoveRouteWithMask(const std::string& ip, int prefixLengt
     if (it == routes.end()) return false;
 
     if (--it->second->refCount <= 0) {
-        if (RemoveSystemRouteWithMask(ip, prefixLength)) {
+        // UPDATED: Pass current gateway
+        if (RemoveSystemRouteWithMask(ip, prefixLength, config.gatewayIp)) {
             Logger::Instance().Info("Removed route: " + routeKey);
             routes.erase(it);
             routesDirty = true;  // Mark as dirty instead of saving immediately
@@ -242,7 +303,8 @@ void RouteController::CleanupAllRoutes() {
 
     for (const auto& [ip, prefixLength] : routesToDelete) {
         Logger::Instance().Info("Removing Windows route for: " + ip + "/" + std::to_string(prefixLength));
-        if (RemoveSystemRouteWithMask(ip, prefixLength)) {
+        // UPDATED: Pass current gateway
+        if (RemoveSystemRouteWithMask(ip, prefixLength, config.gatewayIp)) {
             successCount++;
         }
         else {
@@ -271,7 +333,8 @@ void RouteController::CleanupOldRoutes() {
     bool anyRemoved = false;
     for (auto it = routes.begin(); it != routes.end();) {
         if (it->second->createdAt < cutoff) {
-            RemoveSystemRouteWithMask(it->second->ip, it->second->prefixLength);
+            // UPDATED: Pass current gateway
+            RemoveSystemRouteWithMask(it->second->ip, it->second->prefixLength, config.gatewayIp);
             it = routes.erase(it);
             anyRemoved = true;
         }
@@ -457,11 +520,11 @@ bool RouteController::AddSystemRouteOldAPIWithMask(const std::string& ip, int pr
     }
 }
 
-bool RouteController::RemoveSystemRoute(const std::string& ip) {
-    return RemoveSystemRouteWithMask(ip, 32);
+bool RouteController::RemoveSystemRoute(const std::string& ip, const std::string& gatewayIp) {
+    return RemoveSystemRouteWithMask(ip, 32, gatewayIp);
 }
 
-bool RouteController::RemoveSystemRouteWithMask(const std::string& ip, int prefixLength) {
+bool RouteController::RemoveSystemRouteWithMask(const std::string& ip, int prefixLength, const std::string& gatewayIp) {
     MIB_IPFORWARDROW route;
     ZeroMemory(&route, sizeof(MIB_IPFORWARDROW));
 
@@ -474,7 +537,8 @@ bool RouteController::RemoveSystemRouteWithMask(const std::string& ip, int prefi
     DWORD mask = prefixLength == 0 ? 0 : (0xFFFFFFFF << (32 - prefixLength));
     route.dwForwardMask = htonl(mask);
 
-    route.dwForwardNextHop = inet_addr(config.gatewayIp.c_str());
+    // NOW USES THE PASSED GATEWAY PARAMETER
+    route.dwForwardNextHop = inet_addr(gatewayIp.c_str());
 
     ULONG bestInterface;
     if (GetBestInterface(route.dwForwardNextHop, &bestInterface) == NO_ERROR) {
@@ -558,18 +622,19 @@ void RouteController::SaveRoutesToDisk() {
     std::ofstream file(Constants::STATE_FILE + ".tmp");
     if (!file.is_open()) return;
 
-    file << "version=2\n";
+    file << "version=3\n";  // Increment version
 
     auto now = std::chrono::system_clock::now();
     auto nowSeconds = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
     file << "timestamp=" << nowSeconds << "\n";
+    file << "gateway=" << config.gatewayIp << "\n";  // Save current gateway
 
     for (auto& [routeKey, route] : routes) {
         auto createdSeconds = std::chrono::duration_cast<std::chrono::seconds>(
             route->createdAt.time_since_epoch()).count();
 
         file << "route=" << route->ip << "," << route->processName << ","
-            << createdSeconds << "," << route->prefixLength << "\n";
+            << createdSeconds << "," << route->prefixLength << "," << config.gatewayIp << "\n";  // Include gateway
     }
 
     file.close();
@@ -591,9 +656,13 @@ void RouteController::LoadRoutesFromDisk() {
     std::string line;
     int loadedCount = 0;
     int skippedPreloadCount = 0;
+    std::string savedGateway;
 
     while (std::getline(file, line)) {
-        if (line.substr(0, 6) == "route=") {
+        if (line.substr(0, 8) == "gateway=") {
+            savedGateway = line.substr(8);
+        }
+        else if (line.substr(0, 6) == "route=") {
             std::string routeData = line.substr(6);
             auto parts = Utils::SplitString(routeData, ',');
             if (parts.size() >= 2) {
@@ -631,6 +700,12 @@ void RouteController::LoadRoutesFromDisk() {
                     }
                 }
 
+                // Check if gateway from file matches current gateway
+                std::string routeGateway = config.gatewayIp;  // Default to current
+                if (parts.size() >= 5) {
+                    routeGateway = parts[4];
+                }
+
                 if (AddSystemRouteWithMask(ip, prefixLength)) {
                     std::string routeKey = ip + "/" + std::to_string(prefixLength);
                     auto routeInfo = std::make_unique<RouteInfo>(ip, process);
@@ -641,6 +716,14 @@ void RouteController::LoadRoutesFromDisk() {
                 }
             }
         }
+    }
+
+    // Check if saved gateway differs from current and migrate if needed
+    if (!savedGateway.empty() && savedGateway != config.gatewayIp) {
+        Logger::Instance().Warning("Gateway mismatch on startup. Saved: " + savedGateway +
+            ", Config: " + config.gatewayIp + ". Migrating routes.");
+        // Use the migration logic to fix the loaded routes immediately
+        MigrateExistingRoutes(savedGateway, config.gatewayIp);
     }
 
     Logger::Instance().Info("LoadRoutesFromDisk - Loaded " + std::to_string(loadedCount) +

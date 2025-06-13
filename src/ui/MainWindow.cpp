@@ -375,13 +375,70 @@ void MainWindow::UpdateStatus() {
 void MainWindow::OnApplyConfig() {
     char buffer[256];
     GetWindowTextA(gatewayEdit, buffer, sizeof(buffer));
-    config.gatewayIp = buffer;
+    std::string newGateway = buffer;
 
     GetWindowTextA(metricEdit, buffer, sizeof(buffer));
-    config.metric = std::stoi(buffer);
+    int newMetric = 0;
+    try {
+        newMetric = std::stoi(buffer);
+    }
+    catch (...) {
+        MessageBox(hwnd, L"Invalid metric value. Please enter a number.", L"Error", MB_OK | MB_ICONERROR);
+        return;
+    }
 
+    // Validate gateway IP
+    if (!Utils::IsValidIPv4(newGateway)) {
+        MessageBox(hwnd, L"Invalid gateway IP address format.", L"Error", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    // Get current config from service
+    ServiceConfig currentConfig = serviceClient->GetConfig();
+
+    // Check for gateway or metric changes
+    bool gatewayChanging = (currentConfig.gatewayIp != newGateway);
+    bool metricChanging = (currentConfig.metric != newMetric);
+
+    if ((gatewayChanging || metricChanging) && serviceClient && serviceClient->IsConnected()) {
+        auto routes = serviceClient->GetRoutes();
+
+        if (!routes.empty()) {
+            std::wstringstream msg;
+            msg << L"You are about to change:\n\n";
+
+            if (gatewayChanging) {
+                msg << L"Gateway: " << Utils::StringToWString(currentConfig.gatewayIp)
+                    << L" → " << Utils::StringToWString(newGateway) << L"\n";
+            }
+
+            if (metricChanging) {
+                msg << L"Metric: " << currentConfig.metric
+                    << L" → " << newMetric << L"\n";
+            }
+
+            msg << L"\nThis will update " << routes.size() << L" existing routes.\n\n"
+                << L"Continue?";
+
+            int result = MessageBox(hwnd, msg.str().c_str(),
+                L"Confirm Routing Changes",
+                MB_YESNO | MB_ICONQUESTION);
+
+            if (result != IDYES) {
+                // Restore old values in UI
+                SetWindowTextA(gatewayEdit, currentConfig.gatewayIp.c_str());
+                SetWindowTextA(metricEdit, std::to_string(currentConfig.metric).c_str());
+                return;
+            }
+        }
+    }
+
+    // Update config
+    config.gatewayIp = newGateway;
+    config.metric = newMetric;
+
+    // Preserve other settings from current config
     if (serviceClient && serviceClient->IsConnected()) {
-        ServiceConfig currentConfig = serviceClient->GetConfig();
         config.selectedProcesses = currentConfig.selectedProcesses;
         config.startMinimized = currentConfig.startMinimized;
         config.startWithWindows = currentConfig.startWithWindows;
@@ -389,6 +446,27 @@ void MainWindow::OnApplyConfig() {
     }
 
     serviceClient->SetConfig(config);
+
+    // Show success message if gateway or metric changed
+    if (gatewayChanging || metricChanging) {
+        std::wstringstream successMsg;
+        successMsg << L"Configuration updated successfully.\n\n";
+
+        if (gatewayChanging) {
+            successMsg << L"Gateway changed to: " << Utils::StringToWString(newGateway) << L"\n";
+        }
+
+        if (metricChanging) {
+            successMsg << L"Metric changed to: " << newMetric << L"\n";
+        }
+
+        auto routes = serviceClient->GetRoutes();
+        if (!routes.empty()) {
+            successMsg << L"\nAll existing routes have been updated.";
+        }
+
+        MessageBox(hwnd, successMsg.str().c_str(), L"Success", MB_OK | MB_ICONINFORMATION);
+    }
 }
 
 void MainWindow::OnMinimizeToTray() {

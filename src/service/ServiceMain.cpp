@@ -282,8 +282,22 @@ void ServiceMain::HandlePipeClient(HANDLE pipe) {
             }
 
             case IPCMessageType::SetConfig: {
-                auto config = IPCSerializer::DeserializeServiceConfig(msgData);
-                configManager->SetConfig(config);
+                auto newConfig = IPCSerializer::DeserializeServiceConfig(msgData);
+                auto oldConfig = configManager->GetConfig();
+
+                // Save config immediately
+                configManager->SetConfig(newConfig);
+
+                // Update RouteController if config changed
+                if (routeController) {
+                    routeController->UpdateConfig(newConfig);
+                }
+
+                // Update ProcessManager if processes changed
+                if (processManager && oldConfig.selectedProcesses != newConfig.selectedProcesses) {
+                    processManager->SetSelectedProcesses(newConfig.selectedProcesses);
+                }
+
                 break;
             }
 

@@ -26,6 +26,7 @@ public:
     std::vector<RouteInfo> GetActiveRoutes() const;
     void PreloadAIRoutes();
     ServiceConfig GetConfig() const { return config; }
+    void UpdateConfig(const ServiceConfig& newConfig);
 
 private:
     ServiceConfig config;
@@ -47,8 +48,8 @@ private:
     bool AddSystemRouteWithMask(const std::string& ip, int prefixLength);
     bool AddSystemRouteOldAPI(const std::string& ip);
     bool AddSystemRouteOldAPIWithMask(const std::string& ip, int prefixLength);
-    bool RemoveSystemRoute(const std::string& ip);
-    bool RemoveSystemRouteWithMask(const std::string& ip, int prefixLength);
+    bool RemoveSystemRoute(const std::string& ip, const std::string& gatewayIp);
+    bool RemoveSystemRouteWithMask(const std::string& ip, int prefixLength, const std::string& gatewayIp);
     void VerifyRoutesThreadFunc();
     void PersistenceThreadFunc();
     void SaveRoutesToDisk();
@@ -56,6 +57,7 @@ private:
     void LoadRoutesFromDisk();
     bool IsGatewayReachable();
     void InvalidateInterfaceCache();
+    void MigrateExistingRoutes(const std::string& oldGateway, const std::string& newGateway);
 
     struct AIServiceRange {
         std::string service;
