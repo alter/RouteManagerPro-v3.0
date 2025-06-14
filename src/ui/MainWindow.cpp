@@ -178,6 +178,10 @@ void MainWindow::CreateControls() {
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
         140, 580, 100, 30, hwnd, (HMENU)1004, hInstance, nullptr);
 
+    optimizeRoutesButton = CreateWindow(L"BUTTON", L"Optimize Routes",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        250, 580, 120, 30, hwnd, (HMENU)1006, hInstance, nullptr);
+
     EnumChildWindows(hwnd, [](HWND hwnd, LPARAM lParam) -> BOOL {
         SendMessage(hwnd, WM_SETFONT, (WPARAM)lParam, TRUE);
         return TRUE;
@@ -199,6 +203,7 @@ LRESULT CALLBACK MainWindow::WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         case 1003: instance->OnMinimizeToTray(); break;
         case 1004: instance->OnViewLogs(); break;
         case 1005: instance->OnEditPreload(); break;
+        case 1006: instance->OnOptimizeRoutes(); break;
         default:
             if (instance->processPanel) {
                 instance->processPanel->HandleCommand(wParam);
@@ -261,6 +266,13 @@ LRESULT CALLBACK MainWindow::WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         }
         return 0;
 
+    case WM_USER + 101: // WM_ROUTE_COUNT_CHANGED
+        // Route count was changed, update status immediately
+        if (instance->serviceClient && instance->serviceClient->IsConnected()) {
+            instance->UpdateStatus();
+        }
+        return 0;
+
     case WM_CLOSE: {
         instance->OnClose();
         return 0;
@@ -288,6 +300,21 @@ void MainWindow::OnEditPreload() {
     ShellExecuteW(nullptr, L"open", wideConfigPath.c_str(), nullptr, nullptr, SW_SHOW);
 }
 
+void MainWindow::OnOptimizeRoutes() {
+    if (serviceClient && serviceClient->IsConnected()) {
+        serviceClient->OptimizeRoutes();
+        MessageBox(hwnd, L"Route optimization completed.\nCheck logs for details.", L"Optimization", MB_OK | MB_ICONINFORMATION);
+
+        // Refresh route table to show optimized routes
+        if (routeTable) {
+            routeTable->Refresh();
+        }
+
+        // Update status to reflect new route count
+        UpdateStatus();
+    }
+}
+
 void MainWindow::OnSize(int width, int height) {
     if (width == 0 || height == 0) return;
 
@@ -309,6 +336,7 @@ void MainWindow::OnSize(int width, int height) {
 
     SetWindowPos(minimizeButton, NULL, 10, height - 50, 120, 30, SWP_NOZORDER);
     SetWindowPos(viewLogsButton, NULL, 140, height - 50, 100, 30, SWP_NOZORDER);
+    SetWindowPos(optimizeRoutesButton, NULL, 250, height - 50, 120, 30, SWP_NOZORDER);
 }
 
 void MainWindow::OnClose() {
@@ -443,6 +471,7 @@ void MainWindow::OnApplyConfig() {
         config.startMinimized = currentConfig.startMinimized;
         config.startWithWindows = currentConfig.startWithWindows;
         config.aiPreloadEnabled = currentConfig.aiPreloadEnabled;
+        config.optimizerSettings = currentConfig.optimizerSettings;
     }
 
     serviceClient->SetConfig(config);

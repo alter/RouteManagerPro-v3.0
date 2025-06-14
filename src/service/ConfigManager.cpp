@@ -119,6 +119,27 @@ void ConfigManager::LoadConfig() {
     config.startWithWindows = root.get("startWithWindows", config.startWithWindows).asBool();
     config.aiPreloadEnabled = root.get("aiPreloadEnabled", config.aiPreloadEnabled).asBool();
 
+    // Load optimizer settings
+    const Json::Value& optimizer = root["optimizerSettings"];
+    if (optimizer.isObject()) {
+        config.optimizerSettings.minHostsToAggregate =
+            optimizer.get("minHostsToAggregate", config.optimizerSettings.minHostsToAggregate).asInt();
+
+        const Json::Value& thresholds = optimizer["wasteThresholds"];
+        if (thresholds.isObject()) {
+            config.optimizerSettings.wasteThresholds.clear();
+            for (const auto& key : thresholds.getMemberNames()) {
+                try {
+                    int prefix = std::stoi(key);
+                    if (prefix >= 0 && prefix <= 32) {
+                        config.optimizerSettings.wasteThresholds[prefix] = thresholds[key].asFloat();
+                    }
+                }
+                catch (const std::exception&) {}
+            }
+        }
+    }
+
     const Json::Value& processes = root["selectedProcesses"];
     if (processes.isArray()) {
         config.selectedProcesses.clear();
@@ -156,6 +177,17 @@ void ConfigManager::SaveConfig() {
     root["startWithWindows"] = configCopy.startWithWindows;
     root["aiPreloadEnabled"] = configCopy.aiPreloadEnabled;
 
+    // Save optimizer settings
+    Json::Value optimizer;
+    optimizer["minHostsToAggregate"] = configCopy.optimizerSettings.minHostsToAggregate;
+
+    Json::Value thresholds;
+    for (const auto& [prefix, threshold] : configCopy.optimizerSettings.wasteThresholds) {
+        thresholds[std::to_string(prefix)] = threshold;
+    }
+    optimizer["wasteThresholds"] = thresholds;
+    root["optimizerSettings"] = optimizer;
+
     Json::Value processes(Json::arrayValue);
     for (const auto& process : configCopy.selectedProcesses) {
         processes.append(process);
@@ -170,6 +202,7 @@ void ConfigManager::SaveConfig() {
     }
 
     Json::StreamWriterBuilder builder;
+    builder["indentation"] = "  ";
     std::unique_ptr<Json::StreamWriter> writer(builder.newStreamWriter());
     writer->write(root, &file);
     file.close();
@@ -190,5 +223,6 @@ ServiceConfig ConfigManager::GetDefaultConfig() {
     defaultConfig.selectedProcesses = {
         "Discord.exe"
     };
+    // Optimizer settings are already initialized with defaults in Models.h
     return defaultConfig;
 }

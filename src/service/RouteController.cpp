@@ -4,6 +4,7 @@
 #include <iphlpapi.h>
 #include <netioapi.h>
 #include "RouteController.h"
+#include "RouteOptimizer.h"
 #include "../common/Constants.h"
 #include "../common/Utils.h"
 #include "../common/Logger.h"
@@ -13,15 +14,27 @@
 #include <filesystem>
 #include <chrono>
 #include <json/json.h>
+#include <condition_variable>
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
 
 RouteController::RouteController(const ServiceConfig& cfg) : config(cfg), running(true),
-lastSaveTime(std::chrono::steady_clock::now()), cachedInterfaceIndex(0) {
+lastSaveTime(std::chrono::steady_clock::now()), cachedInterfaceIndex(0),
+lastOptimizationTime(std::chrono::steady_clock::now()) {
     LoadRoutesFromDisk();
+
+    // Initialize optimizer with config
+    OptimizerConfig optConfig;
+    optConfig.min_hosts_to_aggregate = config.optimizerSettings.minHostsToAggregate;
+    optConfig.waste_thresholds = config.optimizerSettings.wasteThresholds;
+    optimizer = std::make_unique<RouteOptimizer>(optConfig);
+
+    // Start threads
     verifyThread = std::thread(&RouteController::VerifyRoutesThreadFunc, this);
     persistThread = std::thread(&RouteController::PersistenceThreadFunc, this);
+    optimizationThread = std::thread(&RouteController::OptimizationThreadFunc, this);
+
     if (config.aiPreloadEnabled) {
         PreloadAIRoutes();
     }
@@ -32,29 +45,25 @@ RouteController::~RouteController() {
 
     // Signal threads to stop
     running = false;
+    optimizationCV.notify_all();
 
-    // Wait for verify thread
+    // Wait for threads
     if (verifyThread.joinable()) {
         Logger::Instance().Info("Waiting for verify thread to stop...");
-        try {
-            verifyThread.join();
-            Logger::Instance().Info("Verify thread joined successfully");
-        }
-        catch (const std::exception& e) {
-            Logger::Instance().Error("Exception joining verify thread: " + std::string(e.what()));
-        }
+        verifyThread.join();
+        Logger::Instance().Info("Verify thread joined successfully");
     }
 
-    // Wait for persist thread
     if (persistThread.joinable()) {
         Logger::Instance().Info("Waiting for persist thread to stop...");
-        try {
-            persistThread.join();
-            Logger::Instance().Info("Persist thread joined successfully");
-        }
-        catch (const std::exception& e) {
-            Logger::Instance().Error("Exception joining persist thread: " + std::string(e.what()));
-        }
+        persistThread.join();
+        Logger::Instance().Info("Persist thread joined successfully");
+    }
+
+    if (optimizationThread.joinable()) {
+        Logger::Instance().Info("Waiting for optimization thread to stop...");
+        optimizationThread.join();
+        Logger::Instance().Info("Optimization thread joined successfully");
     }
 
     // Final save on shutdown
@@ -66,6 +75,166 @@ RouteController::~RouteController() {
     Logger::Instance().Info("RouteController destructor - completed");
 }
 
+void RouteController::OptimizationThreadFunc() {
+    Logger::Instance().Info("RouteController optimization thread started");
+
+    try {
+        while (running.load() && !ShutdownCoordinator::Instance().isShuttingDown) {
+            std::unique_lock<std::mutex> lock(optimizationMutex);
+
+            // Wait for 1 hour or until signaled to stop
+            auto waitUntil = std::chrono::steady_clock::now() + std::chrono::hours(1);
+            optimizationCV.wait_until(lock, waitUntil, [this] {
+                return !running.load() || ShutdownCoordinator::Instance().isShuttingDown;
+                });
+
+            if (!running.load() || ShutdownCoordinator::Instance().isShuttingDown) {
+                break;
+            }
+
+            lock.unlock();
+            RunOptimization();
+            lastOptimizationTime = std::chrono::steady_clock::now();
+        }
+    }
+    catch (const std::exception& e) {
+        Logger::Instance().Error("OptimizationThreadFunc exception: " + std::string(e.what()));
+    }
+
+    Logger::Instance().Info("RouteController optimization thread exiting");
+}
+
+void RouteController::RunOptimization() {
+    Logger::Instance().Info("=== Starting Route Optimization ===");
+
+    // Step 1: Copy current routes under minimal lock
+    std::vector<HostRoute> hostRoutes;
+    {
+        std::lock_guard<std::mutex> lock(routesMutex);
+        for (const auto& [routeKey, route] : routes) {
+            if (route->prefixLength == 32) { // Only optimize host routes
+                HostRoute hr;
+                hr.ip = route->ip;
+                hr.ipNum = IPToUInt(route->ip);
+                hr.processName = route->processName;
+                hostRoutes.push_back(hr);
+            }
+        }
+    }
+
+    // Step 2: Run optimization without lock
+    auto plan = optimizer->OptimizeRoutes(hostRoutes);
+
+    // Step 3: Log results
+    if (plan.routesBefore > 0) {
+        Logger::Instance().Info("Optimization Results:");
+        Logger::Instance().Info("  Routes before: " + std::to_string(plan.routesBefore));
+        Logger::Instance().Info("  Routes after: " + std::to_string(plan.routesAfter));
+        Logger::Instance().Info("  Compression: " + std::to_string(plan.compressionRatio * 100) + "%");
+        Logger::Instance().Info("  Savings: " + std::to_string(plan.routesBefore - plan.routesAfter) + " routes");
+    }
+    else {
+        Logger::Instance().Info("No routes to optimize");
+        return;
+    }
+
+    // Step 4: Apply changes if any
+    if (!plan.changes.empty()) {
+        ApplyOptimizationPlan(plan);
+    }
+
+    Logger::Instance().Info("=== Route Optimization Completed ===");
+}
+
+void RouteController::ApplyOptimizationPlan(const OptimizationPlan& plan) {
+    std::vector<std::pair<std::string, int>> toRemove;
+    std::vector<std::pair<std::string, int>> toAdd;
+    std::vector<std::pair<std::string, int>> addedRoutes; // For rollback
+
+    // Separate adds and removes
+    for (const auto& change : plan.changes) {
+        if (change.type == OptimizationPlan::RouteChange::ADD) {
+            toAdd.emplace_back(change.ip, change.prefixLength);
+        }
+        else {
+            toRemove.emplace_back(change.ip, change.prefixLength);
+        }
+    }
+
+    // First add new aggregated routes
+    bool addFailed = false;
+    for (const auto& [ip, prefix] : toAdd) {
+        if (AddSystemRouteWithMask(ip, prefix)) {
+            addedRoutes.push_back({ ip, prefix });
+        }
+        else {
+            Logger::Instance().Error("Failed to add aggregated route: " + ip + "/" + std::to_string(prefix));
+            addFailed = true;
+            break;
+        }
+    }
+
+    // If any add failed, rollback
+    if (addFailed) {
+        Logger::Instance().Warning("Rolling back optimization due to add failure");
+        for (const auto& [ip, prefix] : addedRoutes) {
+            RemoveSystemRouteWithMask(ip, prefix, config.gatewayIp);
+        }
+        return;
+    }
+
+    // Then remove old host routes
+    for (const auto& [ip, prefix] : toRemove) {
+        if (!RemoveSystemRouteWithMask(ip, prefix, config.gatewayIp)) {
+            Logger::Instance().Warning("Failed to remove host route: " + ip + "/" + std::to_string(prefix));
+            // Continue anyway - having extra routes is better than missing routes
+        }
+    }
+
+    // Update internal map only after successful system changes
+    {
+        std::lock_guard<std::mutex> lock(routesMutex);
+
+        // Add new routes
+        for (const auto& change : plan.changes) {
+            if (change.type == OptimizationPlan::RouteChange::ADD) {
+                std::string routeKey = change.ip + "/" + std::to_string(change.prefixLength);
+                auto routeInfo = std::make_unique<RouteInfo>(change.ip, "Optimized");
+                routeInfo->prefixLength = change.prefixLength;
+                routes[routeKey] = std::move(routeInfo);
+            }
+        }
+
+        // Remove old routes
+        for (const auto& change : plan.changes) {
+            if (change.type == OptimizationPlan::RouteChange::REMOVE) {
+                std::string routeKey = change.ip + "/" + std::to_string(change.prefixLength);
+                routes.erase(routeKey);
+            }
+        }
+
+        routesDirty = true;
+    }
+
+    // Notify UI about route count change
+    NotifyUIRouteCountChanged();
+}
+
+void RouteController::NotifyUIRouteCountChanged() {
+    // Send a custom message to UI window if available
+    // This is a simplified version - in production you'd use proper IPC
+    HWND uiWindow = FindWindow(L"RouteManagerProWindow", nullptr);
+    if (uiWindow) {
+        PostMessage(uiWindow, WM_USER + 101, 0, 0); // Custom message for route count update
+    }
+}
+
+void RouteController::RunOptimizationManual() {
+    Logger::Instance().Info("Manual optimization requested");
+    RunOptimization();
+    lastOptimizationTime = std::chrono::steady_clock::now();
+}
+
 void RouteController::InvalidateInterfaceCache() {
     std::lock_guard<std::mutex> lock(interfaceCacheMutex);
     cachedInterfaceIndex = 0;
@@ -75,29 +244,32 @@ void RouteController::InvalidateInterfaceCache() {
 void RouteController::UpdateConfig(const ServiceConfig& newConfig) {
     std::lock_guard<std::mutex> lock(routesMutex);
 
-    // Check what changed
     bool gatewayChanged = (config.gatewayIp != newConfig.gatewayIp);
     bool metricChanged = (config.metric != newConfig.metric);
 
     std::string oldGateway = config.gatewayIp;
-
-    // Update entire config
     config = newConfig;
 
-    // Handle changes
+    // Update optimizer config
+    if (optimizer) {
+        OptimizerConfig optConfig;
+        optConfig.min_hosts_to_aggregate = config.optimizerSettings.minHostsToAggregate;
+        optConfig.waste_thresholds = config.optimizerSettings.wasteThresholds;
+        optimizer->UpdateConfig(optConfig);
+    }
+
     if (gatewayChanged) {
         Logger::Instance().Info("Gateway changed from " + oldGateway + " to " + config.gatewayIp);
-        InvalidateInterfaceCache(); // Critical!
+        InvalidateInterfaceCache();
         MigrateExistingRoutes(oldGateway, config.gatewayIp);
     }
     else if (metricChanged) {
         Logger::Instance().Info("Metric changed, updating all routes");
-        MigrateExistingRoutes(config.gatewayIp, config.gatewayIp); // Re-add with new metric
+        MigrateExistingRoutes(config.gatewayIp, config.gatewayIp);
     }
 }
 
 void RouteController::MigrateExistingRoutes(const std::string& oldGateway, const std::string& newGateway) {
-    // Collect routes without holding lock during system calls
     std::vector<std::pair<std::string, int>> routesToMigrate;
     for (const auto& [key, route] : routes) {
         routesToMigrate.emplace_back(route->ip, route->prefixLength);
@@ -110,10 +282,8 @@ void RouteController::MigrateExistingRoutes(const std::string& oldGateway, const
     int failCount = 0;
 
     for (const auto& [ip, prefix] : routesToMigrate) {
-        // CRITICAL FIX: Remove with OLD gateway
         RemoveSystemRouteWithMask(ip, prefix, oldGateway);
 
-        // Add with new gateway (uses current config.gatewayIp)
         if (AddSystemRouteWithMask(ip, prefix)) {
             successCount++;
         }
@@ -125,10 +295,6 @@ void RouteController::MigrateExistingRoutes(const std::string& oldGateway, const
 
     Logger::Instance().Info("Migration complete. Success: " + std::to_string(successCount) +
         ", Failed: " + std::to_string(failCount));
-
-    if (failCount > 0) {
-        // Could notify UI about failures
-    }
 }
 
 void RouteController::PersistenceThreadFunc() {
@@ -136,7 +302,6 @@ void RouteController::PersistenceThreadFunc() {
 
     try {
         while (running.load() && !ShutdownCoordinator::Instance().isShuttingDown) {
-            // Check every minute if we need to save - but check shutdown every second
             for (int i = 0; i < 60 && running.load() && !ShutdownCoordinator::Instance().isShuttingDown; i++) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
@@ -148,14 +313,12 @@ void RouteController::PersistenceThreadFunc() {
             auto now = std::chrono::steady_clock::now();
             auto timeSinceLastSave = now - lastSaveTime;
 
-            // Save if dirty and enough time has passed
             if (routesDirty.load() && timeSinceLastSave >= SAVE_INTERVAL) {
                 Logger::Instance().Info("Periodic save of routes (dirty flag set)");
                 SaveRoutesToDiskAsync();
             }
         }
 
-        // Final save on thread exit
         if (routesDirty.load()) {
             Logger::Instance().Info("Persistence thread: Final save of routes");
             SaveRoutesToDisk();
@@ -165,12 +328,10 @@ void RouteController::PersistenceThreadFunc() {
         Logger::Instance().Error("PersistenceThreadFunc exception: " + std::string(e.what()));
     }
 
-    // Log AFTER all work is done, right before thread exits
     Logger::Instance().Info("RouteController persistence thread exiting");
 }
 
 void RouteController::SaveRoutesToDiskAsync() {
-    // Create a snapshot of routes under lock
     std::vector<std::pair<std::string, RouteInfo>> snapshot;
     {
         std::lock_guard<std::mutex> lock(routesMutex);
@@ -179,7 +340,6 @@ void RouteController::SaveRoutesToDiskAsync() {
         }
     }
 
-    // Save without holding the lock
     std::ofstream file(Constants::STATE_FILE + ".tmp");
     if (!file.is_open()) {
         Logger::Instance().Error("Failed to open state file for writing");
@@ -220,7 +380,19 @@ bool RouteController::AddRoute(const std::string& ip, const std::string& process
 bool RouteController::AddRouteWithMask(const std::string& ip, int prefixLength, const std::string& processName) {
     if (!Utils::IsValidIPv4(ip)) return false;
 
+    // Skip private/local IPs
+    if (Utils::IsPrivateIP(ip)) {
+        Logger::Instance().Debug("Skipping private IP: " + ip);
+        return false;
+    }
+
     std::lock_guard<std::mutex> lock(routesMutex);
+
+    // Check if this IP is already covered by an existing aggregated route
+    if (IsIPCoveredByExistingRoute(ip)) {
+        Logger::Instance().Info("IP " + ip + " is already covered by an aggregated route, skipping addition");
+        return true;
+    }
 
     std::string routeKey = ip + "/" + std::to_string(prefixLength);
 
@@ -240,7 +412,10 @@ bool RouteController::AddRouteWithMask(const std::string& ip, int prefixLength, 
         routeInfo->prefixLength = prefixLength;
         routes[routeKey] = std::move(routeInfo);
         Logger::Instance().Info("Added new route: " + routeKey + " for process: " + processName);
-        routesDirty = true;  // Mark as dirty instead of saving immediately
+        routesDirty = true;
+
+        // Notify UI to update route count
+        NotifyUIRouteCountChanged();
         return true;
     }
 
@@ -259,11 +434,13 @@ bool RouteController::RemoveRouteWithMask(const std::string& ip, int prefixLengt
     if (it == routes.end()) return false;
 
     if (--it->second->refCount <= 0) {
-        // UPDATED: Pass current gateway
         if (RemoveSystemRouteWithMask(ip, prefixLength, config.gatewayIp)) {
             Logger::Instance().Info("Removed route: " + routeKey);
             routes.erase(it);
-            routesDirty = true;  // Mark as dirty instead of saving immediately
+            routesDirty = true;
+
+            // Notify UI to update route count
+            NotifyUIRouteCountChanged();
             return true;
         }
     }
@@ -274,7 +451,6 @@ bool RouteController::RemoveRouteWithMask(const std::string& ip, int prefixLengt
 void RouteController::CleanupAllRoutes() {
     Logger::Instance().Info("CleanupAllRoutes - Starting cleanup of all routes");
 
-    // 1. Collect route information and clear internal cache under lock
     std::vector<std::pair<std::string, int>> routesToDelete;
     bool hadPreloadRoutes = false;
     {
@@ -284,7 +460,6 @@ void RouteController::CleanupAllRoutes() {
             return;
         }
 
-        // Collect routes to delete and check for preload routes
         for (const auto& [routeKey, route] : routes) {
             routesToDelete.emplace_back(route->ip, route->prefixLength);
             if (route->processName.find("Preload-") == 0) {
@@ -292,18 +467,15 @@ void RouteController::CleanupAllRoutes() {
             }
         }
 
-        // Clear internal cache immediately
         routes.clear();
         routesDirty = true;
     }
 
-    // 2. Delete system routes WITHOUT holding the lock
     int successCount = 0;
     int failCount = 0;
 
     for (const auto& [ip, prefixLength] : routesToDelete) {
         Logger::Instance().Info("Removing Windows route for: " + ip + "/" + std::to_string(prefixLength));
-        // UPDATED: Pass current gateway
         if (RemoveSystemRouteWithMask(ip, prefixLength, config.gatewayIp)) {
             successCount++;
         }
@@ -313,14 +485,13 @@ void RouteController::CleanupAllRoutes() {
         }
     }
 
-    // 3. If we had preload routes, disable AI preload in config
     if (hadPreloadRoutes) {
         config.aiPreloadEnabled = false;
         Logger::Instance().Info("CleanupAllRoutes - Disabled AI preload since preload routes were removed");
     }
 
-    // Force immediate save for cleanup
     SaveRoutesToDisk();
+    NotifyUIRouteCountChanged();
 
     Logger::Instance().Info("CleanupAllRoutes - Completed. Removed: " + std::to_string(successCount) +
         ", Failed: " + std::to_string(failCount));
@@ -333,7 +504,6 @@ void RouteController::CleanupOldRoutes() {
     bool anyRemoved = false;
     for (auto it = routes.begin(); it != routes.end();) {
         if (it->second->createdAt < cutoff) {
-            // UPDATED: Pass current gateway
             RemoveSystemRouteWithMask(it->second->ip, it->second->prefixLength, config.gatewayIp);
             it = routes.erase(it);
             anyRemoved = true;
@@ -345,6 +515,7 @@ void RouteController::CleanupOldRoutes() {
 
     if (anyRemoved) {
         routesDirty = true;
+        NotifyUIRouteCountChanged();
     }
 }
 
@@ -367,6 +538,38 @@ std::vector<RouteInfo> RouteController::GetActiveRoutes() const {
         });
 
     return result;
+}
+
+bool RouteController::IsIPCoveredByExistingRoute(const std::string& ip) {
+    uint32_t ipAddr = IPToUInt(ip);
+
+    for (const auto& [routeKey, route] : routes) {
+        if (route->prefixLength >= 32) continue;
+
+        uint32_t routeAddr = IPToUInt(route->ip);
+        uint32_t mask = CreateMask(route->prefixLength);
+
+        if ((ipAddr & mask) == (routeAddr & mask)) {
+            Logger::Instance().Debug("IP " + ip + " is covered by route " + routeKey);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+uint32_t RouteController::IPToUInt(const std::string& ip) {
+    struct in_addr addr;
+    if (inet_pton(AF_INET, ip.c_str(), &addr) == 1) {
+        return ntohl(addr.s_addr);
+    }
+    return 0;
+}
+
+uint32_t RouteController::CreateMask(int prefixLength) {
+    if (prefixLength <= 0) return 0;
+    if (prefixLength >= 32) return 0xFFFFFFFF;
+    return ~((1u << (32 - prefixLength)) - 1);
 }
 
 bool RouteController::AddSystemRoute(const std::string& ip) {
@@ -537,7 +740,6 @@ bool RouteController::RemoveSystemRouteWithMask(const std::string& ip, int prefi
     DWORD mask = prefixLength == 0 ? 0 : (0xFFFFFFFF << (32 - prefixLength));
     route.dwForwardMask = htonl(mask);
 
-    // NOW USES THE PASSED GATEWAY PARAMETER
     route.dwForwardNextHop = inet_addr(gatewayIp.c_str());
 
     ULONG bestInterface;
@@ -566,13 +768,11 @@ void RouteController::VerifyRoutesThreadFunc() {
 
     try {
         while (running.load() && !ShutdownCoordinator::Instance().isShuttingDown) {
-            // Interruptible sleep - check shutdown every second
             for (int i = 0; i < Constants::ROUTE_VERIFY_INTERVAL_SEC &&
                 running.load() && !ShutdownCoordinator::Instance().isShuttingDown; i++) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
 
-            // Exit immediately if shutting down
             if (!running.load() || ShutdownCoordinator::Instance().isShuttingDown) {
                 break;
             }
@@ -582,11 +782,9 @@ void RouteController::VerifyRoutesThreadFunc() {
                 continue;
             }
 
-            // Create a snapshot of routes to verify without holding lock too long
             std::vector<std::pair<std::string, int>> routesToVerify;
             {
                 std::lock_guard<std::mutex> lock(routesMutex);
-                // Check shutdown again after acquiring lock
                 if (!running.load() || ShutdownCoordinator::Instance().isShuttingDown) {
                     break;
                 }
@@ -596,9 +794,7 @@ void RouteController::VerifyRoutesThreadFunc() {
                 }
             }
 
-            // Verify routes without holding the lock
             for (const auto& [ip, prefixLength] : routesToVerify) {
-                // Check shutdown before each route verification
                 if (!running.load() || ShutdownCoordinator::Instance().isShuttingDown) {
                     Logger::Instance().Info("Route verification interrupted by shutdown");
                     break;
@@ -612,7 +808,6 @@ void RouteController::VerifyRoutesThreadFunc() {
         Logger::Instance().Error("VerifyRoutesThreadFunc exception: " + std::string(e.what()));
     }
 
-    // Log AFTER all work is done, right before thread exits
     Logger::Instance().Info("RouteController verify thread exiting");
 }
 
@@ -622,19 +817,19 @@ void RouteController::SaveRoutesToDisk() {
     std::ofstream file(Constants::STATE_FILE + ".tmp");
     if (!file.is_open()) return;
 
-    file << "version=3\n";  // Increment version
+    file << "version=3\n";
 
     auto now = std::chrono::system_clock::now();
     auto nowSeconds = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
     file << "timestamp=" << nowSeconds << "\n";
-    file << "gateway=" << config.gatewayIp << "\n";  // Save current gateway
+    file << "gateway=" << config.gatewayIp << "\n";
 
     for (auto& [routeKey, route] : routes) {
         auto createdSeconds = std::chrono::duration_cast<std::chrono::seconds>(
             route->createdAt.time_since_epoch()).count();
 
         file << "route=" << route->ip << "," << route->processName << ","
-            << createdSeconds << "," << route->prefixLength << "," << config.gatewayIp << "\n";  // Include gateway
+            << createdSeconds << "," << route->prefixLength << "," << config.gatewayIp << "\n";
     }
 
     file.close();
@@ -670,7 +865,6 @@ void RouteController::LoadRoutesFromDisk() {
                 std::string process = parts[1];
                 int prefixLength = 32;
 
-                // Skip preload routes - they will be loaded from preload_ips.json
                 if (process.find("Preload-") == 0) {
                     skippedPreloadCount++;
                     continue;
@@ -700,8 +894,7 @@ void RouteController::LoadRoutesFromDisk() {
                     }
                 }
 
-                // Check if gateway from file matches current gateway
-                std::string routeGateway = config.gatewayIp;  // Default to current
+                std::string routeGateway = config.gatewayIp;
                 if (parts.size() >= 5) {
                     routeGateway = parts[4];
                 }
@@ -718,18 +911,15 @@ void RouteController::LoadRoutesFromDisk() {
         }
     }
 
-    // Check if saved gateway differs from current and migrate if needed
     if (!savedGateway.empty() && savedGateway != config.gatewayIp) {
         Logger::Instance().Warning("Gateway mismatch on startup. Saved: " + savedGateway +
             ", Config: " + config.gatewayIp + ". Migrating routes.");
-        // Use the migration logic to fix the loaded routes immediately
         MigrateExistingRoutes(savedGateway, config.gatewayIp);
     }
 
     Logger::Instance().Info("LoadRoutesFromDisk - Loaded " + std::to_string(loadedCount) +
         " routes, skipped " + std::to_string(skippedPreloadCount) + " preload routes");
 
-    // Reset dirty flag after loading
     routesDirty = false;
 }
 

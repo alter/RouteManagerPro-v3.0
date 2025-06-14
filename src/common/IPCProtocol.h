@@ -14,7 +14,7 @@ enum class IPCMessageType {
     AddRoute = 7,
     RemoveRoute = 8,
     ClearRoutes = 9,
-    // RestartService = 10, // Removed as it was service-specific
+    OptimizeRoutes = 10,
     SetAIPreload = 12
 };
 

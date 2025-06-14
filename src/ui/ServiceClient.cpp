@@ -254,3 +254,12 @@ void ServiceClient::SetAIPreload(bool enabled) {
 
     SendMessage(msg);
 }
+
+void ServiceClient::OptimizeRoutes() {
+    if (!connected) return;
+
+    IPCMessage msg;
+    msg.type = IPCMessageType::OptimizeRoutes;
+
+    SendMessage(msg);
+}

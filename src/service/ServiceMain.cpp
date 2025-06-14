@@ -346,6 +346,13 @@ void ServiceMain::HandlePipeClient(HANDLE pipe) {
                 break;
             }
 
+            case IPCMessageType::OptimizeRoutes: {
+                if (routeController) {
+                    routeController->RunOptimizationManual();
+                }
+                break;
+            }
+
             default:
                 response.success = false;
                 response.error = "Unknown message type";

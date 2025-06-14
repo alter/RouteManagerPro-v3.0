@@ -38,6 +38,7 @@ private:
     HWND statusLabel;
     HWND minimizeButton;
     HWND viewLogsButton;
+    HWND optimizeRoutesButton;
 
     ServiceConfig config;
     ServiceStatus status;
@@ -55,6 +56,7 @@ private:
     void OnMinimizeToTray();
     void OnViewLogs();
     void OnAIPreloadToggle();
+    void OnOptimizeRoutes();
     void LoadConfiguration();
     void OnClose();
     void OnSize(int width, int height);

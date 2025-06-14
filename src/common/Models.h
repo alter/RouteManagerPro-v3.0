@@ -6,6 +6,7 @@
 #include <vector>
 #include <chrono>
 #include <atomic>
+#include <unordered_map>
 
 struct ProcessInfo {
     std::wstring name;
@@ -55,6 +56,14 @@ struct NetworkEvent {
     NetworkEvent() : remotePort(0), timestamp(std::chrono::system_clock::now()) {}
 };
 
+struct OptimizerSettings {
+    int minHostsToAggregate = 2;
+    std::unordered_map<int, float> wasteThresholds = {
+        {30, 0.75f}, {29, 0.80f}, {28, 0.85f},
+        {27, 0.90f}, {26, 0.90f}, {25, 0.92f}, {24, 0.95f}
+    };
+};
+
 struct ServiceConfig {
     std::string gatewayIp = "10.200.210.1";
     int metric = 1;
@@ -62,6 +71,7 @@ struct ServiceConfig {
     bool startMinimized = true;
     bool startWithWindows = true;
     bool aiPreloadEnabled = false;
+    OptimizerSettings optimizerSettings;
 };
 
 struct ServiceStatus {

@@ -81,6 +81,9 @@
     <ClCompile Include="src\service\Watchdog.cpp">
       <Filter>Source Files\service</Filter>
     </ClCompile>
+    <ClCompile Include="src\service\RouteOptimizer.cpp">
+      <Filter>Source Files\service</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\common\Utils.h">
@@ -142,6 +145,9 @@
     </ClInclude>
     <ClInclude Include="src\common\resource.h">
       <Filter>Header Files\common</Filter>
+    </ClInclude>
+    <ClInclude Include="src\service\RouteOptimizer.h">
+      <Filter>Header Files\service</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>

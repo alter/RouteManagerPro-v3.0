@@ -7,9 +7,12 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <memory>
+#include <condition_variable>
 #include <winsock2.h>
 #include <netioapi.h>
 #include "../common/Models.h"
+#include "RouteOptimizer.h"
 
 class RouteController {
 public:
@@ -27,43 +30,63 @@ public:
     void PreloadAIRoutes();
     ServiceConfig GetConfig() const { return config; }
     void UpdateConfig(const ServiceConfig& newConfig);
+    void RunOptimizationManual();
 
 private:
     ServiceConfig config;
     std::unordered_map<std::string, std::unique_ptr<RouteInfo>> routes;
     mutable std::mutex routesMutex;
     std::atomic<bool> running;
+
+    // Threads
     std::thread verifyThread;
     std::thread persistThread;
+    std::thread optimizationThread;
+
+    // Optimization
+    std::unique_ptr<RouteOptimizer> optimizer;
+    std::chrono::steady_clock::time_point lastOptimizationTime;
+    std::condition_variable optimizationCV;
+    std::mutex optimizationMutex;
 
     NET_IFINDEX cachedInterfaceIndex;
     std::mutex interfaceCacheMutex;
 
-    // Persistence optimization
+    // Persistence
     std::atomic<bool> routesDirty{ false };
     std::chrono::steady_clock::time_point lastSaveTime;
     static constexpr auto SAVE_INTERVAL = std::chrono::minutes(10);
 
+    // System route management
     bool AddSystemRoute(const std::string& ip);
     bool AddSystemRouteWithMask(const std::string& ip, int prefixLength);
     bool AddSystemRouteOldAPI(const std::string& ip);
     bool AddSystemRouteOldAPIWithMask(const std::string& ip, int prefixLength);
     bool RemoveSystemRoute(const std::string& ip, const std::string& gatewayIp);
     bool RemoveSystemRouteWithMask(const std::string& ip, int prefixLength, const std::string& gatewayIp);
+
+    // Thread functions
     void VerifyRoutesThreadFunc();
     void PersistenceThreadFunc();
+    void OptimizationThreadFunc();
+
+    // Persistence
     void SaveRoutesToDisk();
     void SaveRoutesToDiskAsync();
     void LoadRoutesFromDisk();
+
+    // Helpers
     bool IsGatewayReachable();
     void InvalidateInterfaceCache();
     void MigrateExistingRoutes(const std::string& oldGateway, const std::string& newGateway);
+    void RunOptimization();
+    void ApplyOptimizationPlan(const OptimizationPlan& plan);
+    bool IsIPCoveredByExistingRoute(const std::string& ip);
+    uint32_t IPToUInt(const std::string& ip);
+    uint32_t CreateMask(int prefixLength);
+    void NotifyUIRouteCountChanged();
 
-    struct AIServiceRange {
-        std::string service;
-        std::vector<std::string> ranges;
-    };
-
+    // Preload
     struct PreloadService {
         std::string name;
         bool enabled;
