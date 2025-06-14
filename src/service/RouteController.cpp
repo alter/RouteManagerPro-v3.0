@@ -182,35 +182,41 @@ std::vector<SystemRoute> RouteController::GetSystemRoutesOldAPI() {
 // Подсчет битов в маске
 int RouteController::CountBits(uint32_t mask) {
     int count = 0;
-    while (mask) {
-        count += mask & 1;
-        mask >>= 1;
+    uint32_t n = mask;
+    while (n) {
+        count++;
+        n &= (n - 1);  // Clear the least significant bit
     }
     return count;
 }
 
 // Новый улучшенный метод оптимизации
 void RouteController::RunOptimization() {
-    Logger::Instance().Info("=== Starting Route Optimization (Improved Algorithm) ===");
+    Logger::Instance().Info("=== Starting Route Optimization (Deep Algorithm) ===");
 
     // Step 1: Get ALL routes from system table for our gateway
     auto systemRoutes = GetSystemRoutesForGateway();
     Logger::Instance().Info("Found " + std::to_string(systemRoutes.size()) +
         " total routes in system for gateway " + config.gatewayIp);
 
-    // Step 2: Separate host routes (/32) and aggregated routes
-    std::vector<HostRoute> candidateHostRoutes;
-    std::vector<SystemRoute> existingAggregatedRoutes;
+    // Step 2: Convert ALL routes (not just /32) to HostRoute format for optimization
+    std::vector<HostRoute> allRoutesForOptimization;
+    std::vector<SystemRoute> largeAggregatedRoutes; // Only keep very large aggregates (< /24)
 
     for (const auto& route : systemRoutes) {
-        if (route.prefixLength == 32) {
-            // This is a host route - potential candidate
+        if (route.prefixLength < 24) {
+            // Keep large aggregated routes (like /16, /19, etc) as they are
+            largeAggregatedRoutes.push_back(route);
+        }
+        else {
+            // Convert to HostRoute for optimization (includes /24, /25, ..., /32)
             HostRoute hr;
             hr.ip = route.ipString;
             hr.ipNum = route.address;
+            hr.prefixLength = route.prefixLength;
 
             // Try to find process name from our internal state
-            std::string routeKey = route.ipString + "/32";
+            std::string routeKey = route.ipString + "/" + std::to_string(route.prefixLength);
             auto it = routes.find(routeKey);
             if (it != routes.end()) {
                 hr.processName = it->second->processName;
@@ -219,78 +225,107 @@ void RouteController::RunOptimization() {
                 hr.processName = "Unknown";
             }
 
-            candidateHostRoutes.push_back(hr);
-        }
-        else {
-            // This is an aggregated route
-            existingAggregatedRoutes.push_back(route);
+            allRoutesForOptimization.push_back(hr);
         }
     }
 
-    Logger::Instance().Info("Separated routes: " + std::to_string(candidateHostRoutes.size()) +
-        " host routes, " + std::to_string(existingAggregatedRoutes.size()) +
-        " aggregated routes");
+    Logger::Instance().Info("Prepared for optimization: " +
+        std::to_string(allRoutesForOptimization.size()) + " routes (/24 and smaller), " +
+        std::to_string(largeAggregatedRoutes.size()) + " large aggregates kept");
 
-    // Step 3: Filter out host routes that are already covered by existing aggregated routes
-    std::vector<HostRoute> uncoveredHostRoutes;
+    // Step 3: Group routes by /24 network for analysis
+    std::unordered_map<uint32_t, std::vector<HostRoute>> routesByNetwork;
+    for (const auto& route : allRoutesForOptimization) {
+        uint32_t network = route.ipNum & 0xFFFFFF00; // /24 network
+        routesByNetwork[network].push_back(route);
+    }
+
+    // Log some statistics about route distribution
+    Logger::Instance().Info("Routes are distributed across " +
+        std::to_string(routesByNetwork.size()) + " /24 networks");
+
+    // Log top networks with most routes
+    std::vector<std::pair<uint32_t, size_t>> networkSizes;
+    for (const auto& [network, routes] : routesByNetwork) {
+        networkSizes.push_back({ network, routes.size() });
+    }
+    std::sort(networkSizes.begin(), networkSizes.end(),
+        [](const auto& a, const auto& b) { return a.second > b.second; });
+
+    for (size_t i = 0; i < std::min(size_t(5), networkSizes.size()); i++) {
+        uint32_t network = networkSizes[i].first;
+        size_t count = networkSizes[i].second;
+        struct in_addr addr;
+        addr.s_addr = htonl(network);
+        char ipStr[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &addr, ipStr, INET_ADDRSTRLEN);
+        Logger::Instance().Info("Network " + std::string(ipStr) + "/24 has " +
+            std::to_string(count) + " routes");
+    }
+
+    // Step 4: Filter out routes that are already covered by large aggregated routes
+    std::vector<HostRoute> uncoveredRoutes;
     int coveredCount = 0;
 
-    for (const auto& hostRoute : candidateHostRoutes) {
+    for (const auto& route : allRoutesForOptimization) {
         bool isCovered = false;
 
-        for (const auto& aggRoute : existingAggregatedRoutes) {
-            // Check if this host is covered by the aggregated route
-            uint32_t hostAddr = hostRoute.ipNum;
+        for (const auto& aggRoute : largeAggregatedRoutes) {
+            uint32_t routeAddr = route.ipNum;
             uint32_t aggAddr = aggRoute.address;
             uint32_t mask = aggRoute.mask;
 
-            if ((hostAddr & mask) == (aggAddr & mask)) {
+            if ((routeAddr & mask) == (aggAddr & mask)) {
                 isCovered = true;
-                Logger::Instance().Debug("Host " + hostRoute.ip + " is covered by " +
-                    aggRoute.ipString + "/" + std::to_string(aggRoute.prefixLength));
                 break;
             }
         }
 
         if (!isCovered) {
-            uncoveredHostRoutes.push_back(hostRoute);
+            uncoveredRoutes.push_back(route);
         }
         else {
             coveredCount++;
         }
     }
 
-    Logger::Instance().Info("Filtered host routes: " + std::to_string(coveredCount) +
-        " already covered (redundant), " +
-        std::to_string(uncoveredHostRoutes.size()) + " uncovered (need optimization)");
+    Logger::Instance().Info("Filtered routes: " + std::to_string(coveredCount) +
+        " already covered by large aggregates, " +
+        std::to_string(uncoveredRoutes.size()) + " routes need optimization");
 
-    // Step 4: Run optimization only on uncovered host routes
-    auto plan = optimizer->OptimizeRoutes(uncoveredHostRoutes);
+    // Step 5: Run optimization on uncovered routes
+    auto plan = optimizer->OptimizeRoutes(uncoveredRoutes);
 
-    // Step 5: Log results
+    // Step 6: Log results
     if (plan.routesBefore > 0) {
         Logger::Instance().Info("Optimization Results:");
         Logger::Instance().Info("  Routes before: " + std::to_string(plan.routesBefore));
         Logger::Instance().Info("  Routes after: " + std::to_string(plan.routesAfter));
         Logger::Instance().Info("  Compression: " + std::to_string(plan.compressionRatio * 100) + "%");
         Logger::Instance().Info("  Savings: " + std::to_string(plan.routesBefore - plan.routesAfter) + " routes");
-        Logger::Instance().Info("  Plus " + std::to_string(coveredCount) + " redundant routes can be removed");
+
+        // Log details of changes
+        int adds = 0, removes = 0;
+        for (const auto& change : plan.changes) {
+            if (change.type == OptimizationPlan::RouteChange::ADD) {
+                adds++;
+                Logger::Instance().Debug("  + Add: " + change.ip + "/" +
+                    std::to_string(change.prefixLength) + " (" + change.reason + ")");
+            }
+            else {
+                removes++;
+            }
+        }
+        Logger::Instance().Info("  Changes: " + std::to_string(adds) + " additions, " +
+            std::to_string(removes) + " removals");
     }
     else {
-        Logger::Instance().Info("No uncovered routes to optimize");
+        Logger::Instance().Info("No routes to optimize");
     }
 
-    // Step 6: Apply optimization plan
-    if (!plan.changes.empty() || coveredCount > 0) {
-        // First, remove redundant covered routes
-        if (coveredCount > 0) {
-            RemoveRedundantSystemRoutes(candidateHostRoutes, existingAggregatedRoutes);
-        }
-
-        // Then apply optimization plan
-        if (!plan.changes.empty()) {
-            ApplyOptimizationPlan(plan);
-        }
+    // Step 7: Apply optimization plan
+    if (!plan.changes.empty()) {
+        ApplyOptimizationPlan(plan);
     }
 
     Logger::Instance().Info("=== Route Optimization Completed ===");

@@ -33,6 +33,13 @@ struct HostRoute {
     std::string ip;
     uint32_t ipNum;
     std::string processName;
+    int prefixLength = 32;  // Added to support non-/32 routes
+};
+
+struct RouteInfo {
+    std::string ip;
+    int prefixLength;
+    std::string processName;
 };
 
 class RouteOptimizer {
@@ -48,18 +55,27 @@ public:
 private:
     struct TrieNode {
         std::unique_ptr<TrieNode> children[2];
-        bool isHost = false;
-        bool isAggregated = false;
+        bool isRoute = false;          // Marks if this node represents an actual route
+        bool isAggregated = false;     // Marks if this subtree should be aggregated
         std::string processName;
+        int prefixLength = 32;         // The prefix length of the route at this node
+        int routeCount = 0;            // Number of routes at exactly this node
     };
 
     OptimizerConfig config;
     mutable std::mutex configMutex;
 
-    void BuildTrie(std::unique_ptr<TrieNode>& root, const std::vector<HostRoute>& routes);
-    int AggregateTrie(TrieNode* node, int depth);
-    void GeneratePlan(TrieNode* node, uint32_t currentSubnet, int depth,
-        OptimizationPlan& plan, std::unordered_map<std::string, bool>& processedHosts);
+    // Enhanced methods that handle routes with different prefix lengths
+    void BuildEnhancedTrie(std::unique_ptr<TrieNode>& root, const std::vector<HostRoute>& routes);
+    int AggregateEnhancedTrie(TrieNode* node, int depth);
+    void GenerateEnhancedPlan(TrieNode* node, uint32_t currentSubnet, int depth,
+        OptimizationPlan& plan, std::unordered_map<std::string, RouteInfo>& processedRoutes);
+
+    // Helper methods
+    int CountRoutesInSubtree(TrieNode* node);
+    int CountExistingRoutes(TrieNode* node);
+    void CollectRoutesForRemoval(TrieNode* node, uint32_t subnet, int depth,
+        std::vector<RouteInfo>& routes);
 
     uint32_t CreateMask(int prefixLength);
     std::string UIntToIP(uint32_t ip);
