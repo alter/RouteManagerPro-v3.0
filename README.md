@@ -29,7 +29,7 @@ Route Manager Pro automatically creates and manages Windows network routes based
 
 ## 🔧 Installation
 
-1. Download the latest release from [Releases](https://github.com/yourrepo/releases)
+1. Download the latest release from [Releases](https://github.com/alter/RouteManagerPro-v3.0/releases/latest)
 2. Extract to your preferred location
 3. Run `RouteManagerPro.exe` as Administrator
 
