@@ -15,6 +15,8 @@
 #include <chrono>
 #include <json/json.h>
 #include <condition_variable>
+#include <unordered_set>
+#include <unordered_map>
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
@@ -104,46 +106,347 @@ void RouteController::OptimizationThreadFunc() {
     Logger::Instance().Info("RouteController optimization thread exiting");
 }
 
-void RouteController::RunOptimization() {
-    Logger::Instance().Info("=== Starting Route Optimization ===");
+// Новый метод для получения всех маршрутов из системы
+std::vector<SystemRoute> RouteController::GetSystemRoutesForGateway() {
+    std::vector<SystemRoute> systemRoutes;
 
-    // Step 1: Copy current routes under minimal lock
-    std::vector<HostRoute> hostRoutes;
-    {
-        std::lock_guard<std::mutex> lock(routesMutex);
-        for (const auto& [routeKey, route] : routes) {
-            if (route->prefixLength == 32) { // Only optimize host routes
-                HostRoute hr;
-                hr.ip = route->ip;
-                hr.ipNum = IPToUInt(route->ip);
-                hr.processName = route->processName;
-                hostRoutes.push_back(hr);
+    // Use old API for compatibility
+    return GetSystemRoutesOldAPI();
+}
+
+// Fallback метод для старого API
+std::vector<SystemRoute> RouteController::GetSystemRoutesOldAPI() {
+    std::vector<SystemRoute> systemRoutes;
+
+    PMIB_IPFORWARDTABLE pIpForwardTable = nullptr;
+    DWORD dwSize = 0;
+
+    // First call to get size
+    if (GetIpForwardTable(pIpForwardTable, &dwSize, FALSE) == ERROR_INSUFFICIENT_BUFFER) {
+        pIpForwardTable = (PMIB_IPFORWARDTABLE)malloc(dwSize);
+
+        if (pIpForwardTable && GetIpForwardTable(pIpForwardTable, &dwSize, FALSE) == NO_ERROR) {
+            DWORD targetGateway = inet_addr(config.gatewayIp.c_str());
+
+            for (DWORD i = 0; i < pIpForwardTable->dwNumEntries; i++) {
+                const auto& row = pIpForwardTable->table[i];
+
+                if (row.dwForwardNextHop == targetGateway) {
+                    SystemRoute route;
+                    route.address = ntohl(row.dwForwardDest);
+                    route.mask = ntohl(row.dwForwardMask);
+                    route.prefixLength = CountBits(route.mask);
+
+                    struct in_addr addr;
+                    addr.s_addr = row.dwForwardDest;
+                    char ipStr[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &addr, ipStr, INET_ADDRSTRLEN);
+                    route.ipString = ipStr;
+
+                    systemRoutes.push_back(route);
+
+                    // Debug log для первых нескольких маршрутов
+                    if (systemRoutes.size() <= 5 || route.prefixLength < 32) {
+                        Logger::Instance().Debug("Route: " + route.ipString + "/" +
+                            std::to_string(route.prefixLength) +
+                            " addr=" + std::to_string(route.address) +
+                            " mask=" + std::to_string(route.mask));
+                    }
+                }
             }
+        }
+
+        if (pIpForwardTable) {
+            free(pIpForwardTable);
         }
     }
 
-    // Step 2: Run optimization without lock
-    auto plan = optimizer->OptimizeRoutes(hostRoutes);
+    Logger::Instance().Info("Found " + std::to_string(systemRoutes.size()) +
+        " routes for gateway " + config.gatewayIp);
 
-    // Step 3: Log results
+    // Log distribution of prefix lengths
+    std::unordered_map<int, int> prefixCounts;
+    for (const auto& route : systemRoutes) {
+        prefixCounts[route.prefixLength]++;
+    }
+
+    std::string distribution = "Route distribution by prefix: ";
+    for (const auto& [prefix, count] : prefixCounts) {
+        distribution += "/" + std::to_string(prefix) + "=" + std::to_string(count) + " ";
+    }
+    Logger::Instance().Info(distribution);
+
+    return systemRoutes;
+}
+
+// Подсчет битов в маске
+int RouteController::CountBits(uint32_t mask) {
+    int count = 0;
+    while (mask) {
+        count += mask & 1;
+        mask >>= 1;
+    }
+    return count;
+}
+
+// Новый улучшенный метод оптимизации
+void RouteController::RunOptimization() {
+    Logger::Instance().Info("=== Starting Route Optimization (Improved Algorithm) ===");
+
+    // Step 1: Get ALL routes from system table for our gateway
+    auto systemRoutes = GetSystemRoutesForGateway();
+    Logger::Instance().Info("Found " + std::to_string(systemRoutes.size()) +
+        " total routes in system for gateway " + config.gatewayIp);
+
+    // Step 2: Separate host routes (/32) and aggregated routes
+    std::vector<HostRoute> candidateHostRoutes;
+    std::vector<SystemRoute> existingAggregatedRoutes;
+
+    for (const auto& route : systemRoutes) {
+        if (route.prefixLength == 32) {
+            // This is a host route - potential candidate
+            HostRoute hr;
+            hr.ip = route.ipString;
+            hr.ipNum = route.address;
+
+            // Try to find process name from our internal state
+            std::string routeKey = route.ipString + "/32";
+            auto it = routes.find(routeKey);
+            if (it != routes.end()) {
+                hr.processName = it->second->processName;
+            }
+            else {
+                hr.processName = "Unknown";
+            }
+
+            candidateHostRoutes.push_back(hr);
+        }
+        else {
+            // This is an aggregated route
+            existingAggregatedRoutes.push_back(route);
+        }
+    }
+
+    Logger::Instance().Info("Separated routes: " + std::to_string(candidateHostRoutes.size()) +
+        " host routes, " + std::to_string(existingAggregatedRoutes.size()) +
+        " aggregated routes");
+
+    // Step 3: Filter out host routes that are already covered by existing aggregated routes
+    std::vector<HostRoute> uncoveredHostRoutes;
+    int coveredCount = 0;
+
+    for (const auto& hostRoute : candidateHostRoutes) {
+        bool isCovered = false;
+
+        for (const auto& aggRoute : existingAggregatedRoutes) {
+            // Check if this host is covered by the aggregated route
+            uint32_t hostAddr = hostRoute.ipNum;
+            uint32_t aggAddr = aggRoute.address;
+            uint32_t mask = aggRoute.mask;
+
+            if ((hostAddr & mask) == (aggAddr & mask)) {
+                isCovered = true;
+                Logger::Instance().Debug("Host " + hostRoute.ip + " is covered by " +
+                    aggRoute.ipString + "/" + std::to_string(aggRoute.prefixLength));
+                break;
+            }
+        }
+
+        if (!isCovered) {
+            uncoveredHostRoutes.push_back(hostRoute);
+        }
+        else {
+            coveredCount++;
+        }
+    }
+
+    Logger::Instance().Info("Filtered host routes: " + std::to_string(coveredCount) +
+        " already covered (redundant), " +
+        std::to_string(uncoveredHostRoutes.size()) + " uncovered (need optimization)");
+
+    // Step 4: Run optimization only on uncovered host routes
+    auto plan = optimizer->OptimizeRoutes(uncoveredHostRoutes);
+
+    // Step 5: Log results
     if (plan.routesBefore > 0) {
         Logger::Instance().Info("Optimization Results:");
         Logger::Instance().Info("  Routes before: " + std::to_string(plan.routesBefore));
         Logger::Instance().Info("  Routes after: " + std::to_string(plan.routesAfter));
         Logger::Instance().Info("  Compression: " + std::to_string(plan.compressionRatio * 100) + "%");
         Logger::Instance().Info("  Savings: " + std::to_string(plan.routesBefore - plan.routesAfter) + " routes");
+        Logger::Instance().Info("  Plus " + std::to_string(coveredCount) + " redundant routes can be removed");
     }
     else {
-        Logger::Instance().Info("No routes to optimize");
-        return;
+        Logger::Instance().Info("No uncovered routes to optimize");
     }
 
-    // Step 4: Apply changes if any
-    if (!plan.changes.empty()) {
-        ApplyOptimizationPlan(plan);
+    // Step 6: Apply optimization plan
+    if (!plan.changes.empty() || coveredCount > 0) {
+        // First, remove redundant covered routes
+        if (coveredCount > 0) {
+            RemoveRedundantSystemRoutes(candidateHostRoutes, existingAggregatedRoutes);
+        }
+
+        // Then apply optimization plan
+        if (!plan.changes.empty()) {
+            ApplyOptimizationPlan(plan);
+        }
     }
 
     Logger::Instance().Info("=== Route Optimization Completed ===");
+}
+
+// Новый метод для удаления избыточных системных маршрутов
+void RouteController::RemoveRedundantSystemRoutes(
+    const std::vector<HostRoute>& allHostRoutes,
+    const std::vector<SystemRoute>& aggregatedRoutes) {
+
+    Logger::Instance().Info("Removing redundant system routes");
+
+    int removedCount = 0;
+    int failedCount = 0;
+
+    for (const auto& hostRoute : allHostRoutes) {
+        // Check if covered
+        bool isCovered = false;
+
+        for (const auto& aggRoute : aggregatedRoutes) {
+            if ((hostRoute.ipNum & aggRoute.mask) == (aggRoute.address & aggRoute.mask)) {
+                isCovered = true;
+                break;
+            }
+        }
+
+        if (isCovered) {
+            // Remove this redundant route
+            if (RemoveSystemRouteWithMask(hostRoute.ip, 32, config.gatewayIp)) {
+                removedCount++;
+
+                // Also remove from internal state
+                std::lock_guard<std::mutex> lock(routesMutex);
+                std::string routeKey = hostRoute.ip + "/32";
+                routes.erase(routeKey);
+                routesDirty = true;
+            }
+            else {
+                failedCount++;
+            }
+        }
+    }
+
+    Logger::Instance().Info("Removed " + std::to_string(removedCount) +
+        " redundant routes, " + std::to_string(failedCount) + " failed");
+
+    if (removedCount > 0) {
+        NotifyUIRouteCountChanged();
+    }
+}
+
+// Новый метод для синхронизации с системной таблицей при запуске
+void RouteController::SyncWithSystemTable() {
+    Logger::Instance().Info("Syncing with system routing table");
+
+    // Получаем все маршруты из системы для нашего gateway
+    auto systemRoutes = GetSystemRoutesForGateway();
+
+    // Создаем набор ключей системных маршрутов
+    std::unordered_set<std::string> systemRouteKeys;
+    for (const auto& route : systemRoutes) {
+        std::string key = route.ipString + "/" + std::to_string(route.prefixLength);
+        systemRouteKeys.insert(key);
+    }
+
+    // Проверяем наши сохраненные маршруты
+    std::vector<std::string> toRemove;
+    {
+        std::lock_guard<std::mutex> lock(routesMutex);
+
+        for (const auto& [routeKey, route] : routes) {
+            // Если маршрут есть у нас, но нет в системе
+            if (systemRouteKeys.find(routeKey) == systemRouteKeys.end()) {
+                Logger::Instance().Warning("Route " + routeKey +
+                    " exists in state but not in system, marking for removal");
+                toRemove.push_back(routeKey);
+            }
+        }
+
+        // Удаляем несуществующие маршруты из нашего состояния
+        for (const auto& key : toRemove) {
+            routes.erase(key);
+        }
+    }
+
+    // Добавляем системные маршруты, которых нет в нашем состоянии
+    int addedCount = 0;
+    for (const auto& sysRoute : systemRoutes) {
+        std::string key = sysRoute.ipString + "/" + std::to_string(sysRoute.prefixLength);
+
+        std::lock_guard<std::mutex> lock(routesMutex);
+        if (routes.find(key) == routes.end()) {
+            // Этот маршрут есть в системе, но нет у нас
+            auto route = std::make_unique<RouteInfo>();
+            route->ip = sysRoute.ipString;
+            route->prefixLength = sysRoute.prefixLength;
+            route->refCount = 1;
+            route->processName = "System";  // Неизвестный источник
+            route->createdAt = std::chrono::system_clock::now();
+
+            routes[key] = std::move(route);
+            addedCount++;
+        }
+    }
+
+    Logger::Instance().Info("Sync completed: removed " + std::to_string(toRemove.size()) +
+        " orphaned routes, added " + std::to_string(addedCount) + " system routes");
+
+    if (!toRemove.empty() || addedCount > 0) {
+        routesDirty = true;
+    }
+}
+
+// Новый метод для выполнения полной очистки
+void RouteController::PerformFullCleanup() {
+    Logger::Instance().Info("Starting smart route cleanup");
+
+    // Сначала синхронизируемся с системой
+    SyncWithSystemTable();
+
+    // Затем запускаем оптимизацию
+    RunOptimization();
+
+    // Обновляем статистику
+    SaveRoutesToDisk();
+
+    Logger::Instance().Info("Smart cleanup completed");
+}
+
+// Новый метод для очистки только избыточных маршрутов
+void RouteController::CleanupRedundantRoutes() {
+    Logger::Instance().Info("CleanupRedundantRoutes - Starting cleanup of redundant routes only");
+
+    auto systemRoutes = GetSystemRoutesForGateway();
+
+    std::vector<HostRoute> hostRoutes;
+    std::vector<SystemRoute> aggregatedRoutes;
+
+    // Разделяем маршруты
+    for (const auto& route : systemRoutes) {
+        if (route.prefixLength == 32) {
+            HostRoute hr;
+            hr.ip = route.ipString;
+            hr.ipNum = route.address;
+            hr.processName = "System";
+            hostRoutes.push_back(hr);
+        }
+        else {
+            aggregatedRoutes.push_back(route);
+        }
+    }
+
+    // Удаляем только покрытые маршруты
+    RemoveRedundantSystemRoutes(hostRoutes, aggregatedRoutes);
+
+    Logger::Instance().Info("CleanupRedundantRoutes - Completed");
 }
 
 void RouteController::ApplyOptimizationPlan(const OptimizationPlan& plan) {

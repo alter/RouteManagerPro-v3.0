@@ -14,6 +14,14 @@
 #include "../common/Models.h"
 #include "RouteOptimizer.h"
 
+// Структура для представления системного маршрута
+struct SystemRoute {
+    uint32_t address;
+    uint32_t mask;
+    int prefixLength;
+    std::string ipString;
+};
+
 class RouteController {
 public:
     RouteController(const ServiceConfig& config);
@@ -31,6 +39,11 @@ public:
     ServiceConfig GetConfig() const { return config; }
     void UpdateConfig(const ServiceConfig& newConfig);
     void RunOptimizationManual();
+
+    // Новые методы для улучшенной оптимизации
+    void SyncWithSystemTable();
+    void PerformFullCleanup();
+    void CleanupRedundantRoutes();
 
 private:
     ServiceConfig config;
@@ -85,6 +98,13 @@ private:
     uint32_t IPToUInt(const std::string& ip);
     uint32_t CreateMask(int prefixLength);
     void NotifyUIRouteCountChanged();
+
+    // Новые вспомогательные методы
+    std::vector<SystemRoute> GetSystemRoutesForGateway();
+    std::vector<SystemRoute> GetSystemRoutesOldAPI();
+    void RemoveRedundantSystemRoutes(const std::vector<HostRoute>& hostRoutes,
+        const std::vector<SystemRoute>& aggregatedRoutes);
+    int CountBits(uint32_t mask);
 
     // Preload
     struct PreloadService {

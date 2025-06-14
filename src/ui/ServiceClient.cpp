@@ -263,3 +263,12 @@ void ServiceClient::OptimizeRoutes() {
 
     SendMessage(msg);
 }
+
+void ServiceClient::CleanupRedundantRoutes() {
+    if (!connected) return;
+
+    IPCMessage msg;
+    msg.type = IPCMessageType::CleanupRedundantRoutes;
+
+    SendMessage(msg);
+}

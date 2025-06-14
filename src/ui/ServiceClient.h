@@ -29,6 +29,7 @@ public:
     void RestartService();
     void SetAIPreload(bool enabled);
     void OptimizeRoutes();
+    void CleanupRedundantRoutes();
 
 private:
     HANDLE pipe;

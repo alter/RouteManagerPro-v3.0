@@ -36,33 +36,58 @@ void ServiceMain::StartDirect() {
     }
 
     try {
-        Logger::Instance().Debug("ServiceMain::StartDirect - Creating ConfigManager");
+        Logger::Instance().Info("=== Service initialization started ===");
+
+        // Step 1: Create ConfigManager
+        Logger::Instance().Debug("Step 1: Creating ConfigManager");
         configManager = std::make_unique<ConfigManager>();
         auto config = configManager->GetConfig();
 
-        Logger::Instance().Debug("ServiceMain::StartDirect - Creating RouteController");
+        // Step 2: Create RouteController
+        Logger::Instance().Debug("Step 2: Creating RouteController");
         routeController = std::make_unique<RouteController>(config);
 
-        Logger::Instance().Debug("ServiceMain::StartDirect - Creating ProcessManager");
+        // Step 3: Load saved routes from disk
+        // This is already done in RouteController constructor
+        Logger::Instance().Debug("Step 3: Routes loaded from disk in constructor");
+
+        // Step 4: Sync with system routing table
+        Logger::Instance().Info("Step 4: Syncing with system routing table");
+        routeController->SyncWithSystemTable();
+
+        // Step 5: Perform smart cleanup (safe operation)
+        Logger::Instance().Info("Step 5: Performing smart cleanup of redundant routes");
+        routeController->PerformFullCleanup();
+
+        // Note: PerformFullCleanup already saves state internally after cleanup
+
+        // Step 6: Create ProcessManager
+        Logger::Instance().Debug("Step 6: Creating ProcessManager");
         processManager = std::make_unique<ProcessManager>(config);
 
-        Logger::Instance().Debug("ServiceMain::StartDirect - Creating NetworkMonitor");
+        // Step 7: Create NetworkMonitor
+        Logger::Instance().Debug("Step 7: Creating NetworkMonitor");
         networkMonitor = std::make_unique<NetworkMonitor>(
             routeController.get(), processManager.get());
 
-        Logger::Instance().Debug("ServiceMain::StartDirect - Creating Watchdog");
+        // Step 8: Create Watchdog
+        Logger::Instance().Debug("Step 8: Creating Watchdog");
         watchdog = std::make_unique<Watchdog>(this);
 
-        Logger::Instance().Debug("ServiceMain::StartDirect - Starting NetworkMonitor");
+        // Step 9: Start NetworkMonitor
+        Logger::Instance().Debug("Step 9: Starting NetworkMonitor");
         networkMonitor->Start();
 
-        Logger::Instance().Debug("ServiceMain::StartDirect - Starting Watchdog");
+        // Step 10: Start Watchdog
+        Logger::Instance().Debug("Step 10: Starting Watchdog");
         watchdog->Start();
 
-        Logger::Instance().Debug("ServiceMain::StartDirect - Creating pipe server thread");
+        // Step 11: Create pipe server thread for UI communication
+        Logger::Instance().Debug("Step 11: Creating pipe server thread");
         pipeThread = CreateThread(nullptr, 0, PipeServerThread, this, 0, nullptr);
 
         running = true;
+        Logger::Instance().Info("=== Service initialization completed ===");
         Logger::Instance().Info("ServiceMain::StartDirect - Service logic is running");
 
         WaitForSingleObject(stopEvent, INFINITE);
@@ -349,6 +374,13 @@ void ServiceMain::HandlePipeClient(HANDLE pipe) {
             case IPCMessageType::OptimizeRoutes: {
                 if (routeController) {
                     routeController->RunOptimizationManual();
+                }
+                break;
+            }
+
+            case IPCMessageType::CleanupRedundantRoutes: {
+                if (routeController) {
+                    routeController->CleanupRedundantRoutes();
                 }
                 break;
             }
