@@ -3,6 +3,7 @@
 #include "../common/Utils.h"
 #include "../common/Logger.h"
 #include "../common/ShutdownCoordinator.h"
+#include "PerformanceMonitor.h"
 #include <windows.h>
 #include <tlhelp32.h>
 #include <psapi.h>
@@ -11,7 +12,9 @@
 #include <ranges>
 
 ProcessManager::ProcessManager(const ServiceConfig& config, const PerformanceConfig& perfCfg)
-    : running(true), perfConfig(perfCfg), m_pidMissCache(perfCfg.missCacheMaxSize) {
+    : running(true), perfConfig(perfCfg), m_pidMissCache(perfCfg.missCacheMaxSize),
+    m_wstringToStringCache(perfCfg.stringCacheMaxSize),
+    m_stringToWstringCache(perfCfg.stringCacheMaxSize) {
 
     Logger::Instance().Debug("ProcessManager::ProcessManager - Constructor called");
 
@@ -44,6 +47,8 @@ ProcessManager::~ProcessManager() {
 }
 
 bool ProcessManager::IsSelectedProcessByPid(DWORD pid) {
+    PERF_TIMER("ProcessManager::IsSelectedProcessByPid");
+
     auto cachedInfo = GetCachedInfo(pid);
     if (cachedInfo.has_value()) {
         stats.hits.fetch_add(1);
@@ -174,6 +179,8 @@ void ProcessManager::UpdateThreadFunc() {
         }
 
         try {
+            PERF_TIMER("ProcessManager::UpdateSnapshot");
+
             auto newCache = BuildProcessSnapshot();
 
             MergeMissCacheIntoMain(newCache);
@@ -187,11 +194,11 @@ void ProcessManager::UpdateThreadFunc() {
                 for (const auto& [pid, info] : m_pidCache) {
                     ProcessInfo procInfo;
                     procInfo.name = info.name;
-                    procInfo.executablePath = Utils::StringToWString(info.processPath);
+                    procInfo.executablePath = CachedStringToWString(info.processPath);
                     procInfo.pid = pid;
                     procInfo.isSelected = info.isSelected;
-                    procInfo.isGame = Utils::IsGameProcess(Utils::WStringToString(info.name));
-                    procInfo.isDiscord = Utils::IsDiscordProcess(Utils::WStringToString(info.name));
+                    procInfo.isGame = Utils::IsGameProcess(CachedWStringToString(info.name));
+                    procInfo.isDiscord = Utils::IsDiscordProcess(CachedWStringToString(info.name));
                     allProcesses.push_back(procInfo);
                 }
             }
@@ -207,6 +214,8 @@ void ProcessManager::UpdateThreadFunc() {
 }
 
 std::unordered_map<DWORD, CachedProcessInfo> ProcessManager::BuildProcessSnapshot() {
+    PERF_TIMER("ProcessManager::BuildProcessSnapshot");
+
     std::unordered_map<DWORD, CachedProcessInfo> newCache;
     std::unordered_set<DWORD> alivePids;
 
@@ -239,6 +248,8 @@ std::unordered_map<DWORD, CachedProcessInfo> ProcessManager::BuildProcessSnapsho
 }
 
 std::optional<CachedProcessInfo> ProcessManager::GetCompleteProcessInfo(DWORD pid) {
+    PERF_TIMER("ProcessManager::GetCompleteProcessInfo");
+
     UniqueHandle process(OpenProcess(PROCESS_QUERY_INFORMATION |
         PROCESS_QUERY_LIMITED_INFORMATION,
         FALSE, pid), HandleDeleter{});
@@ -258,9 +269,9 @@ std::optional<CachedProcessInfo> ProcessManager::GetCompleteProcessInfo(DWORD pi
     }
 
     info.creationTime = creationTime;
-    info.processPath = Utils::WStringToString(path);
-    info.name = Utils::StringToWString(Utils::GetProcessNameFromPath(info.processPath));
-    info.isSelected = IsProcessSelectedInternal(Utils::WStringToString(info.name));
+    info.processPath = CachedWStringToString(path);
+    info.name = CachedStringToWString(Utils::GetProcessNameFromPath(info.processPath));
+    info.isSelected = IsProcessSelectedInternal(CachedWStringToString(info.name));
     info.lastVerified = std::chrono::steady_clock::now();
 
     return info;
@@ -287,14 +298,22 @@ void ProcessManager::LogPerformanceStats() const {
     auto misses = stats.misses.load();
     auto verifications = stats.verificationChecks.load();
     auto newChecks = stats.newProcessChecks.load();
+    auto stringHits = stats.stringCacheHits.load();
+    auto stringMisses = stats.stringCacheMisses.load();
 
     if (hits + misses == 0) return;
 
     double hitRate = hits / static_cast<double>(hits + misses) * 100;
+    double stringHitRate = stringHits / static_cast<double>(stringHits + stringMisses + 1) * 100;
 
     Logger::Instance().Info(std::format(
         "ProcessManager Cache: {} hits, {} misses ({:.1f}% hit rate), {} verifications, {} new process checks",
         hits, misses, hitRate, verifications, newChecks
+    ));
+
+    Logger::Instance().Info(std::format(
+        "String Cache: {} hits, {} misses ({:.1f}% hit rate)",
+        stringHits, stringMisses, stringHitRate
     ));
 }
 
@@ -345,4 +364,46 @@ void ProcessManager::CleanupStalePids(std::unordered_map<DWORD, CachedProcessInf
         }
         return shouldErase;
         });
+}
+
+std::string ProcessManager::CachedWStringToString(const std::wstring& wstr) {
+    PERF_TIMER("ProcessManager::StringConversion");
+
+    // Check cache first
+    auto cached = m_wstringToStringCache.get(wstr);
+    if (cached.has_value()) {
+        stats.stringCacheHits.fetch_add(1);
+        return *cached;
+    }
+
+    stats.stringCacheMisses.fetch_add(1);
+
+    // Convert
+    std::string result = Utils::WStringToString(wstr);
+
+    // Cache the result
+    m_wstringToStringCache.put(wstr, result);
+
+    return result;
+}
+
+std::wstring ProcessManager::CachedStringToWString(const std::string& str) {
+    PERF_TIMER("ProcessManager::StringConversion");
+
+    // Check cache first
+    auto cached = m_stringToWstringCache.get(str);
+    if (cached.has_value()) {
+        stats.stringCacheHits.fetch_add(1);
+        return *cached;
+    }
+
+    stats.stringCacheMisses.fetch_add(1);
+
+    // Convert
+    std::wstring result = Utils::StringToWString(str);
+
+    // Cache the result
+    m_stringToWstringCache.put(str, result);
+
+    return result;
 }

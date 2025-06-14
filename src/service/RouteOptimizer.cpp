@@ -1,6 +1,7 @@
 // src/service/RouteOptimizer.cpp
 #include "RouteOptimizer.h"
 #include "../common/Logger.h"
+#include "../service/PerformanceMonitor.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <algorithm>
@@ -9,15 +10,31 @@
 #include <set>
 
 RouteOptimizer::RouteOptimizer(const OptimizerConfig& cfg) : config(cfg) {
-    Logger::Instance().Info("RouteOptimizer initialized");
+    Logger::Instance().Info("RouteOptimizer initialized with caching support");
 }
 
 void RouteOptimizer::UpdateConfig(const OptimizerConfig& newConfig) {
     std::lock_guard<std::mutex> lock(configMutex);
     config = newConfig;
+
+    // Clear cache on config change as results may differ
+    std::lock_guard<std::mutex> cacheLock(cacheMutex);
+    optimizationCache.clear();
 }
 
 OptimizationPlan RouteOptimizer::OptimizeRoutes(const std::vector<HostRoute>& hostRoutes) {
+    PERF_TIMER("RouteOptimizer::OptimizeRoutes");
+    auto startTime = std::chrono::high_resolution_clock::now();
+
+    // Check cache first
+    auto cachedPlan = GetCachedPlan(hostRoutes);
+    if (cachedPlan.has_value()) {
+        PERF_COUNT("RouteOptimizer.CacheHit");
+        Logger::Instance().Debug("RouteOptimizer: Using cached optimization plan");
+        return *cachedPlan;
+    }
+
+    PERF_COUNT("RouteOptimizer.CacheMiss");
     OptimizationPlan plan;
 
     // Filter out private IPs
@@ -66,14 +83,116 @@ OptimizationPlan RouteOptimizer::OptimizeRoutes(const std::vector<HostRoute>& ho
         plan.compressionRatio = 1.0f - (static_cast<float>(plan.routesAfter) / plan.routesBefore);
     }
 
+    // Update stats
+    auto endTime = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+
+    {
+        std::lock_guard<std::mutex> lock(statsMutex);
+        stats.totalOptimizations++;
+        stats.totalRoutesProcessed += publicRoutes.size();
+        stats.totalRoutesAggregated += removedRoutes;
+        stats.totalProcessingTime += duration;
+        stats.lastOptimization = std::chrono::system_clock::now();
+    }
+
+    // Cache the result
+    CachePlan(hostRoutes, plan);
+
     // Log optimization details
     Logger::Instance().Info("RouteOptimizer: Analyzed " + std::to_string(publicRoutes.size()) +
-        " routes, found " + std::to_string(plan.changes.size()) + " changes");
+        " routes, found " + std::to_string(plan.changes.size()) + " changes in " +
+        std::to_string(duration.count()) + "ms");
 
     return plan;
 }
 
+RouteOptimizer::Stats RouteOptimizer::GetStats() const {
+    std::lock_guard<std::mutex> lock(statsMutex);
+    return stats;
+}
+
+void RouteOptimizer::ResetStats() {
+    std::lock_guard<std::mutex> lock(statsMutex);
+    stats = Stats();
+}
+
+size_t RouteOptimizer::ComputeRouteHash(const std::vector<HostRoute>& routes) const {
+    // Create a hash based on sorted routes
+    std::vector<HostRoute> sorted = routes;
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+        return a.ipNum < b.ipNum || (a.ipNum == b.ipNum && a.prefixLength < b.prefixLength);
+        });
+
+    std::hash<std::string> hasher;
+    size_t hash = 0;
+
+    for (const auto& route : sorted) {
+        hash ^= hasher(route.ip) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= std::hash<int>{}(route.prefixLength) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    }
+
+    return hash;
+}
+
+void RouteOptimizer::CleanupExpiredCache() {
+    auto now = std::chrono::system_clock::now();
+
+    for (auto it = optimizationCache.begin(); it != optimizationCache.end();) {
+        if (now - it->second.timestamp > CACHE_EXPIRY) {
+            it = optimizationCache.erase(it);
+        }
+        else {
+            ++it;
+        }
+    }
+}
+
+std::optional<OptimizationPlan> RouteOptimizer::GetCachedPlan(const std::vector<HostRoute>& routes) {
+    std::lock_guard<std::mutex> lock(cacheMutex);
+
+    CleanupExpiredCache();
+
+    size_t hash = ComputeRouteHash(routes);
+    auto it = optimizationCache.find(hash);
+
+    if (it != optimizationCache.end()) {
+        // Verify the cached entry matches exactly
+        if (it->second.inputRoutes.size() == routes.size()) {
+            return it->second.plan;
+        }
+    }
+
+    return std::nullopt;
+}
+
+void RouteOptimizer::CachePlan(const std::vector<HostRoute>& routes, const OptimizationPlan& plan) {
+    std::lock_guard<std::mutex> lock(cacheMutex);
+
+    // Limit cache size
+    if (optimizationCache.size() >= MAX_CACHE_SIZE) {
+        // Remove oldest entry
+        auto oldest = optimizationCache.begin();
+        for (auto it = optimizationCache.begin(); it != optimizationCache.end(); ++it) {
+            if (it->second.timestamp < oldest->second.timestamp) {
+                oldest = it;
+            }
+        }
+        optimizationCache.erase(oldest);
+    }
+
+    size_t hash = ComputeRouteHash(routes);
+    CachedOptimization cached;
+    cached.inputRoutes = routes;
+    cached.plan = plan;
+    cached.timestamp = std::chrono::system_clock::now();
+
+    optimizationCache[hash] = std::move(cached);
+}
+
 void RouteOptimizer::BuildEnhancedTrie(std::unique_ptr<TrieNode>& root, const std::vector<HostRoute>& routes) {
+    PERF_TIMER("RouteOptimizer::BuildEnhancedTrie");
+
     for (const auto& route : routes) {
         TrieNode* current = root.get();
         uint32_t ip = route.ipNum;
@@ -138,6 +257,7 @@ int RouteOptimizer::AggregateEnhancedTrie(TrieNode* node, int depth) {
 
                 if (existingRouteCount > 1) {  // Only aggregate if we have more than 1 route
                     node->isAggregated = true;
+                    PERF_COUNT("RouteOptimizer.Aggregation");
                     Logger::Instance().Debug("Aggregating at depth " + std::to_string(depth) +
                         " with " + std::to_string(totalCount) + " routes (was " +
                         std::to_string(existingRouteCount) + " routes)");

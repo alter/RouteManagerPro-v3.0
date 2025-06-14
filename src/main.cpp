@@ -13,6 +13,7 @@
 #include "common/Logger.h"
 #include "common/Utils.h"
 #include "common/ShutdownCoordinator.h"
+#include "service/PerformanceMonitor.h"
 
 // Global service instance
 ServiceMain* g_pServiceMain = nullptr;
@@ -37,13 +38,47 @@ void RunServiceLogic() {
     Logger::Instance().Info("RunServiceLogic - Service logic thread has finished.");
 }
 
+void LogPerformanceReport() {
+    auto report = PerformanceMonitor::Instance().GetReport();
+
+    Logger::Instance().Info("=== Application Performance Report ===");
+
+    // Log counters
+    for (const auto& [name, count] : report.counters) {
+        Logger::Instance().Info(std::format("Counter {}: {}", name, count));
+    }
+
+    // Log operation timings
+    for (const auto& op : report.operations) {
+        if (op.count > 0) {
+            Logger::Instance().Info(std::format(
+                "Operation {}: {} calls, avg: {}us, min: {}us, max: {}us, p95: {}us",
+                op.name, op.count,
+                op.avgTime.count(),
+                op.minTime.count(),
+                op.maxTime.count(),
+                op.p95Time.count()
+            ));
+        }
+    }
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    // Configure logger
+    Logger::LogConfig logConfig;
+    logConfig.maxFileSize = 10 * 1024 * 1024;  // 10MB
+    logConfig.maxFiles = 5;
+    logConfig.asyncLogging = true;
+    logConfig.bufferSize = 1000;
+
 #ifdef NDEBUG
     Logger::Instance().SetLogLevel(Logger::LogLevel::LEVEL_INFO);
 #else
     Logger::Instance().SetLogLevel(Logger::LogLevel::LEVEL_DEBUG);
 #endif
-    Logger::Instance().Info("WinMain - Application started.");
+
+    Logger::Instance().SetConfig(logConfig);
+    Logger::Instance().Info("WinMain - Application started with enhanced logging.");
 
     // The application requires administrator privileges to manage network routes.
     if (!Utils::IsRunAsAdmin()) {
@@ -130,9 +165,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         CloseHandle(mutex);
     }
 
+    // Log final performance report
+    LogPerformanceReport();
+
     Logger::Instance().Info("WinMain - Application shutting down cleanly.");
 
     // Force flush logs
+    Logger::Instance().Flush();
     Logger::Instance().Info("=== END OF LOG ===");
 
     return result;

@@ -8,6 +8,10 @@
 #include <filesystem>
 #include <ctime>
 #include <format>
+#include <deque>
+#include <thread>
+#include <condition_variable>
+#include <atomic>
 
 #ifdef __cpp_lib_stacktrace
 #include <stacktrace>
@@ -22,6 +26,14 @@ public:
         LEVEL_ERROR = 3
     };
 
+    struct LogConfig {
+        size_t maxFileSize = 10 * 1024 * 1024;  // 10MB
+        size_t maxFiles = 5;
+        bool asyncLogging = true;
+        size_t bufferSize = 1000;
+        std::chrono::milliseconds flushInterval{ 1000 };
+    };
+
     static Logger& Instance() {
         static Logger instance;
         return instance;
@@ -29,6 +41,18 @@ public:
 
     void SetLogLevel(LogLevel level) {
         currentLogLevel = level;
+    }
+
+    void SetConfig(const LogConfig& cfg) {
+        std::lock_guard<std::mutex> lock(configMutex);
+        config = cfg;
+
+        if (config.asyncLogging && !asyncThread.joinable()) {
+            StartAsyncLogging();
+        }
+        else if (!config.asyncLogging && asyncThread.joinable()) {
+            StopAsyncLogging();
+        }
     }
 
     void Log(const std::string& message) {
@@ -40,22 +64,20 @@ public:
             return;
         }
 
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!logFile_.is_open()) {
-            std::filesystem::create_directories("logs");
-            logFile_.open("logs/route_manager.log", std::ios::app);
-        }
-
         auto now = std::chrono::system_clock::now();
-        auto time_t = std::chrono::system_clock::to_time_t(now);
+        LogEntry entry{ now, level, message };
 
-        char timeStr[100];
-        struct tm timeinfo;
-        localtime_s(&timeinfo, &time_t);
-        strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
-
-        logFile_ << "[" << timeStr << "] " << message << std::endl;
-        logFile_.flush();
+        if (config.asyncLogging) {
+            std::lock_guard<std::mutex> lock(bufferMutex);
+            if (buffer.size() >= config.bufferSize) {
+                buffer.pop_front();
+            }
+            buffer.push_back(entry);
+            bufferCV.notify_one();
+        }
+        else {
+            WriteEntry(entry);
+        }
     }
 
     void Error(const std::string& message) {
@@ -74,6 +96,20 @@ public:
         Log("WARNING: " + message, LogLevel::LEVEL_WARNING);
     }
 
+    void Flush() {
+        if (config.asyncLogging) {
+            std::unique_lock<std::mutex> lock(bufferMutex);
+            while (!buffer.empty()) {
+                bufferCV.wait(lock);
+            }
+        }
+
+        std::lock_guard<std::mutex> lock(fileMutex);
+        if (logFile_.is_open()) {
+            logFile_.flush();
+        }
+    }
+
 #ifdef __cpp_lib_stacktrace
     void LogWithStackTrace(const std::string& message, LogLevel level) {
         Log(message, level);
@@ -86,6 +122,16 @@ public:
     }
 #endif
 
+    ~Logger() {
+        if (config.asyncLogging) {
+            StopAsyncLogging();
+        }
+
+        if (logFile_.is_open()) {
+            logFile_.close();
+        }
+    }
+
 private:
     Logger() {
 #ifdef _DEBUG
@@ -93,12 +139,107 @@ private:
 #else
         currentLogLevel = LogLevel::LEVEL_INFO;
 #endif
+        if (config.asyncLogging) {
+            StartAsyncLogging();
+        }
     }
 
-    ~Logger() {
-        if (logFile_.is_open()) {
-            logFile_.close();
+    struct LogEntry {
+        std::chrono::system_clock::time_point timestamp;
+        LogLevel level;
+        std::string message;
+    };
+
+    void StartAsyncLogging() {
+        asyncRunning = true;
+        asyncThread = std::thread(&Logger::AsyncLogThread, this);
+    }
+
+    void StopAsyncLogging() {
+        {
+            std::lock_guard<std::mutex> lock(bufferMutex);
+            asyncRunning = false;
+            bufferCV.notify_all();
         }
+
+        if (asyncThread.joinable()) {
+            asyncThread.join();
+        }
+    }
+
+    void AsyncLogThread() {
+        while (asyncRunning) {
+            std::unique_lock<std::mutex> lock(bufferMutex);
+
+            bufferCV.wait_for(lock, config.flushInterval, [this] {
+                return !buffer.empty() || !asyncRunning;
+                });
+
+            if (!buffer.empty()) {
+                std::deque<LogEntry> localBuffer;
+                localBuffer.swap(buffer);
+                lock.unlock();
+
+                for (const auto& entry : localBuffer) {
+                    WriteEntry(entry);
+                }
+            }
+        }
+
+        // Flush remaining entries
+        for (const auto& entry : buffer) {
+            WriteEntry(entry);
+        }
+    }
+
+    void WriteEntry(const LogEntry& entry) {
+        std::lock_guard<std::mutex> lock(fileMutex);
+
+        CheckRotation();
+
+        if (!logFile_.is_open()) {
+            OpenLogFile();
+        }
+
+        auto time_t = std::chrono::system_clock::to_time_t(entry.timestamp);
+        char timeStr[100];
+        struct tm timeinfo;
+        localtime_s(&timeinfo, &time_t);
+        strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
+
+        logFile_ << "[" << timeStr << "] "
+            << GetLevelString(entry.level) << " "
+            << entry.message << std::endl;
+    }
+
+    void OpenLogFile() {
+        std::filesystem::create_directories("logs");
+        currentLogPath = "logs/route_manager.log";
+        logFile_.open(currentLogPath, std::ios::app);
+        currentFileSize = std::filesystem::exists(currentLogPath) ?
+            std::filesystem::file_size(currentLogPath) : 0;
+    }
+
+    void CheckRotation() {
+        if (!logFile_.is_open() || currentFileSize < config.maxFileSize) {
+            return;
+        }
+
+        logFile_.close();
+
+        // Rotate files
+        for (size_t i = config.maxFiles - 1; i > 0; --i) {
+            auto oldPath = std::format("logs/route_manager.{}.log", i - 1);
+            auto newPath = std::format("logs/route_manager.{}.log", i);
+
+            if (std::filesystem::exists(oldPath)) {
+                std::filesystem::rename(oldPath, newPath);
+            }
+        }
+
+        std::filesystem::rename(currentLogPath, "logs/route_manager.0.log");
+
+        OpenLogFile();
     }
 
     std::string GetLevelString(LogLevel level) {
@@ -111,7 +252,23 @@ private:
         }
     }
 
+    // Configuration
+    LogConfig config;
+    std::mutex configMutex;
+
+    // File handling
     std::ofstream logFile_;
-    std::mutex mutex_;
+    std::string currentLogPath;
+    size_t currentFileSize = 0;
+    std::mutex fileMutex;
+
+    // Log level
     LogLevel currentLogLevel;
+
+    // Async logging
+    std::deque<LogEntry> buffer;
+    std::mutex bufferMutex;
+    std::condition_variable bufferCV;
+    std::thread asyncThread;
+    std::atomic<bool> asyncRunning{ false };
 };

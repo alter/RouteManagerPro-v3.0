@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <memory>
 #include <mutex>
+#include <chrono>
 #include "../common/Models.h"
 
 struct OptimizerConfig {
@@ -34,7 +35,7 @@ struct HostRoute {
     std::string ip;
     uint32_t ipNum;
     std::string processName;
-    int prefixLength = 32;  // Added to support non-/32 routes
+    int prefixLength = 32;
 };
 
 class RouteOptimizer {
@@ -42,31 +43,55 @@ public:
     RouteOptimizer(const OptimizerConfig& config);
     ~RouteOptimizer() = default;
 
-    // Pure function that takes routes and returns optimization plan
     OptimizationPlan OptimizeRoutes(const std::vector<HostRoute>& hostRoutes);
-
     void UpdateConfig(const OptimizerConfig& newConfig);
+
+    // Performance stats
+    struct Stats {
+        uint64_t totalOptimizations = 0;
+        uint64_t totalRoutesProcessed = 0;
+        uint64_t totalRoutesAggregated = 0;
+        std::chrono::milliseconds totalProcessingTime{ 0 };
+        std::chrono::system_clock::time_point lastOptimization;
+    };
+
+    Stats GetStats() const;
+    void ResetStats();
 
 private:
     struct TrieNode {
         std::unique_ptr<TrieNode> children[2];
-        bool isRoute = false;          // Marks if this node represents an actual route
-        bool isAggregated = false;     // Marks if this subtree should be aggregated
+        bool isRoute = false;
+        bool isAggregated = false;
         std::string processName;
-        int prefixLength = 32;         // The prefix length of the route at this node
-        int routeCount = 0;            // Number of routes at exactly this node
+        int prefixLength = 32;
+        int routeCount = 0;
+    };
+
+    struct CachedOptimization {
+        std::vector<HostRoute> inputRoutes;
+        OptimizationPlan plan;
+        std::chrono::system_clock::time_point timestamp;
     };
 
     OptimizerConfig config;
     mutable std::mutex configMutex;
 
-    // Enhanced methods that handle routes with different prefix lengths
+    // Performance tracking
+    mutable Stats stats;
+    mutable std::mutex statsMutex;
+
+    // Cache for recent optimizations
+    std::unordered_map<size_t, CachedOptimization> optimizationCache;
+    mutable std::mutex cacheMutex;
+    static constexpr size_t MAX_CACHE_SIZE = 10;
+    static constexpr auto CACHE_EXPIRY = std::chrono::minutes(5);
+
     void BuildEnhancedTrie(std::unique_ptr<TrieNode>& root, const std::vector<HostRoute>& routes);
     int AggregateEnhancedTrie(TrieNode* node, int depth);
     void GenerateEnhancedPlan(TrieNode* node, uint32_t currentSubnet, int depth,
         OptimizationPlan& plan, std::unordered_map<std::string, RouteInfo>& processedRoutes);
 
-    // Helper methods
     int CountRoutesInSubtree(TrieNode* node);
     int CountExistingRoutes(TrieNode* node);
     void CollectRoutesForRemoval(TrieNode* node, uint32_t subnet, int depth,
@@ -75,4 +100,10 @@ private:
     uint32_t CreateMask(int prefixLength);
     std::string UIntToIP(uint32_t ip);
     bool IsPrivateNetwork(uint32_t ip);
+
+    // Cache helpers
+    size_t ComputeRouteHash(const std::vector<HostRoute>& routes) const;
+    void CleanupExpiredCache();
+    std::optional<OptimizationPlan> GetCachedPlan(const std::vector<HostRoute>& routes);
+    void CachePlan(const std::vector<HostRoute>& routes, const OptimizationPlan& plan);
 };

@@ -2,6 +2,7 @@
 #include "NetworkMonitor.h"
 #include "RouteController.h"
 #include "ProcessManager.h"
+#include "PerformanceMonitor.h"
 #include "../common/Constants.h"
 #include "../common/Utils.h"
 #include "../common/Logger.h"
@@ -86,6 +87,7 @@ void NetworkMonitor::MonitorThreadFunc() {
 
     active = true;
     auto lastCleanup = std::chrono::steady_clock::now();
+    auto lastStats = std::chrono::steady_clock::now();
     int eventCount = 0;
 
     Logger::Instance().Info("Monitor thread started - waiting for FLOW events");
@@ -139,6 +141,12 @@ void NetworkMonitor::MonitorThreadFunc() {
             CleanupOldConnections();
             lastCleanup = now;
         }
+
+        // Log performance stats every 5 minutes
+        if (std::chrono::duration_cast<std::chrono::minutes>(now - lastStats).count() >= 5) {
+            LogPerformanceStats();
+            lastStats = now;
+        }
     }
 
     active = false;
@@ -146,8 +154,11 @@ void NetworkMonitor::MonitorThreadFunc() {
 }
 
 void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr) {
+    PERF_TIMER("NetworkMonitor::ProcessFlowEvent");
+
     bool isSelected = processManager->IsSelectedProcessByPid(addr.Flow.ProcessId);
     if (!isSelected) {
+        PERF_COUNT("NetworkMonitor.FlowEvent.Filtered");
         return;
     }
 
@@ -165,6 +176,7 @@ void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr) {
         remoteIp = remoteIp.substr(7);
     }
     else if (remoteIp.contains(':')) {
+        PERF_COUNT("NetworkMonitor.FlowEvent.IPv6Skipped");
         Logger::Instance().Debug(std::format("Skipping IPv6 address: {} for process: {}", remoteIp, processName));
         return;
     }
@@ -175,6 +187,7 @@ void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr) {
         static_cast<int>(addr.Flow.Protocol)));
 
     if (Utils::IsPrivateIP(remoteIp)) {
+        PERF_COUNT("NetworkMonitor.FlowEvent.PrivateIPSkipped");
         Logger::Instance().Debug(std::format("Skipping private IP: {}", remoteIp));
         return;
     }
@@ -182,10 +195,12 @@ void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr) {
     Logger::Instance().Info(std::format("Selected process detected: {} -> {}", processName, remoteIp));
 
     if (addr.Event == WINDIVERT_EVENT_FLOW_ESTABLISHED) {
+        PERF_COUNT("NetworkMonitor.FlowEvent.Established");
         std::lock_guard<std::mutex> lock(connectionsMutex);
 
         // Check connection limit
         if (connections.size() >= MAX_CONNECTIONS) {
+            PERF_COUNT("NetworkMonitor.ConnectionLimitReached");
             Logger::Instance().Warning(std::format("Connection limit reached ({}), cleaning up old connections", MAX_CONNECTIONS));
             ForceCleanupOldConnections();
         }
@@ -203,11 +218,14 @@ void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr) {
         };
 
         if (routeController) {
+            PERF_TIMER("NetworkMonitor::AddRoute");
             Logger::Instance().Info(std::format("Adding route IMMEDIATELY for {} (process: {})", remoteIp, processName));
             routeController->AddRoute(remoteIp, processName);
+            PERF_COUNT("NetworkMonitor.RouteAdded");
         }
     }
     else if (addr.Event == WINDIVERT_EVENT_FLOW_DELETED) {
+        PERF_COUNT("NetworkMonitor.FlowEvent.Deleted");
         std::lock_guard<std::mutex> lock(connectionsMutex);
         UINT64 flowId = ((UINT64)addr.Flow.ProcessId << 32) |
             ((UINT64)addr.Flow.LocalPort << 16) |
@@ -218,6 +236,8 @@ void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr) {
 }
 
 void NetworkMonitor::CleanupOldConnections() {
+    PERF_TIMER("NetworkMonitor::CleanupOldConnections");
+
     std::lock_guard<std::mutex> lock(connectionsMutex);
     auto now = std::chrono::system_clock::now();
     int cleaned = 0;
@@ -234,6 +254,7 @@ void NetworkMonitor::CleanupOldConnections() {
     }
 
     if (cleaned > 0) {
+        PERF_COUNT("NetworkMonitor.ConnectionsCleaned");
         Logger::Instance().Info(std::format("Cleaned up {} old connections", cleaned));
     }
 }
@@ -287,4 +308,23 @@ std::string NetworkMonitor::GetProcessPathFromFlowId(UINT64 flowId, UINT32 proce
 
     CloseHandle(process);
     return std::string(path);
+}
+
+void NetworkMonitor::LogPerformanceStats() {
+    auto report = PerformanceMonitor::Instance().GetReport();
+
+    Logger::Instance().Info("=== NetworkMonitor Performance Stats ===");
+
+    for (const auto& [name, count] : report.counters) {
+        if (name.starts_with("NetworkMonitor.")) {
+            Logger::Instance().Info(std::format("{}: {}", name, count));
+        }
+    }
+
+    for (const auto& op : report.operations) {
+        if (op.name.starts_with("NetworkMonitor::")) {
+            Logger::Instance().Info(std::format("{}: {} calls, avg: {}us, p95: {}us",
+                op.name, op.count, op.avgTime.count(), op.p95Time.count()));
+        }
+    }
 }

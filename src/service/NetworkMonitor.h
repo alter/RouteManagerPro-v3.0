@@ -54,4 +54,5 @@ private:
     void ForceCleanupOldConnections();
     std::string GetProcessPathFromFlowId(UINT64 flowId, UINT32 processId);
     void LogDetailedStats();
+    void LogPerformanceStats();
 };
