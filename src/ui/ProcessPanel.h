@@ -18,7 +18,6 @@ struct ProcessDisplayInfo {
 
 class ProcessPanel {
 public:
-    // Enhanced scroll position preservation
     struct ScrollState {
         int topIndex;
         int pixelOffset;
@@ -41,7 +40,6 @@ public:
     void HandleNotify(LPNMHDR pnmh);
     void Resize(int x, int y, int width, int height);
 
-    // Public scroll restoration for message handling
     void RestoreDetailedScrollPosition(HWND listView, const ScrollState& state);
 
 private:
@@ -63,7 +61,6 @@ private:
 
     bool isUpdating;
 
-    // User interaction tracking
     DWORD lastInteractionTime;
     bool isUserInteracting;
 
@@ -71,6 +68,7 @@ private:
 
     void CreateControls(int x, int y, int width, int height);
     void UpdateProcessList();
+    void UpdateListsImmediately();
     void OnAddProcess();
     void OnRemoveProcess();
     void OnAddAllProcesses();
@@ -78,17 +76,13 @@ private:
     void OnSearchChanged();
     void FilterProcesses(const std::string& filter);
 
-    // Enhanced scroll position helpers
     ScrollState SaveDetailedScrollPosition(HWND listView);
 
-    // User interaction detection
     bool IsUserInteracting() const;
     void OnUserInteraction();
 
-    // ListView helpers
     int GetSelectedIndex(HWND listView);
     std::wstring GetItemText(HWND listView, int index);
 
-    // Helper to extract base process name from display name
     std::wstring GetBaseProcessNameFromDisplayName(const std::wstring& displayName);
 };
