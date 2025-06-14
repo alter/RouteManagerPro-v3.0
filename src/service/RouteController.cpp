@@ -171,8 +171,8 @@ std::vector<SystemRoute> RouteController::GetSystemRoutesOldAPI() {
     }
 
     std::string distribution = "Route distribution by prefix: ";
-    for (const auto& [prefix, count] : prefixCounts) {
-        distribution += "/" + std::to_string(prefix) + "=" + std::to_string(count) + " ";
+    for (const auto& prefixPair : prefixCounts) {
+        distribution += "/" + std::to_string(prefixPair.first) + "=" + std::to_string(prefixPair.second) + " ";
     }
     Logger::Instance().Info(distribution);
 
@@ -246,13 +246,18 @@ void RouteController::RunOptimization() {
 
     // Log top networks with most routes
     std::vector<std::pair<uint32_t, size_t>> networkSizes;
-    for (const auto& [network, routes] : routesByNetwork) {
-        networkSizes.push_back({ network, routes.size() });
+    for (const auto& networkPair : routesByNetwork) {
+        networkSizes.push_back({ networkPair.first, networkPair.second.size() });
     }
     std::sort(networkSizes.begin(), networkSizes.end(),
         [](const auto& a, const auto& b) { return a.second > b.second; });
 
-    for (size_t i = 0; i < std::min(size_t(5), networkSizes.size()); i++) {
+    size_t maxNetworks = 5;
+    if (networkSizes.size() < maxNetworks) {
+        maxNetworks = networkSizes.size();
+    }
+
+    for (size_t i = 0; i < maxNetworks; i++) {
         uint32_t network = networkSizes[i].first;
         size_t count = networkSizes[i].second;
         struct in_addr addr;
@@ -396,7 +401,8 @@ void RouteController::SyncWithSystemTable() {
     {
         std::lock_guard<std::mutex> lock(routesMutex);
 
-        for (const auto& [routeKey, route] : routes) {
+        for (const auto& routePair : routes) {
+            const std::string& routeKey = routePair.first;
             // Если маршрут есть у нас, но нет в системе
             if (systemRouteKeys.find(routeKey) == systemRouteKeys.end()) {
                 Logger::Instance().Warning("Route " + routeKey +
@@ -501,7 +507,10 @@ void RouteController::ApplyOptimizationPlan(const OptimizationPlan& plan) {
 
     // First add new aggregated routes
     bool addFailed = false;
-    for (const auto& [ip, prefix] : toAdd) {
+    for (const auto& routeToAdd : toAdd) {
+        const std::string& ip = routeToAdd.first;
+        int prefix = routeToAdd.second;
+
         if (AddSystemRouteWithMask(ip, prefix)) {
             addedRoutes.push_back({ ip, prefix });
         }
@@ -515,14 +524,17 @@ void RouteController::ApplyOptimizationPlan(const OptimizationPlan& plan) {
     // If any add failed, rollback
     if (addFailed) {
         Logger::Instance().Warning("Rolling back optimization due to add failure");
-        for (const auto& [ip, prefix] : addedRoutes) {
-            RemoveSystemRouteWithMask(ip, prefix, config.gatewayIp);
+        for (const auto& routeToRollback : addedRoutes) {
+            RemoveSystemRouteWithMask(routeToRollback.first, routeToRollback.second, config.gatewayIp);
         }
         return;
     }
 
     // Then remove old host routes
-    for (const auto& [ip, prefix] : toRemove) {
+    for (const auto& routeToRemove : toRemove) {
+        const std::string& ip = routeToRemove.first;
+        int prefix = routeToRemove.second;
+
         if (!RemoveSystemRouteWithMask(ip, prefix, config.gatewayIp)) {
             Logger::Instance().Warning("Failed to remove host route: " + ip + "/" + std::to_string(prefix));
             // Continue anyway - having extra routes is better than missing routes
@@ -609,8 +621,8 @@ void RouteController::UpdateConfig(const ServiceConfig& newConfig) {
 
 void RouteController::MigrateExistingRoutes(const std::string& oldGateway, const std::string& newGateway) {
     std::vector<std::pair<std::string, int>> routesToMigrate;
-    for (const auto& [key, route] : routes) {
-        routesToMigrate.emplace_back(route->ip, route->prefixLength);
+    for (const auto& routePair : routes) {
+        routesToMigrate.emplace_back(routePair.second->ip, routePair.second->prefixLength);
     }
 
     Logger::Instance().Info("Migrating " + std::to_string(routesToMigrate.size()) + " routes from gateway " +
@@ -619,7 +631,10 @@ void RouteController::MigrateExistingRoutes(const std::string& oldGateway, const
     int successCount = 0;
     int failCount = 0;
 
-    for (const auto& [ip, prefix] : routesToMigrate) {
+    for (const auto& routeInfo : routesToMigrate) {
+        const std::string& ip = routeInfo.first;
+        int prefix = routeInfo.second;
+
         RemoveSystemRouteWithMask(ip, prefix, oldGateway);
 
         if (AddSystemRouteWithMask(ip, prefix)) {
@@ -673,8 +688,8 @@ void RouteController::SaveRoutesToDiskAsync() {
     std::vector<std::pair<std::string, RouteInfo>> snapshot;
     {
         std::lock_guard<std::mutex> lock(routesMutex);
-        for (const auto& [key, route] : routes) {
-            snapshot.emplace_back(key, *route);
+        for (const auto& routePair : routes) {
+            snapshot.emplace_back(routePair.first, *routePair.second);
         }
     }
 
@@ -691,7 +706,10 @@ void RouteController::SaveRoutesToDiskAsync() {
     file << "timestamp=" << nowSeconds << "\n";
     file << "gateway=" << config.gatewayIp << "\n";
 
-    for (const auto& [routeKey, route] : snapshot) {
+    for (const auto& routePair : snapshot) {
+        const std::string& routeKey = routePair.first;
+        const RouteInfo& route = routePair.second;
+
         auto createdSeconds = std::chrono::duration_cast<std::chrono::seconds>(
             route.createdAt.time_since_epoch()).count();
 
@@ -798,7 +816,9 @@ void RouteController::CleanupAllRoutes() {
             return;
         }
 
-        for (const auto& [routeKey, route] : routes) {
+        for (const auto& routePair : routes) {
+            const std::string& routeKey = routePair.first;
+            const auto& route = routePair.second;
             routesToDelete.emplace_back(route->ip, route->prefixLength);
             if (route->processName.find("Preload-") == 0) {
                 hadPreloadRoutes = true;
@@ -812,7 +832,10 @@ void RouteController::CleanupAllRoutes() {
     int successCount = 0;
     int failCount = 0;
 
-    for (const auto& [ip, prefixLength] : routesToDelete) {
+    for (const auto& routeInfo : routesToDelete) {
+        const std::string& ip = routeInfo.first;
+        int prefixLength = routeInfo.second;
+
         Logger::Instance().Info("Removing Windows route for: " + ip + "/" + std::to_string(prefixLength));
         if (RemoveSystemRouteWithMask(ip, prefixLength, config.gatewayIp)) {
             successCount++;
@@ -866,8 +889,8 @@ std::vector<RouteInfo> RouteController::GetActiveRoutes() const {
     std::lock_guard<std::mutex> lock(routesMutex);
     std::vector<RouteInfo> result;
 
-    for (auto& [routeKey, route] : routes) {
-        result.push_back(*route);
+    for (const auto& routePair : routes) {
+        result.push_back(*routePair.second);
     }
 
     std::sort(result.begin(), result.end(),
@@ -881,7 +904,10 @@ std::vector<RouteInfo> RouteController::GetActiveRoutes() const {
 bool RouteController::IsIPCoveredByExistingRoute(const std::string& ip) {
     uint32_t ipAddr = IPToUInt(ip);
 
-    for (const auto& [routeKey, route] : routes) {
+    for (const auto& routePair : routes) {
+        const std::string& routeKey = routePair.first;
+        const auto& route = routePair.second;
+
         if (route->prefixLength >= 32) continue;
 
         uint32_t routeAddr = IPToUInt(route->ip);
@@ -1127,12 +1153,15 @@ void RouteController::VerifyRoutesThreadFunc() {
                     break;
                 }
 
-                for (const auto& [routeKey, route] : routes) {
-                    routesToVerify.emplace_back(route->ip, route->prefixLength);
+                for (const auto& routePair : routes) {
+                    routesToVerify.emplace_back(routePair.second->ip, routePair.second->prefixLength);
                 }
             }
 
-            for (const auto& [ip, prefixLength] : routesToVerify) {
+            for (const auto& routeInfo : routesToVerify) {
+                const std::string& ip = routeInfo.first;
+                int prefixLength = routeInfo.second;
+
                 if (!running.load() || ShutdownCoordinator::Instance().isShuttingDown) {
                     Logger::Instance().Info("Route verification interrupted by shutdown");
                     break;
@@ -1162,7 +1191,8 @@ void RouteController::SaveRoutesToDisk() {
     file << "timestamp=" << nowSeconds << "\n";
     file << "gateway=" << config.gatewayIp << "\n";
 
-    for (auto& [routeKey, route] : routes) {
+    for (const auto& routePair : routes) {
+        const auto& route = routePair.second;
         auto createdSeconds = std::chrono::duration_cast<std::chrono::seconds>(
             route->createdAt.time_since_epoch()).count();
 

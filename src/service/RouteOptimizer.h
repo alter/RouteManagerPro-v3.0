@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <memory>
 #include <mutex>
+#include "../common/Models.h"
 
 struct OptimizerConfig {
     int min_hosts_to_aggregate = 2;
@@ -34,12 +35,6 @@ struct HostRoute {
     uint32_t ipNum;
     std::string processName;
     int prefixLength = 32;  // Added to support non-/32 routes
-};
-
-struct RouteInfo {
-    std::string ip;
-    int prefixLength;
-    std::string processName;
 };
 
 class RouteOptimizer {
