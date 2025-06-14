@@ -254,12 +254,10 @@ class ScopedTimer {
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please read our [Contributing Guide](CONTRIBUTING.md) for details.
-
+Contributions are welcome!
 ## 📜 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
+This project is licensed under the MIT License.
 ## 🙏 Acknowledgments
 
 - [WinDivert](https://www.reqrypt.org/windivert.html) for packet capture
