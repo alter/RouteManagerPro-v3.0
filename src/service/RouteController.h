@@ -12,6 +12,7 @@
 #include <winsock2.h>
 #include <netioapi.h>
 #include "../common/Models.h"
+#include "../common/Result.h"
 #include "RouteOptimizer.h"
 
 struct SystemRoute {
@@ -26,6 +27,7 @@ public:
     RouteController(const ServiceConfig& config);
     ~RouteController();
 
+    // Public API - unchanged
     bool AddRoute(const std::string& ip, const std::string& processName);
     bool AddRouteWithMask(const std::string& ip, int prefixLength, const std::string& processName);
     bool RemoveRoute(const std::string& ip);
@@ -42,6 +44,9 @@ public:
     void SyncWithSystemTable();
     void PerformFullCleanup();
     void CleanupRedundantRoutes();
+
+    // New method for detailed error info when needed
+    const RouteError& GetLastError() const { return lastError; }
 
 private:
     ServiceConfig config;
@@ -65,12 +70,24 @@ private:
     std::chrono::steady_clock::time_point lastSaveTime;
     static constexpr auto SAVE_INTERVAL = std::chrono::minutes(10);
 
+    // Error tracking
+    mutable RouteError lastError;
+    mutable std::mutex errorMutex;
+
+    // Internal methods
     bool AddSystemRoute(const std::string& ip);
     bool AddSystemRouteWithMask(const std::string& ip, int prefixLength);
     bool AddSystemRouteOldAPI(const std::string& ip);
     bool AddSystemRouteOldAPIWithMask(const std::string& ip, int prefixLength);
     bool RemoveSystemRoute(const std::string& ip, const std::string& gatewayIp);
     bool RemoveSystemRouteWithMask(const std::string& ip, int prefixLength, const std::string& gatewayIp);
+
+    // New internal methods with Result for better error handling
+    Result<void> AddSystemRouteEx(const std::string& ip, int prefixLength);
+    Result<void> RemoveSystemRouteEx(const std::string& ip, int prefixLength, const std::string& gatewayIp);
+
+    void SetLastError(const RouteError& error);
+    void ClearLastError();
 
     void VerifyRoutesThreadFunc();
     void PersistenceThreadFunc();

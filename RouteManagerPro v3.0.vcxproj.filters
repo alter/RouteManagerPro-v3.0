@@ -146,6 +146,9 @@
     <ClInclude Include="src\service\RouteOptimizer.h">
       <Filter>Header Files\service</Filter>
     </ClInclude>
+    <ClInclude Include="src\common\Result.h">
+      <Filter>Header Files\common</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <Image Include="app.ico">

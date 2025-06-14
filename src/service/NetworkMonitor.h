@@ -38,6 +38,11 @@ private:
         size_t packetCount;
     };
 
+    // Connection tracking limits
+    static constexpr size_t MAX_CONNECTIONS = 10000;
+    static constexpr size_t CLEANUP_TRIGGER_PERCENT = 80;
+    static constexpr auto AGGRESSIVE_CLEANUP_AGE = std::chrono::minutes(30);
+
     std::unordered_map<UINT64, ConnectionInfo> connections;
     std::mutex connectionsMutex;
 
@@ -46,6 +51,7 @@ private:
     void HandleNewProcess(DWORD pid, const std::string& remoteIp, WINDIVERT_EVENT event);
     bool VerifyProcessIdentity(DWORD pid, const FILETIME& expectedTime);
     void CleanupOldConnections();
+    void ForceCleanupOldConnections();
     std::string GetProcessPathFromFlowId(UINT64 flowId, UINT32 processId);
     void LogDetailedStats();
 };

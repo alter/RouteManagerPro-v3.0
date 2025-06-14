@@ -184,6 +184,12 @@ void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr) {
     if (addr.Event == WINDIVERT_EVENT_FLOW_ESTABLISHED) {
         std::lock_guard<std::mutex> lock(connectionsMutex);
 
+        // Check connection limit
+        if (connections.size() >= MAX_CONNECTIONS) {
+            Logger::Instance().Warning(std::format("Connection limit reached ({}), cleaning up old connections", MAX_CONNECTIONS));
+            ForceCleanupOldConnections();
+        }
+
         UINT64 flowId = ((UINT64)addr.Flow.ProcessId << 32) |
             ((UINT64)addr.Flow.LocalPort << 16) |
             addr.Flow.RemotePort;
@@ -230,6 +236,42 @@ void NetworkMonitor::CleanupOldConnections() {
     if (cleaned > 0) {
         Logger::Instance().Info(std::format("Cleaned up {} old connections", cleaned));
     }
+}
+
+void NetworkMonitor::ForceCleanupOldConnections() {
+    auto now = std::chrono::system_clock::now();
+    int cleaned = 0;
+
+    // More aggressive cleanup - remove connections older than 30 minutes
+    for (auto it = connections.begin(); it != connections.end();) {
+        auto duration = std::chrono::duration_cast<std::chrono::minutes>(now - it->second.lastSeen);
+        if (duration.count() >= 30) {
+            it = connections.erase(it);
+            cleaned++;
+        }
+        else {
+            ++it;
+        }
+    }
+
+    // If still too many, remove oldest connections
+    if (connections.size() > MAX_CONNECTIONS * 0.8) {
+        std::vector<std::pair<UINT64, std::chrono::system_clock::time_point>> sortedConnections;
+        for (const auto& [id, info] : connections) {
+            sortedConnections.emplace_back(id, info.lastSeen);
+        }
+
+        std::sort(sortedConnections.begin(), sortedConnections.end(),
+            [](const auto& a, const auto& b) { return a.second < b.second; });
+
+        size_t toRemove = connections.size() - static_cast<size_t>(MAX_CONNECTIONS * 0.8);
+        for (size_t i = 0; i < toRemove && i < sortedConnections.size(); ++i) {
+            connections.erase(sortedConnections[i].first);
+            cleaned++;
+        }
+    }
+
+    Logger::Instance().Info(std::format("Force cleanup removed {} connections", cleaned));
 }
 
 std::string NetworkMonitor::GetProcessPathFromFlowId(UINT64 flowId, UINT32 processId) {

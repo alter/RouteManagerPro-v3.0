@@ -25,6 +25,7 @@ struct PerformanceConfig {
     std::chrono::seconds verificationInterval{ 30 };
     size_t missCacheMaxSize{ 1000 };
     size_t mainCacheMaxSize{ 10000 };
+    size_t stringCacheMaxSize{ 5000 };
     bool aggressiveCaching{ false };
 };
 
@@ -34,6 +35,8 @@ struct CacheStats {
     std::atomic<uint64_t> verificationChecks{ 0 };
     std::atomic<uint64_t> newProcessChecks{ 0 };
     std::atomic<uint64_t> cacheEvictions{ 0 };
+    std::atomic<uint64_t> stringCacheHits{ 0 };
+    std::atomic<uint64_t> stringCacheMisses{ 0 };
 };
 
 template<typename K, typename V>
@@ -133,6 +136,10 @@ private:
     std::unordered_map<DWORD, CachedProcessInfo> m_pidCache;
     ThreadSafeLRUCache<DWORD, CachedProcessInfo> m_pidMissCache;
 
+    // String conversion cache
+    ThreadSafeLRUCache<std::wstring, std::string> m_wstringToStringCache{ 5000 };
+    ThreadSafeLRUCache<std::string, std::wstring> m_stringToWstringCache{ 5000 };
+
     std::unordered_set<std::string> selectedProcesses;
     std::vector<ProcessInfo> allProcesses;
 
@@ -150,4 +157,8 @@ private:
     void MergeMissCacheIntoMain(std::unordered_map<DWORD, CachedProcessInfo>& mainCache);
     void CleanupStalePids(std::unordered_map<DWORD, CachedProcessInfo>& cache,
         const std::unordered_set<DWORD>& alivePids);
+
+    // Optimized string conversion with caching
+    std::string CachedWStringToString(const std::wstring& wstr);
+    std::wstring CachedStringToWString(const std::string& str);
 };
