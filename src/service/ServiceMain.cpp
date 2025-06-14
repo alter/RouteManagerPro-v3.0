@@ -12,6 +12,7 @@
 #include "../common/Logger.h"
 #include "../common/ShutdownCoordinator.h"
 #include <thread>
+#include <format>
 
 HANDLE ServiceMain::stopEvent = nullptr;
 
@@ -38,51 +39,37 @@ void ServiceMain::StartDirect() {
     try {
         Logger::Instance().Info("=== Service initialization started ===");
 
-        // Step 1: Create ConfigManager
         Logger::Instance().Debug("Step 1: Creating ConfigManager");
         configManager = std::make_unique<ConfigManager>();
         auto config = configManager->GetConfig();
 
-        // Step 2: Create RouteController
         Logger::Instance().Debug("Step 2: Creating RouteController");
         routeController = std::make_unique<RouteController>(config);
 
-        // Step 3: Load saved routes from disk
-        // This is already done in RouteController constructor
         Logger::Instance().Debug("Step 3: Routes loaded from disk in constructor");
 
-        // Step 4: Sync with system routing table
         Logger::Instance().Info("Step 4: Syncing with system routing table");
         routeController->SyncWithSystemTable();
 
-        // Step 5: Perform smart cleanup (safe operation)
         Logger::Instance().Info("Step 5: Performing smart cleanup of redundant routes");
         routeController->PerformFullCleanup();
 
-        // Note: PerformFullCleanup already saves state internally after cleanup
-
-        // Step 6: Create ProcessManager
         Logger::Instance().Debug("Step 6: Creating ProcessManager");
         processManager = std::make_unique<ProcessManager>(config);
 
-        // Step 7: Create NetworkMonitor
         Logger::Instance().Debug("Step 7: Creating NetworkMonitor");
         networkMonitor = std::make_unique<NetworkMonitor>(
             routeController.get(), processManager.get());
 
-        // Step 8: Create Watchdog
         Logger::Instance().Debug("Step 8: Creating Watchdog");
         watchdog = std::make_unique<Watchdog>(this);
 
-        // Step 9: Start NetworkMonitor
         Logger::Instance().Debug("Step 9: Starting NetworkMonitor");
         networkMonitor->Start();
 
-        // Step 10: Start Watchdog
         Logger::Instance().Debug("Step 10: Starting Watchdog");
         watchdog->Start();
 
-        // Step 11: Create pipe server thread for UI communication
         Logger::Instance().Debug("Step 11: Creating pipe server thread");
         pipeThread = CreateThread(nullptr, 0, PipeServerThread, this, 0, nullptr);
 
@@ -94,7 +81,7 @@ void ServiceMain::StartDirect() {
         Logger::Instance().Debug("ServiceMain::StartDirect - Stop event signaled, exiting StartDirect()");
     }
     catch (const std::exception& e) {
-        Logger::Instance().Error("ServiceMain::StartDirect - Exception: " + std::string(e.what()));
+        Logger::Instance().Error(std::format("ServiceMain::StartDirect - Exception: {}", e.what()));
         StopDirect();
         throw;
     }
@@ -193,7 +180,7 @@ void ServiceMain::StopDirect() {
         Logger::Instance().Info("ServiceMain::StopDirect - Service logic stopped successfully");
     }
     catch (const std::exception& e) {
-        Logger::Instance().Error("ServiceMain::StopDirect - Exception during shutdown: " + std::string(e.what()));
+        Logger::Instance().Error(std::format("ServiceMain::StopDirect - Exception during shutdown: {}", e.what()));
     }
     catch (...) {
         Logger::Instance().Error("ServiceMain::StopDirect - Unknown exception during shutdown");
@@ -225,13 +212,13 @@ DWORD WINAPI ServiceMain::PipeServerThread(LPVOID param) {
         );
 
         if (pipe == INVALID_HANDLE_VALUE) {
-            Logger::Instance().Error("PipeServerThread: Failed to create pipe: " + std::to_string(GetLastError()));
+            Logger::Instance().Error(std::format("PipeServerThread: Failed to create pipe: {}", ::GetLastError()));
             Sleep(1000);
             continue;
         }
 
         BOOL connected = ConnectNamedPipe(pipe, &overlapped);
-        if (!connected && GetLastError() == ERROR_IO_PENDING) {
+        if (!connected && ::GetLastError() == ERROR_IO_PENDING) {
             HANDLE waitHandles[] = { overlapped.hEvent, ShutdownCoordinator::Instance().shutdownEvent };
             DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
 
@@ -269,9 +256,9 @@ void ServiceMain::HandlePipeClient(HANDLE pipe) {
         std::vector<uint8_t> buffer(4096);
 
         if (!ReadFile(pipe, buffer.data(), static_cast<DWORD>(buffer.size()), &bytesRead, nullptr)) {
-            DWORD error = GetLastError();
+            DWORD error = ::GetLastError();
             if (error != ERROR_BROKEN_PIPE) {
-                Logger::Instance().Debug("HandlePipeClient: ReadFile failed: " + std::to_string(error));
+                Logger::Instance().Debug(std::format("HandlePipeClient: ReadFile failed: {}", error));
             }
             break;
         }
@@ -310,15 +297,12 @@ void ServiceMain::HandlePipeClient(HANDLE pipe) {
                 auto newConfig = IPCSerializer::DeserializeServiceConfig(msgData);
                 auto oldConfig = configManager->GetConfig();
 
-                // Save config immediately
                 configManager->SetConfig(newConfig);
 
-                // Update RouteController if config changed
                 if (routeController) {
                     routeController->UpdateConfig(newConfig);
                 }
 
-                // Update ProcessManager if processes changed
                 if (processManager && oldConfig.selectedProcesses != newConfig.selectedProcesses) {
                     processManager->SetSelectedProcesses(newConfig.selectedProcesses);
                 }
@@ -349,7 +333,6 @@ void ServiceMain::HandlePipeClient(HANDLE pipe) {
 
             case IPCMessageType::ClearRoutes: {
                 routeController->CleanupAllRoutes();
-                // Check if AI preload was disabled and update config
                 auto currentConfig = configManager->GetConfig();
                 auto routeConfig = routeController->GetConfig();
                 if (currentConfig.aiPreloadEnabled && !routeConfig.aiPreloadEnabled) {
@@ -392,7 +375,7 @@ void ServiceMain::HandlePipeClient(HANDLE pipe) {
             }
         }
         catch (const std::exception& e) {
-            Logger::Instance().Error("HandlePipeClient: Exception processing message: " + std::string(e.what()));
+            Logger::Instance().Error(std::format("HandlePipeClient: Exception processing message: {}", e.what()));
             response.success = false;
             response.error = e.what();
         }

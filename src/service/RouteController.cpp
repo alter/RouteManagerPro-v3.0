@@ -9,7 +9,7 @@
 #include "../common/Utils.h"
 #include "../common/Logger.h"
 #include "../common/ShutdownCoordinator.h"
-#include <sstream>
+#include <format>
 #include <fstream>
 #include <filesystem>
 #include <chrono>
@@ -17,6 +17,8 @@
 #include <condition_variable>
 #include <unordered_set>
 #include <unordered_map>
+#include <ranges>
+#include <algorithm>
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
@@ -26,13 +28,11 @@ lastSaveTime(std::chrono::steady_clock::now()), cachedInterfaceIndex(0),
 lastOptimizationTime(std::chrono::steady_clock::now()) {
     LoadRoutesFromDisk();
 
-    // Initialize optimizer with config
     OptimizerConfig optConfig;
     optConfig.min_hosts_to_aggregate = config.optimizerSettings.minHostsToAggregate;
     optConfig.waste_thresholds = config.optimizerSettings.wasteThresholds;
     optimizer = std::make_unique<RouteOptimizer>(optConfig);
 
-    // Start threads
     verifyThread = std::thread(&RouteController::VerifyRoutesThreadFunc, this);
     persistThread = std::thread(&RouteController::PersistenceThreadFunc, this);
     optimizationThread = std::thread(&RouteController::OptimizationThreadFunc, this);
@@ -45,11 +45,9 @@ lastOptimizationTime(std::chrono::steady_clock::now()) {
 RouteController::~RouteController() {
     Logger::Instance().Info("RouteController destructor - starting shutdown");
 
-    // Signal threads to stop
     running = false;
     optimizationCV.notify_all();
 
-    // Wait for threads
     if (verifyThread.joinable()) {
         Logger::Instance().Info("Waiting for verify thread to stop...");
         verifyThread.join();
@@ -68,7 +66,6 @@ RouteController::~RouteController() {
         Logger::Instance().Info("Optimization thread joined successfully");
     }
 
-    // Final save on shutdown
     if (routesDirty.load()) {
         Logger::Instance().Info("RouteController shutdown: Saving routes to disk");
         SaveRoutesToDisk();
@@ -84,7 +81,6 @@ void RouteController::OptimizationThreadFunc() {
         while (running.load() && !ShutdownCoordinator::Instance().isShuttingDown) {
             std::unique_lock<std::mutex> lock(optimizationMutex);
 
-            // Wait for 1 hour or until signaled to stop
             auto waitUntil = std::chrono::steady_clock::now() + std::chrono::hours(1);
             optimizationCV.wait_until(lock, waitUntil, [this] {
                 return !running.load() || ShutdownCoordinator::Instance().isShuttingDown;
@@ -100,28 +96,23 @@ void RouteController::OptimizationThreadFunc() {
         }
     }
     catch (const std::exception& e) {
-        Logger::Instance().Error("OptimizationThreadFunc exception: " + std::string(e.what()));
+        Logger::Instance().Error(std::format("OptimizationThreadFunc exception: {}", e.what()));
     }
 
     Logger::Instance().Info("RouteController optimization thread exiting");
 }
 
-// Новый метод для получения всех маршрутов из системы
 std::vector<SystemRoute> RouteController::GetSystemRoutesForGateway() {
     std::vector<SystemRoute> systemRoutes;
-
-    // Use old API for compatibility
     return GetSystemRoutesOldAPI();
 }
 
-// Fallback метод для старого API
 std::vector<SystemRoute> RouteController::GetSystemRoutesOldAPI() {
     std::vector<SystemRoute> systemRoutes;
 
     PMIB_IPFORWARDTABLE pIpForwardTable = nullptr;
     DWORD dwSize = 0;
 
-    // First call to get size
     if (GetIpForwardTable(pIpForwardTable, &dwSize, FALSE) == ERROR_INSUFFICIENT_BUFFER) {
         pIpForwardTable = (PMIB_IPFORWARDTABLE)malloc(dwSize);
 
@@ -145,12 +136,9 @@ std::vector<SystemRoute> RouteController::GetSystemRoutesOldAPI() {
 
                     systemRoutes.push_back(route);
 
-                    // Debug log для первых нескольких маршрутов
                     if (systemRoutes.size() <= 5 || route.prefixLength < 32) {
-                        Logger::Instance().Debug("Route: " + route.ipString + "/" +
-                            std::to_string(route.prefixLength) +
-                            " addr=" + std::to_string(route.address) +
-                            " mask=" + std::to_string(route.mask));
+                        Logger::Instance().Debug(std::format("Route: {}/{} addr={} mask={}",
+                            route.ipString, route.prefixLength, route.address, route.mask));
                     }
                 }
             }
@@ -161,62 +149,54 @@ std::vector<SystemRoute> RouteController::GetSystemRoutesOldAPI() {
         }
     }
 
-    Logger::Instance().Info("Found " + std::to_string(systemRoutes.size()) +
-        " routes for gateway " + config.gatewayIp);
+    Logger::Instance().Info(std::format("Found {} routes for gateway {}",
+        systemRoutes.size(), config.gatewayIp));
 
-    // Log distribution of prefix lengths
     std::unordered_map<int, int> prefixCounts;
     for (const auto& route : systemRoutes) {
         prefixCounts[route.prefixLength]++;
     }
 
     std::string distribution = "Route distribution by prefix: ";
-    for (const auto& prefixPair : prefixCounts) {
-        distribution += "/" + std::to_string(prefixPair.first) + "=" + std::to_string(prefixPair.second) + " ";
+    for (const auto& [prefix, count] : prefixCounts) {
+        distribution += std::format("/{}={} ", prefix, count);
     }
     Logger::Instance().Info(distribution);
 
     return systemRoutes;
 }
 
-// Подсчет битов в маске
 int RouteController::CountBits(uint32_t mask) {
     int count = 0;
     uint32_t n = mask;
     while (n) {
         count++;
-        n &= (n - 1);  // Clear the least significant bit
+        n &= (n - 1);
     }
     return count;
 }
 
-// Новый улучшенный метод оптимизации
 void RouteController::RunOptimization() {
     Logger::Instance().Info("=== Starting Route Optimization (Deep Algorithm) ===");
 
-    // Step 1: Get ALL routes from system table for our gateway
     auto systemRoutes = GetSystemRoutesForGateway();
-    Logger::Instance().Info("Found " + std::to_string(systemRoutes.size()) +
-        " total routes in system for gateway " + config.gatewayIp);
+    Logger::Instance().Info(std::format("Found {} total routes in system for gateway {}",
+        systemRoutes.size(), config.gatewayIp));
 
-    // Step 2: Convert ALL routes (not just /32) to HostRoute format for optimization
     std::vector<HostRoute> allRoutesForOptimization;
-    std::vector<SystemRoute> largeAggregatedRoutes; // Only keep very large aggregates (< /24)
+    std::vector<SystemRoute> largeAggregatedRoutes;
 
     for (const auto& route : systemRoutes) {
         if (route.prefixLength < 24) {
-            // Keep large aggregated routes (like /16, /19, etc) as they are
             largeAggregatedRoutes.push_back(route);
         }
         else {
-            // Convert to HostRoute for optimization (includes /24, /25, ..., /32)
             HostRoute hr;
             hr.ip = route.ipString;
             hr.ipNum = route.address;
             hr.prefixLength = route.prefixLength;
 
-            // Try to find process name from our internal state
-            std::string routeKey = route.ipString + "/" + std::to_string(route.prefixLength);
+            std::string routeKey = std::format("{}/{}", route.ipString, route.prefixLength);
             auto it = routes.find(routeKey);
             if (it != routes.end()) {
                 hr.processName = it->second->processName;
@@ -229,33 +209,28 @@ void RouteController::RunOptimization() {
         }
     }
 
-    Logger::Instance().Info("Prepared for optimization: " +
-        std::to_string(allRoutesForOptimization.size()) + " routes (/24 and smaller), " +
-        std::to_string(largeAggregatedRoutes.size()) + " large aggregates kept");
+    Logger::Instance().Info(std::format("Prepared for optimization: {} routes (/24 and smaller), {} large aggregates kept",
+        allRoutesForOptimization.size(), largeAggregatedRoutes.size()));
 
-    // Step 3: Group routes by /24 network for analysis
     std::unordered_map<uint32_t, std::vector<HostRoute>> routesByNetwork;
     for (const auto& route : allRoutesForOptimization) {
-        uint32_t network = route.ipNum & 0xFFFFFF00; // /24 network
+        uint32_t network = route.ipNum & 0xFFFFFF00;
         routesByNetwork[network].push_back(route);
     }
 
-    // Log some statistics about route distribution
-    Logger::Instance().Info("Routes are distributed across " +
-        std::to_string(routesByNetwork.size()) + " /24 networks");
+    Logger::Instance().Info(std::format("Routes are distributed across {} /24 networks",
+        routesByNetwork.size()));
 
-    // Log top networks with most routes
     std::vector<std::pair<uint32_t, size_t>> networkSizes;
-    for (const auto& networkPair : routesByNetwork) {
-        networkSizes.push_back({ networkPair.first, networkPair.second.size() });
+    for (const auto& [network, routes] : routesByNetwork) {
+        networkSizes.emplace_back(network, routes.size());
     }
-    std::sort(networkSizes.begin(), networkSizes.end(),
-        [](const auto& a, const auto& b) { return a.second > b.second; });
 
-    size_t maxNetworks = 5;
-    if (networkSizes.size() < maxNetworks) {
-        maxNetworks = networkSizes.size();
-    }
+    std::ranges::sort(networkSizes, [](const auto& a, const auto& b) {
+        return a.second > b.second;
+        });
+
+    size_t maxNetworks = (std::min)(size_t(5), networkSizes.size());
 
     for (size_t i = 0; i < maxNetworks; i++) {
         uint32_t network = networkSizes[i].first;
@@ -264,27 +239,19 @@ void RouteController::RunOptimization() {
         addr.s_addr = htonl(network);
         char ipStr[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &addr, ipStr, INET_ADDRSTRLEN);
-        Logger::Instance().Info("Network " + std::string(ipStr) + "/24 has " +
-            std::to_string(count) + " routes");
+        Logger::Instance().Info(std::format("Network {}/24 has {} routes", ipStr, count));
     }
 
-    // Step 4: Filter out routes that are already covered by large aggregated routes
     std::vector<HostRoute> uncoveredRoutes;
     int coveredCount = 0;
 
     for (const auto& route : allRoutesForOptimization) {
-        bool isCovered = false;
-
-        for (const auto& aggRoute : largeAggregatedRoutes) {
+        bool isCovered = std::ranges::any_of(largeAggregatedRoutes, [&](const auto& aggRoute) {
             uint32_t routeAddr = route.ipNum;
             uint32_t aggAddr = aggRoute.address;
             uint32_t mask = aggRoute.mask;
-
-            if ((routeAddr & mask) == (aggAddr & mask)) {
-                isCovered = true;
-                break;
-            }
-        }
+            return (routeAddr & mask) == (aggAddr & mask);
+            });
 
         if (!isCovered) {
             uncoveredRoutes.push_back(route);
@@ -294,41 +261,35 @@ void RouteController::RunOptimization() {
         }
     }
 
-    Logger::Instance().Info("Filtered routes: " + std::to_string(coveredCount) +
-        " already covered by large aggregates, " +
-        std::to_string(uncoveredRoutes.size()) + " routes need optimization");
+    Logger::Instance().Info(std::format("Filtered routes: {} already covered by large aggregates, {} routes need optimization",
+        coveredCount, uncoveredRoutes.size()));
 
-    // Step 5: Run optimization on uncovered routes
     auto plan = optimizer->OptimizeRoutes(uncoveredRoutes);
 
-    // Step 6: Log results
     if (plan.routesBefore > 0) {
         Logger::Instance().Info("Optimization Results:");
-        Logger::Instance().Info("  Routes before: " + std::to_string(plan.routesBefore));
-        Logger::Instance().Info("  Routes after: " + std::to_string(plan.routesAfter));
-        Logger::Instance().Info("  Compression: " + std::to_string(plan.compressionRatio * 100) + "%");
-        Logger::Instance().Info("  Savings: " + std::to_string(plan.routesBefore - plan.routesAfter) + " routes");
+        Logger::Instance().Info(std::format("  Routes before: {}", plan.routesBefore));
+        Logger::Instance().Info(std::format("  Routes after: {}", plan.routesAfter));
+        Logger::Instance().Info(std::format("  Compression: {:.1f}%", plan.compressionRatio * 100));
+        Logger::Instance().Info(std::format("  Savings: {} routes", plan.routesBefore - plan.routesAfter));
 
-        // Log details of changes
         int adds = 0, removes = 0;
         for (const auto& change : plan.changes) {
             if (change.type == OptimizationPlan::RouteChange::ADD) {
                 adds++;
-                Logger::Instance().Debug("  + Add: " + change.ip + "/" +
-                    std::to_string(change.prefixLength) + " (" + change.reason + ")");
+                Logger::Instance().Debug(std::format("  + Add: {}/{} ({})",
+                    change.ip, change.prefixLength, change.reason));
             }
             else {
                 removes++;
             }
         }
-        Logger::Instance().Info("  Changes: " + std::to_string(adds) + " additions, " +
-            std::to_string(removes) + " removals");
+        Logger::Instance().Info(std::format("  Changes: {} additions, {} removals", adds, removes));
     }
     else {
         Logger::Instance().Info("No routes to optimize");
     }
 
-    // Step 7: Apply optimization plan
     if (!plan.changes.empty()) {
         ApplyOptimizationPlan(plan);
     }
@@ -336,7 +297,6 @@ void RouteController::RunOptimization() {
     Logger::Instance().Info("=== Route Optimization Completed ===");
 }
 
-// Новый метод для удаления избыточных системных маршрутов
 void RouteController::RemoveRedundantSystemRoutes(
     const std::vector<HostRoute>& allHostRoutes,
     const std::vector<SystemRoute>& aggregatedRoutes) {
@@ -347,24 +307,16 @@ void RouteController::RemoveRedundantSystemRoutes(
     int failedCount = 0;
 
     for (const auto& hostRoute : allHostRoutes) {
-        // Check if covered
-        bool isCovered = false;
-
-        for (const auto& aggRoute : aggregatedRoutes) {
-            if ((hostRoute.ipNum & aggRoute.mask) == (aggRoute.address & aggRoute.mask)) {
-                isCovered = true;
-                break;
-            }
-        }
+        bool isCovered = std::ranges::any_of(aggregatedRoutes, [&](const auto& aggRoute) {
+            return (hostRoute.ipNum & aggRoute.mask) == (aggRoute.address & aggRoute.mask);
+            });
 
         if (isCovered) {
-            // Remove this redundant route
             if (RemoveSystemRouteWithMask(hostRoute.ip, 32, config.gatewayIp)) {
                 removedCount++;
 
-                // Also remove from internal state
                 std::lock_guard<std::mutex> lock(routesMutex);
-                std::string routeKey = hostRoute.ip + "/32";
+                std::string routeKey = std::format("{}/32", hostRoute.ip);
                 routes.erase(routeKey);
                 routesDirty = true;
             }
@@ -374,62 +326,53 @@ void RouteController::RemoveRedundantSystemRoutes(
         }
     }
 
-    Logger::Instance().Info("Removed " + std::to_string(removedCount) +
-        " redundant routes, " + std::to_string(failedCount) + " failed");
+    Logger::Instance().Info(std::format("Removed {} redundant routes, {} failed",
+        removedCount, failedCount));
 
     if (removedCount > 0) {
         NotifyUIRouteCountChanged();
     }
 }
 
-// Новый метод для синхронизации с системной таблицей при запуске
 void RouteController::SyncWithSystemTable() {
     Logger::Instance().Info("Syncing with system routing table");
 
-    // Получаем все маршруты из системы для нашего gateway
     auto systemRoutes = GetSystemRoutesForGateway();
 
-    // Создаем набор ключей системных маршрутов
     std::unordered_set<std::string> systemRouteKeys;
     for (const auto& route : systemRoutes) {
-        std::string key = route.ipString + "/" + std::to_string(route.prefixLength);
+        std::string key = std::format("{}/{}", route.ipString, route.prefixLength);
         systemRouteKeys.insert(key);
     }
 
-    // Проверяем наши сохраненные маршруты
     std::vector<std::string> toRemove;
     {
         std::lock_guard<std::mutex> lock(routesMutex);
 
-        for (const auto& routePair : routes) {
-            const std::string& routeKey = routePair.first;
-            // Если маршрут есть у нас, но нет в системе
-            if (systemRouteKeys.find(routeKey) == systemRouteKeys.end()) {
-                Logger::Instance().Warning("Route " + routeKey +
-                    " exists in state but not in system, marking for removal");
+        for (const auto& [routeKey, routeInfo] : routes) {
+            if (!systemRouteKeys.contains(routeKey)) {
+                Logger::Instance().Warning(std::format("Route {} exists in state but not in system, marking for removal",
+                    routeKey));
                 toRemove.push_back(routeKey);
             }
         }
 
-        // Удаляем несуществующие маршруты из нашего состояния
         for (const auto& key : toRemove) {
             routes.erase(key);
         }
     }
 
-    // Добавляем системные маршруты, которых нет в нашем состоянии
     int addedCount = 0;
     for (const auto& sysRoute : systemRoutes) {
-        std::string key = sysRoute.ipString + "/" + std::to_string(sysRoute.prefixLength);
+        std::string key = std::format("{}/{}", sysRoute.ipString, sysRoute.prefixLength);
 
         std::lock_guard<std::mutex> lock(routesMutex);
-        if (routes.find(key) == routes.end()) {
-            // Этот маршрут есть в системе, но нет у нас
+        if (!routes.contains(key)) {
             auto route = std::make_unique<RouteInfo>();
             route->ip = sysRoute.ipString;
             route->prefixLength = sysRoute.prefixLength;
             route->refCount = 1;
-            route->processName = "System";  // Неизвестный источник
+            route->processName = "System";
             route->createdAt = std::chrono::system_clock::now();
 
             routes[key] = std::move(route);
@@ -437,31 +380,24 @@ void RouteController::SyncWithSystemTable() {
         }
     }
 
-    Logger::Instance().Info("Sync completed: removed " + std::to_string(toRemove.size()) +
-        " orphaned routes, added " + std::to_string(addedCount) + " system routes");
+    Logger::Instance().Info(std::format("Sync completed: removed {} orphaned routes, added {} system routes",
+        toRemove.size(), addedCount));
 
     if (!toRemove.empty() || addedCount > 0) {
         routesDirty = true;
     }
 }
 
-// Новый метод для выполнения полной очистки
 void RouteController::PerformFullCleanup() {
     Logger::Instance().Info("Starting smart route cleanup");
 
-    // Сначала синхронизируемся с системой
     SyncWithSystemTable();
-
-    // Затем запускаем оптимизацию
     RunOptimization();
-
-    // Обновляем статистику
     SaveRoutesToDisk();
 
     Logger::Instance().Info("Smart cleanup completed");
 }
 
-// Новый метод для очистки только избыточных маршрутов
 void RouteController::CleanupRedundantRoutes() {
     Logger::Instance().Info("CleanupRedundantRoutes - Starting cleanup of redundant routes only");
 
@@ -470,7 +406,6 @@ void RouteController::CleanupRedundantRoutes() {
     std::vector<HostRoute> hostRoutes;
     std::vector<SystemRoute> aggregatedRoutes;
 
-    // Разделяем маршруты
     for (const auto& route : systemRoutes) {
         if (route.prefixLength == 32) {
             HostRoute hr;
@@ -484,7 +419,6 @@ void RouteController::CleanupRedundantRoutes() {
         }
     }
 
-    // Удаляем только покрытые маршруты
     RemoveRedundantSystemRoutes(hostRoutes, aggregatedRoutes);
 
     Logger::Instance().Info("CleanupRedundantRoutes - Completed");
@@ -493,9 +427,8 @@ void RouteController::CleanupRedundantRoutes() {
 void RouteController::ApplyOptimizationPlan(const OptimizationPlan& plan) {
     std::vector<std::pair<std::string, int>> toRemove;
     std::vector<std::pair<std::string, int>> toAdd;
-    std::vector<std::pair<std::string, int>> addedRoutes; // For rollback
+    std::vector<std::pair<std::string, int>> addedRoutes;
 
-    // Separate adds and removes
     for (const auto& change : plan.changes) {
         if (change.type == OptimizationPlan::RouteChange::ADD) {
             toAdd.emplace_back(change.ip, change.prefixLength);
@@ -505,60 +438,47 @@ void RouteController::ApplyOptimizationPlan(const OptimizationPlan& plan) {
         }
     }
 
-    // First add new aggregated routes
     bool addFailed = false;
-    for (const auto& routeToAdd : toAdd) {
-        const std::string& ip = routeToAdd.first;
-        int prefix = routeToAdd.second;
-
+    for (const auto& [ip, prefix] : toAdd) {
         if (AddSystemRouteWithMask(ip, prefix)) {
-            addedRoutes.push_back({ ip, prefix });
+            addedRoutes.emplace_back(ip, prefix);
         }
         else {
-            Logger::Instance().Error("Failed to add aggregated route: " + ip + "/" + std::to_string(prefix));
+            Logger::Instance().Error(std::format("Failed to add aggregated route: {}/{}", ip, prefix));
             addFailed = true;
             break;
         }
     }
 
-    // If any add failed, rollback
     if (addFailed) {
         Logger::Instance().Warning("Rolling back optimization due to add failure");
-        for (const auto& routeToRollback : addedRoutes) {
-            RemoveSystemRouteWithMask(routeToRollback.first, routeToRollback.second, config.gatewayIp);
+        for (const auto& [ip, prefix] : addedRoutes) {
+            RemoveSystemRouteWithMask(ip, prefix, config.gatewayIp);
         }
         return;
     }
 
-    // Then remove old host routes
-    for (const auto& routeToRemove : toRemove) {
-        const std::string& ip = routeToRemove.first;
-        int prefix = routeToRemove.second;
-
+    for (const auto& [ip, prefix] : toRemove) {
         if (!RemoveSystemRouteWithMask(ip, prefix, config.gatewayIp)) {
-            Logger::Instance().Warning("Failed to remove host route: " + ip + "/" + std::to_string(prefix));
-            // Continue anyway - having extra routes is better than missing routes
+            Logger::Instance().Warning(std::format("Failed to remove host route: {}/{}", ip, prefix));
         }
     }
 
-    // Update internal map only after successful system changes
     {
         std::lock_guard<std::mutex> lock(routesMutex);
 
-        // Add new routes
         for (const auto& change : plan.changes) {
             if (change.type == OptimizationPlan::RouteChange::ADD) {
-                std::string routeKey = change.ip + "/" + std::to_string(change.prefixLength);
+                std::string routeKey = std::format("{}/{}", change.ip, change.prefixLength);
                 auto routeInfo = std::make_unique<RouteInfo>(change.ip, "Optimized");
                 routeInfo->prefixLength = change.prefixLength;
                 routes[routeKey] = std::move(routeInfo);
             }
         }
 
-        // Remove old routes
         for (const auto& change : plan.changes) {
             if (change.type == OptimizationPlan::RouteChange::REMOVE) {
-                std::string routeKey = change.ip + "/" + std::to_string(change.prefixLength);
+                std::string routeKey = std::format("{}/{}", change.ip, change.prefixLength);
                 routes.erase(routeKey);
             }
         }
@@ -566,16 +486,13 @@ void RouteController::ApplyOptimizationPlan(const OptimizationPlan& plan) {
         routesDirty = true;
     }
 
-    // Notify UI about route count change
     NotifyUIRouteCountChanged();
 }
 
 void RouteController::NotifyUIRouteCountChanged() {
-    // Send a custom message to UI window if available
-    // This is a simplified version - in production you'd use proper IPC
     HWND uiWindow = FindWindow(L"RouteManagerProWindow", nullptr);
     if (uiWindow) {
-        PostMessage(uiWindow, WM_USER + 101, 0, 0); // Custom message for route count update
+        PostMessage(uiWindow, WM_USER + 101, 0, 0);
     }
 }
 
@@ -600,7 +517,6 @@ void RouteController::UpdateConfig(const ServiceConfig& newConfig) {
     std::string oldGateway = config.gatewayIp;
     config = newConfig;
 
-    // Update optimizer config
     if (optimizer) {
         OptimizerConfig optConfig;
         optConfig.min_hosts_to_aggregate = config.optimizerSettings.minHostsToAggregate;
@@ -609,7 +525,7 @@ void RouteController::UpdateConfig(const ServiceConfig& newConfig) {
     }
 
     if (gatewayChanged) {
-        Logger::Instance().Info("Gateway changed from " + oldGateway + " to " + config.gatewayIp);
+        Logger::Instance().Info(std::format("Gateway changed from {} to {}", oldGateway, config.gatewayIp));
         InvalidateInterfaceCache();
         MigrateExistingRoutes(oldGateway, config.gatewayIp);
     }
@@ -621,20 +537,17 @@ void RouteController::UpdateConfig(const ServiceConfig& newConfig) {
 
 void RouteController::MigrateExistingRoutes(const std::string& oldGateway, const std::string& newGateway) {
     std::vector<std::pair<std::string, int>> routesToMigrate;
-    for (const auto& routePair : routes) {
-        routesToMigrate.emplace_back(routePair.second->ip, routePair.second->prefixLength);
+    for (const auto& [key, routeInfo] : routes) {
+        routesToMigrate.emplace_back(routeInfo->ip, routeInfo->prefixLength);
     }
 
-    Logger::Instance().Info("Migrating " + std::to_string(routesToMigrate.size()) + " routes from gateway " +
-        oldGateway + " to " + newGateway);
+    Logger::Instance().Info(std::format("Migrating {} routes from gateway {} to {}",
+        routesToMigrate.size(), oldGateway, newGateway));
 
     int successCount = 0;
     int failCount = 0;
 
-    for (const auto& routeInfo : routesToMigrate) {
-        const std::string& ip = routeInfo.first;
-        int prefix = routeInfo.second;
-
+    for (const auto& [ip, prefix] : routesToMigrate) {
         RemoveSystemRouteWithMask(ip, prefix, oldGateway);
 
         if (AddSystemRouteWithMask(ip, prefix)) {
@@ -642,12 +555,12 @@ void RouteController::MigrateExistingRoutes(const std::string& oldGateway, const
         }
         else {
             failCount++;
-            Logger::Instance().Error("Failed to migrate route: " + ip + "/" + std::to_string(prefix));
+            Logger::Instance().Error(std::format("Failed to migrate route: {}/{}", ip, prefix));
         }
     }
 
-    Logger::Instance().Info("Migration complete. Success: " + std::to_string(successCount) +
-        ", Failed: " + std::to_string(failCount));
+    Logger::Instance().Info(std::format("Migration complete. Success: {}, Failed: {}",
+        successCount, failCount));
 }
 
 void RouteController::PersistenceThreadFunc() {
@@ -678,7 +591,7 @@ void RouteController::PersistenceThreadFunc() {
         }
     }
     catch (const std::exception& e) {
-        Logger::Instance().Error("PersistenceThreadFunc exception: " + std::string(e.what()));
+        Logger::Instance().Error(std::format("PersistenceThreadFunc exception: {}", e.what()));
     }
 
     Logger::Instance().Info("RouteController persistence thread exiting");
@@ -688,8 +601,8 @@ void RouteController::SaveRoutesToDiskAsync() {
     std::vector<std::pair<std::string, RouteInfo>> snapshot;
     {
         std::lock_guard<std::mutex> lock(routesMutex);
-        for (const auto& routePair : routes) {
-            snapshot.emplace_back(routePair.first, *routePair.second);
+        for (const auto& [key, routeInfo] : routes) {
+            snapshot.emplace_back(key, *routeInfo);
         }
     }
 
@@ -703,18 +616,15 @@ void RouteController::SaveRoutesToDiskAsync() {
 
     auto now = std::chrono::system_clock::now();
     auto nowSeconds = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
-    file << "timestamp=" << nowSeconds << "\n";
-    file << "gateway=" << config.gatewayIp << "\n";
+    file << std::format("timestamp={}\n", nowSeconds);
+    file << std::format("gateway={}\n", config.gatewayIp);
 
-    for (const auto& routePair : snapshot) {
-        const std::string& routeKey = routePair.first;
-        const RouteInfo& route = routePair.second;
-
+    for (const auto& [routeKey, route] : snapshot) {
         auto createdSeconds = std::chrono::duration_cast<std::chrono::seconds>(
             route.createdAt.time_since_epoch()).count();
 
-        file << "route=" << route.ip << "," << route.processName << ","
-            << createdSeconds << "," << route.prefixLength << "," << config.gatewayIp << "\n";
+        file << std::format("route={},{},{},{},{}\n",
+            route.ip, route.processName, createdSeconds, route.prefixLength, config.gatewayIp);
     }
 
     file.close();
@@ -726,7 +636,7 @@ void RouteController::SaveRoutesToDiskAsync() {
     routesDirty = false;
     lastSaveTime = std::chrono::steady_clock::now();
 
-    Logger::Instance().Info("Routes saved to disk: " + std::to_string(snapshot.size()) + " routes");
+    Logger::Instance().Info(std::format("Routes saved to disk: {} routes", snapshot.size()));
 }
 
 bool RouteController::AddRoute(const std::string& ip, const std::string& processName) {
@@ -736,21 +646,19 @@ bool RouteController::AddRoute(const std::string& ip, const std::string& process
 bool RouteController::AddRouteWithMask(const std::string& ip, int prefixLength, const std::string& processName) {
     if (!Utils::IsValidIPv4(ip)) return false;
 
-    // Skip private/local IPs
     if (Utils::IsPrivateIP(ip)) {
-        Logger::Instance().Debug("Skipping private IP: " + ip);
+        Logger::Instance().Debug(std::format("Skipping private IP: {}", ip));
         return false;
     }
 
     std::lock_guard<std::mutex> lock(routesMutex);
 
-    // Check if this IP is already covered by an existing aggregated route
     if (IsIPCoveredByExistingRoute(ip)) {
-        Logger::Instance().Info("IP " + ip + " is already covered by an aggregated route, skipping addition");
+        Logger::Instance().Info(std::format("IP {} is already covered by an aggregated route, skipping addition", ip));
         return true;
     }
 
-    std::string routeKey = ip + "/" + std::to_string(prefixLength);
+    std::string routeKey = std::format("{}/{}", ip, prefixLength);
 
     if (routes.size() >= Constants::MAX_ROUTES) {
         CleanupOldRoutes();
@@ -759,7 +667,8 @@ bool RouteController::AddRouteWithMask(const std::string& ip, int prefixLength, 
     auto it = routes.find(routeKey);
     if (it != routes.end()) {
         it->second->refCount++;
-        Logger::Instance().Info("Route already exists, incrementing ref count: " + routeKey + " (refs: " + std::to_string(it->second->refCount.load()) + ")");
+        Logger::Instance().Info(std::format("Route already exists, incrementing ref count: {} (refs: {})",
+            routeKey, it->second->refCount.load()));
         return true;
     }
 
@@ -767,10 +676,9 @@ bool RouteController::AddRouteWithMask(const std::string& ip, int prefixLength, 
         auto routeInfo = std::make_unique<RouteInfo>(ip, processName);
         routeInfo->prefixLength = prefixLength;
         routes[routeKey] = std::move(routeInfo);
-        Logger::Instance().Info("Added new route: " + routeKey + " for process: " + processName);
+        Logger::Instance().Info(std::format("Added new route: {} for process: {}", routeKey, processName));
         routesDirty = true;
 
-        // Notify UI to update route count
         NotifyUIRouteCountChanged();
         return true;
     }
@@ -785,17 +693,16 @@ bool RouteController::RemoveRoute(const std::string& ip) {
 bool RouteController::RemoveRouteWithMask(const std::string& ip, int prefixLength) {
     std::lock_guard<std::mutex> lock(routesMutex);
 
-    std::string routeKey = ip + "/" + std::to_string(prefixLength);
+    std::string routeKey = std::format("{}/{}", ip, prefixLength);
     auto it = routes.find(routeKey);
     if (it == routes.end()) return false;
 
     if (--it->second->refCount <= 0) {
         if (RemoveSystemRouteWithMask(ip, prefixLength, config.gatewayIp)) {
-            Logger::Instance().Info("Removed route: " + routeKey);
+            Logger::Instance().Info(std::format("Removed route: {}", routeKey));
             routes.erase(it);
             routesDirty = true;
 
-            // Notify UI to update route count
             NotifyUIRouteCountChanged();
             return true;
         }
@@ -816,11 +723,9 @@ void RouteController::CleanupAllRoutes() {
             return;
         }
 
-        for (const auto& routePair : routes) {
-            const std::string& routeKey = routePair.first;
-            const auto& route = routePair.second;
-            routesToDelete.emplace_back(route->ip, route->prefixLength);
-            if (route->processName.find("Preload-") == 0) {
+        for (const auto& [routeKey, routeInfo] : routes) {
+            routesToDelete.emplace_back(routeInfo->ip, routeInfo->prefixLength);
+            if (routeInfo->processName.starts_with("Preload-")) {
                 hadPreloadRoutes = true;
             }
         }
@@ -832,16 +737,13 @@ void RouteController::CleanupAllRoutes() {
     int successCount = 0;
     int failCount = 0;
 
-    for (const auto& routeInfo : routesToDelete) {
-        const std::string& ip = routeInfo.first;
-        int prefixLength = routeInfo.second;
-
-        Logger::Instance().Info("Removing Windows route for: " + ip + "/" + std::to_string(prefixLength));
+    for (const auto& [ip, prefixLength] : routesToDelete) {
+        Logger::Instance().Info(std::format("Removing Windows route for: {}/{}", ip, prefixLength));
         if (RemoveSystemRouteWithMask(ip, prefixLength, config.gatewayIp)) {
             successCount++;
         }
         else {
-            Logger::Instance().Error("Failed to remove Windows route for: " + ip + "/" + std::to_string(prefixLength));
+            Logger::Instance().Error(std::format("Failed to remove Windows route for: {}/{}", ip, prefixLength));
             failCount++;
         }
     }
@@ -854,8 +756,8 @@ void RouteController::CleanupAllRoutes() {
     SaveRoutesToDisk();
     NotifyUIRouteCountChanged();
 
-    Logger::Instance().Info("CleanupAllRoutes - Completed. Removed: " + std::to_string(successCount) +
-        ", Failed: " + std::to_string(failCount));
+    Logger::Instance().Info(std::format("CleanupAllRoutes - Completed. Removed: {}, Failed: {}",
+        successCount, failCount));
 }
 
 void RouteController::CleanupOldRoutes() {
@@ -889,13 +791,12 @@ std::vector<RouteInfo> RouteController::GetActiveRoutes() const {
     std::lock_guard<std::mutex> lock(routesMutex);
     std::vector<RouteInfo> result;
 
-    for (const auto& routePair : routes) {
-        result.push_back(*routePair.second);
+    for (const auto& [key, routeInfo] : routes) {
+        result.push_back(*routeInfo);
     }
 
-    std::sort(result.begin(), result.end(),
-        [](const RouteInfo& a, const RouteInfo& b) {
-            return a.createdAt > b.createdAt;
+    std::ranges::sort(result, [](const RouteInfo& a, const RouteInfo& b) {
+        return a.createdAt > b.createdAt;
         });
 
     return result;
@@ -904,17 +805,14 @@ std::vector<RouteInfo> RouteController::GetActiveRoutes() const {
 bool RouteController::IsIPCoveredByExistingRoute(const std::string& ip) {
     uint32_t ipAddr = IPToUInt(ip);
 
-    for (const auto& routePair : routes) {
-        const std::string& routeKey = routePair.first;
-        const auto& route = routePair.second;
+    for (const auto& [routeKey, routeInfo] : routes) {
+        if (routeInfo->prefixLength >= 32) continue;
 
-        if (route->prefixLength >= 32) continue;
-
-        uint32_t routeAddr = IPToUInt(route->ip);
-        uint32_t mask = CreateMask(route->prefixLength);
+        uint32_t routeAddr = IPToUInt(routeInfo->ip);
+        uint32_t mask = CreateMask(routeInfo->prefixLength);
 
         if ((ipAddr & mask) == (routeAddr & mask)) {
-            Logger::Instance().Debug("IP " + ip + " is covered by route " + routeKey);
+            Logger::Instance().Debug(std::format("IP {} is covered by route {}", ip, routeKey));
             return true;
         }
     }
@@ -949,13 +847,13 @@ bool RouteController::AddSystemRouteWithMask(const std::string& ip, int prefixLe
 
     destAddr.si_family = AF_INET;
     if (inet_pton(AF_INET, ip.c_str(), &destAddr.Ipv4.sin_addr) != 1) {
-        Logger::Instance().Error("Invalid destination IP: " + ip);
+        Logger::Instance().Error(std::format("Invalid destination IP: {}", ip));
         return false;
     }
 
     nextHop.si_family = AF_INET;
     if (inet_pton(AF_INET, config.gatewayIp.c_str(), &nextHop.Ipv4.sin_addr) != 1) {
-        Logger::Instance().Error("Invalid gateway IP: " + config.gatewayIp);
+        Logger::Instance().Error(std::format("Invalid gateway IP: {}", config.gatewayIp));
         return false;
     }
 
@@ -970,7 +868,7 @@ bool RouteController::AddSystemRouteWithMask(const std::string& ip, int prefixLe
     if (bestInterface == 0) {
         DWORD result = GetBestInterface(nextHop.Ipv4.sin_addr.s_addr, &bestInterface);
         if (result != NO_ERROR) {
-            Logger::Instance().Error("GetBestInterface failed: " + std::to_string(result));
+            Logger::Instance().Error(std::format("GetBestInterface failed: {}", result));
             return false;
         }
         std::lock_guard<std::mutex> lock(interfaceCacheMutex);
@@ -984,22 +882,22 @@ bool RouteController::AddSystemRouteWithMask(const std::string& ip, int prefixLe
     route.Protocol = MIB_IPPROTO_NETMGMT;
     route.Metric = config.metric;
 
-    Logger::Instance().Debug("Adding route via CreateIpForwardEntry2: " + ip + "/" + std::to_string(prefixLength) +
-        " -> " + config.gatewayIp +
-        " (interface: " + std::to_string(bestInterface) + ")");
+    Logger::Instance().Debug(std::format("Adding route via CreateIpForwardEntry2: {}/{} -> {} (interface: {})",
+        ip, prefixLength, config.gatewayIp, bestInterface));
 
     DWORD result = CreateIpForwardEntry2(&route);
 
     if (result == NO_ERROR) {
-        Logger::Instance().Info("Successfully added route: " + ip + "/" + std::to_string(prefixLength) + " -> " + config.gatewayIp);
+        Logger::Instance().Info(std::format("Successfully added route: {}/{} -> {}",
+            ip, prefixLength, config.gatewayIp));
         return true;
     }
     else if (result == ERROR_OBJECT_ALREADY_EXISTS) {
-        Logger::Instance().Debug("Route already exists: " + ip + "/" + std::to_string(prefixLength));
+        Logger::Instance().Debug(std::format("Route already exists: {}/{}", ip, prefixLength));
         return true;
     }
     else {
-        Logger::Instance().Error("CreateIpForwardEntry2 failed: " + std::to_string(result));
+        Logger::Instance().Error(std::format("CreateIpForwardEntry2 failed: {}", result));
 
         if (result == ERROR_NOT_FOUND || result == ERROR_INVALID_FUNCTION) {
             return AddSystemRouteOldAPIWithMask(ip, prefixLength);
@@ -1020,7 +918,7 @@ bool RouteController::AddSystemRouteOldAPIWithMask(const std::string& ip, int pr
 
     route.dwForwardDest = inet_addr(ip.c_str());
     if (route.dwForwardDest == INADDR_NONE) {
-        Logger::Instance().Error("Invalid IP address: " + ip);
+        Logger::Instance().Error(std::format("Invalid IP address: {}", ip));
         return false;
     }
 
@@ -1031,14 +929,14 @@ bool RouteController::AddSystemRouteOldAPIWithMask(const std::string& ip, int pr
     route.dwForwardNextHop = inet_addr(config.gatewayIp.c_str());
 
     if (route.dwForwardNextHop == INADDR_NONE) {
-        Logger::Instance().Error("Invalid gateway IP: " + config.gatewayIp);
+        Logger::Instance().Error(std::format("Invalid gateway IP: {}", config.gatewayIp));
         return false;
     }
 
     DWORD bestInterface = 0;
     DWORD result = GetBestInterface(route.dwForwardNextHop, &bestInterface);
     if (result != NO_ERROR) {
-        Logger::Instance().Error("GetBestInterface failed: " + std::to_string(result));
+        Logger::Instance().Error(std::format("GetBestInterface failed: {}", result));
         return false;
     }
 
@@ -1053,12 +951,11 @@ bool RouteController::AddSystemRouteOldAPIWithMask(const std::string& ip, int pr
     result = GetIpInterfaceEntry(&iface);
     if (result == NO_ERROR) {
         minMetric = iface.Metric + config.metric;
-        Logger::Instance().Info("Interface metric: " + std::to_string(iface.Metric) +
-            ", using route metric: " + std::to_string(minMetric));
+        Logger::Instance().Info(std::format("Interface metric: {}, using route metric: {}",
+            iface.Metric, minMetric));
     }
     else {
-        Logger::Instance().Warning("GetIpInterfaceEntry failed: " + std::to_string(result) +
-            ", using default metric");
+        Logger::Instance().Warning(std::format("GetIpInterfaceEntry failed: {}, using default metric", result));
     }
 
     route.dwForwardType = 4;
@@ -1074,15 +971,15 @@ bool RouteController::AddSystemRouteOldAPIWithMask(const std::string& ip, int pr
     result = CreateIpForwardEntry(&route);
 
     if (result == NO_ERROR) {
-        Logger::Instance().Info("Successfully added route via old API: " + ip + "/" + std::to_string(prefixLength));
+        Logger::Instance().Info(std::format("Successfully added route via old API: {}/{}", ip, prefixLength));
         return true;
     }
     else if (result == ERROR_OBJECT_ALREADY_EXISTS) {
-        Logger::Instance().Debug("Route already exists: " + ip + "/" + std::to_string(prefixLength));
+        Logger::Instance().Debug(std::format("Route already exists: {}/{}", ip, prefixLength));
         return true;
     }
     else {
-        Logger::Instance().Error("CreateIpForwardEntry failed: " + std::to_string(result));
+        Logger::Instance().Error(std::format("CreateIpForwardEntry failed: {}", result));
         return false;
     }
 }
@@ -1097,7 +994,7 @@ bool RouteController::RemoveSystemRouteWithMask(const std::string& ip, int prefi
 
     route.dwForwardDest = inet_addr(ip.c_str());
     if (route.dwForwardDest == INADDR_NONE) {
-        Logger::Instance().Error("Invalid IP address: " + ip);
+        Logger::Instance().Error(std::format("Invalid IP address: {}", ip));
         return false;
     }
 
@@ -1114,15 +1011,16 @@ bool RouteController::RemoveSystemRouteWithMask(const std::string& ip, int prefi
     DWORD result = DeleteIpForwardEntry(&route);
 
     if (result == NO_ERROR) {
-        Logger::Instance().Debug("Successfully removed route via API: " + ip + "/" + std::to_string(prefixLength));
+        Logger::Instance().Debug(std::format("Successfully removed route via API: {}/{}", ip, prefixLength));
         return true;
     }
     else if (result == ERROR_NOT_FOUND) {
-        Logger::Instance().Debug("Route not found: " + ip + "/" + std::to_string(prefixLength));
+        Logger::Instance().Debug(std::format("Route not found: {}/{}", ip, prefixLength));
         return true;
     }
     else {
-        Logger::Instance().Error("Failed to remove route via API: " + ip + "/" + std::to_string(prefixLength) + ", error: " + std::to_string(result));
+        Logger::Instance().Error(std::format("Failed to remove route via API: {}/{}, error: {}",
+            ip, prefixLength, result));
         return false;
     }
 }
@@ -1153,15 +1051,12 @@ void RouteController::VerifyRoutesThreadFunc() {
                     break;
                 }
 
-                for (const auto& routePair : routes) {
-                    routesToVerify.emplace_back(routePair.second->ip, routePair.second->prefixLength);
+                for (const auto& [key, routeInfo] : routes) {
+                    routesToVerify.emplace_back(routeInfo->ip, routeInfo->prefixLength);
                 }
             }
 
-            for (const auto& routeInfo : routesToVerify) {
-                const std::string& ip = routeInfo.first;
-                int prefixLength = routeInfo.second;
-
+            for (const auto& [ip, prefixLength] : routesToVerify) {
                 if (!running.load() || ShutdownCoordinator::Instance().isShuttingDown) {
                     Logger::Instance().Info("Route verification interrupted by shutdown");
                     break;
@@ -1172,7 +1067,7 @@ void RouteController::VerifyRoutesThreadFunc() {
         }
     }
     catch (const std::exception& e) {
-        Logger::Instance().Error("VerifyRoutesThreadFunc exception: " + std::string(e.what()));
+        Logger::Instance().Error(std::format("VerifyRoutesThreadFunc exception: {}", e.what()));
     }
 
     Logger::Instance().Info("RouteController verify thread exiting");
@@ -1188,16 +1083,16 @@ void RouteController::SaveRoutesToDisk() {
 
     auto now = std::chrono::system_clock::now();
     auto nowSeconds = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
-    file << "timestamp=" << nowSeconds << "\n";
-    file << "gateway=" << config.gatewayIp << "\n";
+    file << std::format("timestamp={}\n", nowSeconds);
+    file << std::format("gateway={}\n", config.gatewayIp);
 
-    for (const auto& routePair : routes) {
-        const auto& route = routePair.second;
+    for (const auto& [key, routeInfo] : routes) {
         auto createdSeconds = std::chrono::duration_cast<std::chrono::seconds>(
-            route->createdAt.time_since_epoch()).count();
+            routeInfo->createdAt.time_since_epoch()).count();
 
-        file << "route=" << route->ip << "," << route->processName << ","
-            << createdSeconds << "," << route->prefixLength << "," << config.gatewayIp << "\n";
+        file << std::format("route={},{},{},{},{}\n",
+            routeInfo->ip, routeInfo->processName, createdSeconds,
+            routeInfo->prefixLength, config.gatewayIp);
     }
 
     file.close();
@@ -1222,10 +1117,10 @@ void RouteController::LoadRoutesFromDisk() {
     std::string savedGateway;
 
     while (std::getline(file, line)) {
-        if (line.substr(0, 8) == "gateway=") {
+        if (line.starts_with("gateway=")) {
             savedGateway = line.substr(8);
         }
-        else if (line.substr(0, 6) == "route=") {
+        else if (line.starts_with("route=")) {
             std::string routeData = line.substr(6);
             auto parts = Utils::SplitString(routeData, ',');
             if (parts.size() >= 2) {
@@ -1233,7 +1128,7 @@ void RouteController::LoadRoutesFromDisk() {
                 std::string process = parts[1];
                 int prefixLength = 32;
 
-                if (process.find("Preload-") == 0) {
+                if (process.starts_with("Preload-")) {
                     skippedPreloadCount++;
                     continue;
                 }
@@ -1249,7 +1144,7 @@ void RouteController::LoadRoutesFromDisk() {
                         }
                     }
                     catch (...) {
-                        Logger::Instance().Warning("Failed to parse timestamp for route: " + ip);
+                        Logger::Instance().Warning(std::format("Failed to parse timestamp for route: {}", ip));
                     }
                 }
 
@@ -1258,7 +1153,7 @@ void RouteController::LoadRoutesFromDisk() {
                         prefixLength = std::stoi(parts[3]);
                     }
                     catch (...) {
-                        Logger::Instance().Warning("Failed to parse prefix length for route: " + ip);
+                        Logger::Instance().Warning(std::format("Failed to parse prefix length for route: {}", ip));
                     }
                 }
 
@@ -1268,7 +1163,7 @@ void RouteController::LoadRoutesFromDisk() {
                 }
 
                 if (AddSystemRouteWithMask(ip, prefixLength)) {
-                    std::string routeKey = ip + "/" + std::to_string(prefixLength);
+                    std::string routeKey = std::format("{}/{}", ip, prefixLength);
                     auto routeInfo = std::make_unique<RouteInfo>(ip, process);
                     routeInfo->prefixLength = prefixLength;
                     routeInfo->createdAt = createdAt;
@@ -1280,13 +1175,13 @@ void RouteController::LoadRoutesFromDisk() {
     }
 
     if (!savedGateway.empty() && savedGateway != config.gatewayIp) {
-        Logger::Instance().Warning("Gateway mismatch on startup. Saved: " + savedGateway +
-            ", Config: " + config.gatewayIp + ". Migrating routes.");
+        Logger::Instance().Warning(std::format("Gateway mismatch on startup. Saved: {}, Config: {}. Migrating routes.",
+            savedGateway, config.gatewayIp));
         MigrateExistingRoutes(savedGateway, config.gatewayIp);
     }
 
-    Logger::Instance().Info("LoadRoutesFromDisk - Loaded " + std::to_string(loadedCount) +
-        " routes, skipped " + std::to_string(skippedPreloadCount) + " preload routes");
+    Logger::Instance().Info(std::format("LoadRoutesFromDisk - Loaded {} routes, skipped {} preload routes",
+        loadedCount, skippedPreloadCount));
 
     routesDirty = false;
 }
@@ -1311,31 +1206,31 @@ void RouteController::PreloadAIRoutes() {
     int totalRoutes = 0;
     for (const auto& service : services) {
         if (!service.enabled) {
-            Logger::Instance().Info("Skipping disabled service: " + service.name);
+            Logger::Instance().Info(std::format("Skipping disabled service: {}", service.name));
             continue;
         }
 
-        Logger::Instance().Info("Processing " + service.name + " ranges");
+        Logger::Instance().Info(std::format("Processing {} ranges", service.name));
         for (const auto& range : service.ranges) {
-            if (range.find('/') != std::string::npos) {
+            if (range.contains('/')) {
                 if (AddCIDRRoute(range, service.name)) {
                     totalRoutes++;
                 }
             }
             else {
-                if (AddRoute(range, "Preload-" + service.name)) {
+                if (AddRoute(range, std::format("Preload-{}", service.name))) {
                     totalRoutes++;
                 }
             }
         }
     }
-    Logger::Instance().Info("PreloadRoutes - Completed, added " + std::to_string(totalRoutes) + " routes");
+    Logger::Instance().Info(std::format("PreloadRoutes - Completed, added {} routes", totalRoutes));
 }
 
 std::vector<RouteController::PreloadService> RouteController::LoadPreloadConfig() {
     std::vector<PreloadService> services;
 
-    std::string configPath = Utils::GetCurrentDirectory() + "\\preload_ips.json";
+    std::string configPath = std::format("{}\\preload_ips.json", Utils::GetCurrentDirectory());
 
     if (!Utils::FileExists(configPath)) {
         CreateDefaultPreloadConfig(configPath);
@@ -1343,7 +1238,7 @@ std::vector<RouteController::PreloadService> RouteController::LoadPreloadConfig(
 
     std::ifstream file(configPath);
     if (!file.is_open()) {
-        Logger::Instance().Error("Failed to open preload config: " + configPath);
+        Logger::Instance().Error(std::format("Failed to open preload config: {}", configPath));
         return GetDefaultPreloadServices();
     }
 
@@ -1352,7 +1247,7 @@ std::vector<RouteController::PreloadService> RouteController::LoadPreloadConfig(
     std::string errors;
 
     if (!Json::parseFromStream(builder, file, &root, &errors)) {
-        Logger::Instance().Error("Failed to parse preload config: " + errors);
+        Logger::Instance().Error(std::format("Failed to parse preload config: {}", errors));
         return GetDefaultPreloadServices();
     }
 
@@ -1379,12 +1274,12 @@ std::vector<RouteController::PreloadService> RouteController::LoadPreloadConfig(
         }
     }
 
-    Logger::Instance().Info("Loaded " + std::to_string(services.size()) + " services from preload config");
+    Logger::Instance().Info(std::format("Loaded {} services from preload config", services.size()));
     return services;
 }
 
 void RouteController::CreateDefaultPreloadConfig(const std::string& path) {
-    std::string sourceFile = Utils::GetCurrentDirectory() + "\\config\\preload_ips.json";
+    std::string sourceFile = std::format("{}\\config\\preload_ips.json", Utils::GetCurrentDirectory());
 
     if (Utils::FileExists(sourceFile)) {
         std::ifstream src(sourceFile, std::ios::binary);
@@ -1392,13 +1287,13 @@ void RouteController::CreateDefaultPreloadConfig(const std::string& path) {
             std::ofstream dst(path, std::ios::binary);
             if (dst.is_open()) {
                 dst << src.rdbuf();
-                Logger::Instance().Info("Copied default preload config from: " + sourceFile);
+                Logger::Instance().Info(std::format("Copied default preload config from: {}", sourceFile));
                 return;
             }
         }
     }
 
-    Logger::Instance().Warning("Could not copy default config from " + sourceFile + ", using fallback");
+    Logger::Instance().Warning(std::format("Could not copy default config from {}, using fallback", sourceFile));
 
     std::ofstream file(path);
     if (file.is_open()) {
@@ -1415,7 +1310,7 @@ void RouteController::CreateDefaultPreloadConfig(const std::string& path) {
   ]
 })";
         file.close();
-        Logger::Instance().Info("Created minimal fallback preload config: " + path);
+        Logger::Instance().Info(std::format("Created minimal fallback preload config: {}", path));
     }
 }
 
@@ -1432,7 +1327,7 @@ bool RouteController::AddCIDRRoute(const std::string& cidr, const std::string& s
     std::string baseIp = cidr.substr(0, slashPos);
     int prefixLen = std::stoi(cidr.substr(slashPos + 1));
 
-    Logger::Instance().Info("Adding CIDR route: " + cidr + " for " + service);
+    Logger::Instance().Info(std::format("Adding CIDR route: {} for {}", cidr, service));
 
-    return AddRouteWithMask(baseIp, prefixLen, "Preload-" + service);
+    return AddRouteWithMask(baseIp, prefixLen, std::format("Preload-{}", service));
 }

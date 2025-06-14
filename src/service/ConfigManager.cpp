@@ -9,11 +9,12 @@
 #include <chrono>
 #include <thread>
 #include <filesystem>
+#include <format>
 
 ConfigManager::ConfigManager() : configDirty(false),
 lastSaveTime(std::chrono::steady_clock::now()),
 persistThread(&ConfigManager::PersistenceThreadFunc, this) {
-    configPath = Utils::GetCurrentDirectory() + "\\" + Constants::CONFIG_FILE;
+    configPath = std::format("{}\\{}", Utils::GetCurrentDirectory(), Constants::CONFIG_FILE);
     LoadConfig();
 }
 
@@ -23,7 +24,6 @@ ConfigManager::~ConfigManager() {
         persistThread.join();
     }
 
-    // Final save on shutdown
     if (configDirty.load()) {
         Logger::Instance().Info("ConfigManager shutdown: Saving config to disk");
         SaveConfig();
@@ -35,7 +35,6 @@ void ConfigManager::PersistenceThreadFunc() {
 
     try {
         while (running.load() && !ShutdownCoordinator::Instance().isShuttingDown) {
-            // Check every 10 minutes for backup save
             for (int i = 0; i < 600 && running.load() && !ShutdownCoordinator::Instance().isShuttingDown; i++) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
@@ -44,16 +43,14 @@ void ConfigManager::PersistenceThreadFunc() {
                 break;
             }
 
-            // Periodic backup save (config is already saved on each change)
             Logger::Instance().Debug("ConfigManager: Periodic backup save");
             SaveConfig();
         }
     }
     catch (const std::exception& e) {
-        Logger::Instance().Error("ConfigManager::PersistenceThreadFunc exception: " + std::string(e.what()));
+        Logger::Instance().Error(std::format("ConfigManager::PersistenceThreadFunc exception: {}", e.what()));
     }
 
-    // Log AFTER all work is done, right before thread exits
     Logger::Instance().Info("ConfigManager persistence thread exiting");
 }
 
@@ -68,13 +65,12 @@ void ConfigManager::SetConfig(const ServiceConfig& newConfig) {
         config = newConfig;
     }
 
-    // Save immediately instead of marking dirty
     SaveConfig();
 
-    Logger::Instance().Info("ConfigManager::SetConfig - Updated " +
-        std::to_string(config.selectedProcesses.size()) + " selected processes (saved immediately)");
+    Logger::Instance().Info(std::format("ConfigManager::SetConfig - Updated {} selected processes (saved immediately)",
+        config.selectedProcesses.size()));
     for (const auto& proc : config.selectedProcesses) {
-        Logger::Instance().Debug("  - " + proc);
+        Logger::Instance().Debug(std::format("  - {}", proc));
     }
 }
 
@@ -84,7 +80,6 @@ void ConfigManager::SetAIPreloadEnabled(bool enabled) {
         config.aiPreloadEnabled = enabled;
     }
 
-    // Save immediately instead of marking dirty
     SaveConfig();
 }
 
@@ -92,13 +87,13 @@ void ConfigManager::LoadConfig() {
     if (!Utils::FileExists(configPath)) {
         Logger::Instance().Info("ConfigManager::LoadConfig - Config file not found, using defaults");
         config = GetDefaultConfig();
-        SaveConfig();  // Save defaults immediately
+        SaveConfig();
         return;
     }
 
     std::ifstream file(configPath);
     if (!file.is_open()) {
-        Logger::Instance().Error("ConfigManager::LoadConfig - Failed to open file: " + configPath);
+        Logger::Instance().Error(std::format("ConfigManager::LoadConfig - Failed to open file: {}", configPath));
         config = GetDefaultConfig();
         return;
     }
@@ -108,7 +103,7 @@ void ConfigManager::LoadConfig() {
     std::string errors;
 
     if (!Json::parseFromStream(builder, file, &root, &errors)) {
-        Logger::Instance().Error("ConfigManager::LoadConfig - Parse error: " + errors);
+        Logger::Instance().Error(std::format("ConfigManager::LoadConfig - Parse error: {}", errors));
         config = GetDefaultConfig();
         return;
     }
@@ -119,7 +114,6 @@ void ConfigManager::LoadConfig() {
     config.startWithWindows = root.get("startWithWindows", config.startWithWindows).asBool();
     config.aiPreloadEnabled = root.get("aiPreloadEnabled", config.aiPreloadEnabled).asBool();
 
-    // Load optimizer settings
     const Json::Value& optimizer = root["optimizerSettings"];
     if (optimizer.isObject()) {
         config.optimizerSettings.minHostsToAggregate =
@@ -147,29 +141,27 @@ void ConfigManager::LoadConfig() {
             config.selectedProcesses.push_back(process.asString());
         }
 
-        Logger::Instance().Info("ConfigManager::LoadConfig - Loaded " +
-            std::to_string(config.selectedProcesses.size()) + " selected processes");
+        Logger::Instance().Info(std::format("ConfigManager::LoadConfig - Loaded {} selected processes",
+            config.selectedProcesses.size()));
         for (const auto& proc : config.selectedProcesses) {
-            Logger::Instance().Debug("  - " + proc);
+            Logger::Instance().Debug(std::format("  - {}", proc));
         }
     }
 
     file.close();
-    configDirty = false;  // Reset dirty flag after loading
+    configDirty = false;
 }
 
 void ConfigManager::SaveConfig() {
-    Logger::Instance().Info("ConfigManager::SaveConfig - Saving configuration with " +
-        std::to_string(config.selectedProcesses.size()) + " selected processes");
+    Logger::Instance().Info(std::format("ConfigManager::SaveConfig - Saving configuration with {} selected processes",
+        config.selectedProcesses.size()));
 
-    // Create a copy of config under lock
     ServiceConfig configCopy;
     {
         std::lock_guard<std::mutex> lock(configMutex);
         configCopy = config;
     }
 
-    // Save without holding the lock
     Json::Value root;
     root["gatewayIp"] = configCopy.gatewayIp;
     root["metric"] = configCopy.metric;
@@ -177,7 +169,6 @@ void ConfigManager::SaveConfig() {
     root["startWithWindows"] = configCopy.startWithWindows;
     root["aiPreloadEnabled"] = configCopy.aiPreloadEnabled;
 
-    // Save optimizer settings
     Json::Value optimizer;
     optimizer["minHostsToAggregate"] = configCopy.optimizerSettings.minHostsToAggregate;
 
@@ -191,13 +182,13 @@ void ConfigManager::SaveConfig() {
     Json::Value processes(Json::arrayValue);
     for (const auto& process : configCopy.selectedProcesses) {
         processes.append(process);
-        Logger::Instance().Debug("  Saving process: " + process);
+        Logger::Instance().Debug(std::format("  Saving process: {}", process));
     }
     root["selectedProcesses"] = processes;
 
     std::ofstream file(configPath + ".tmp");
     if (!file.is_open()) {
-        Logger::Instance().Error("ConfigManager::SaveConfig - Failed to open file: " + configPath + ".tmp");
+        Logger::Instance().Error(std::format("ConfigManager::SaveConfig - Failed to open file: {}.tmp", configPath));
         return;
     }
 
@@ -207,7 +198,6 @@ void ConfigManager::SaveConfig() {
     writer->write(root, &file);
     file.close();
 
-    // Atomic rename
     if (std::filesystem::exists(configPath + ".tmp")) {
         std::filesystem::rename(configPath + ".tmp", configPath);
     }
@@ -215,7 +205,7 @@ void ConfigManager::SaveConfig() {
     configDirty = false;
     lastSaveTime = std::chrono::steady_clock::now();
 
-    Logger::Instance().Debug("ConfigManager::SaveConfig - Saved to " + configPath);
+    Logger::Instance().Debug(std::format("ConfigManager::SaveConfig - Saved to {}", configPath));
 }
 
 ServiceConfig ConfigManager::GetDefaultConfig() {
@@ -223,6 +213,5 @@ ServiceConfig ConfigManager::GetDefaultConfig() {
     defaultConfig.selectedProcesses = {
         "Discord.exe"
     };
-    // Optimizer settings are already initialized with defaults in Models.h
     return defaultConfig;
 }

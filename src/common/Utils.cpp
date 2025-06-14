@@ -1,42 +1,48 @@
 // src/common/Utils.cpp
 #include "Utils.h"
 #include <regex>
-#include <sstream>
-#include <iomanip>
+#include <format>
 #include <tlhelp32.h>
 #include <windows.h>
 #include <io.h>
 #include <direct.h>
+#include <algorithm>
+#include <ranges>
+#include <sstream>
 
 bool Utils::IsValidIPv4(const std::string& ip) {
-    std::regex ipPattern("^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$");
+    static const std::regex ipPattern(R"(^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$)");
     return std::regex_match(ip, ipPattern);
 }
 
 bool Utils::IsPrivateIP(const std::string& ip) {
-    if (ip.substr(0, 3) == "10.") return true;
-    if (ip.substr(0, 8) == "192.168.") return true;
-    if (ip.substr(0, 4) == "172.") {
+    if (ip.starts_with("10.")) return true;
+    if (ip.starts_with("192.168.")) return true;
+    if (ip.starts_with("172.")) {
         int second = std::stoi(ip.substr(4, ip.find('.', 4) - 4));
         return second >= 16 && second <= 31;
     }
-    if (ip.substr(0, 4) == "127.") return true;
+    if (ip.starts_with("127.")) return true;
     return false;
 }
 
 std::string Utils::WStringToString(const std::wstring& wstr) {
     if (wstr.empty()) return std::string();
-    int size = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), nullptr, 0, nullptr, nullptr);
+
+    int size = WideCharToMultiByte(CP_UTF8, 0, wstr.data(), static_cast<int>(wstr.size()),
+        nullptr, 0, nullptr, nullptr);
     std::string result(size, 0);
-    WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &result[0], size, nullptr, nullptr);
+    WideCharToMultiByte(CP_UTF8, 0, wstr.data(), static_cast<int>(wstr.size()),
+        result.data(), size, nullptr, nullptr);
     return result;
 }
 
 std::wstring Utils::StringToWString(const std::string& str) {
     if (str.empty()) return std::wstring();
-    int size = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), nullptr, 0);
+
+    int size = MultiByteToWideChar(CP_UTF8, 0, str.data(), static_cast<int>(str.size()), nullptr, 0);
     std::wstring result(size, 0);
-    MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), &result[0], size);
+    MultiByteToWideChar(CP_UTF8, 0, str.data(), static_cast<int>(str.size()), result.data(), size);
     return result;
 }
 
@@ -44,9 +50,11 @@ std::vector<std::string> Utils::SplitString(const std::string& str, char delimit
     std::vector<std::string> tokens;
     std::stringstream ss(str);
     std::string token;
+
     while (std::getline(ss, token, delimiter)) {
         tokens.push_back(token);
     }
+
     return tokens;
 }
 
@@ -55,11 +63,22 @@ std::string Utils::GetLastError() {
     if (error == 0) return std::string();
 
     LPWSTR buffer = nullptr;
-    size_t size = FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-        nullptr, error, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPWSTR)&buffer, 0, nullptr);
+    size_t size = FormatMessageW(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr, error, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        reinterpret_cast<LPWSTR>(&buffer), 0, nullptr);
+
+    if (size == 0) {
+        return std::format("Unknown error code: {}", error);
+    }
 
     std::wstring message(buffer, size);
     LocalFree(buffer);
+
+    // Remove trailing newlines
+    message.erase(std::remove_if(message.begin(), message.end(),
+        [](wchar_t c) { return c == L'\r' || c == L'\n'; }),
+        message.end());
 
     return WStringToString(message);
 }
@@ -101,67 +120,59 @@ bool Utils::EnableDebugPrivilege() {
         return false;
     }
 
+    bool result = (::GetLastError() == ERROR_SUCCESS);
     CloseHandle(token);
-    return true;
+    return result;
 }
 
 std::string Utils::GetProcessNameFromPath(const std::string& path) {
-    size_t lastSlash = path.find_last_of("\\/");
-    if (lastSlash != std::string::npos) {
-        return path.substr(lastSlash + 1);
-    }
-    return path;
+    auto lastSlash = path.find_last_of("\\/");
+    return (lastSlash != std::string::npos) ? path.substr(lastSlash + 1) : path;
 }
 
 bool Utils::IsGameProcess(const std::string& processName) {
     std::string lower = processName;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    std::ranges::transform(lower, lower.begin(), ::tolower);
 
-    std::vector<std::string> gameIndicators = {
+    static constexpr std::array gameIndicators = {
         "game", "steam", "epic", "origin", "battle.net", "riot", "uplay",
         "huntgame", "squadgame", "cs2", "valorant", "overwatch", "wow"
     };
 
-    for (const auto& indicator : gameIndicators) {
-        if (lower.find(indicator) != std::string::npos) {
-            return true;
-        }
-    }
-    return false;
+    return std::ranges::any_of(gameIndicators, [&lower](const auto& indicator) {
+        return lower.contains(indicator);
+        });
 }
 
 bool Utils::IsDiscordProcess(const std::string& processName) {
     std::string lower = processName;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-    return lower.find("discord") != std::string::npos;
+    std::ranges::transform(lower, lower.begin(), ::tolower);
+    return lower.contains("discord");
 }
 
 bool Utils::IsDevProcess(const std::string& processName) {
     std::string lower = processName;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    std::ranges::transform(lower, lower.begin(), ::tolower);
 
-    std::vector<std::string> devIndicators = {
+    static constexpr std::array devIndicators = {
         "code", "devenv", "pycharm", "idea", "git", "docker", "cursor",
         "visual studio", "jetbrains", "sublime", "atom", "brackets"
     };
 
-    for (const auto& indicator : devIndicators) {
-        if (lower.find(indicator) != std::string::npos) {
-            return true;
-        }
-    }
-    return false;
+    return std::ranges::any_of(devIndicators, [&lower](const auto& indicator) {
+        return lower.contains(indicator);
+        });
 }
 
 std::string Utils::GetCurrentDirectory() {
     char buffer[MAX_PATH];
-    GetModuleFileNameA(nullptr, buffer, MAX_PATH);
-    std::string path(buffer);
-    size_t lastSlash = path.find_last_of("\\/");
-    if (lastSlash != std::string::npos) {
-        return path.substr(0, lastSlash);
+    if (GetModuleFileNameA(nullptr, buffer, MAX_PATH) == 0) {
+        return ".";
     }
-    return ".";
+
+    std::string path(buffer);
+    auto lastSlash = path.find_last_of("\\/");
+    return (lastSlash != std::string::npos) ? path.substr(0, lastSlash) : ".";
 }
 
 bool Utils::FileExists(const std::string& path) {
@@ -196,7 +207,7 @@ DWORD Utils::GetProcessIdByName(const std::wstring& processName) {
 }
 
 std::string Utils::FormatBytes(size_t bytes) {
-    const char* units[] = { "B", "KB", "MB", "GB" };
+    static constexpr std::array units = { "B", "KB", "MB", "GB" };
     int unit = 0;
     double size = static_cast<double>(bytes);
 
@@ -205,9 +216,7 @@ std::string Utils::FormatBytes(size_t bytes) {
         unit++;
     }
 
-    std::stringstream ss;
-    ss << std::fixed << std::setprecision(2) << size << " " << units[unit];
-    return ss.str();
+    return std::format("{:.2f} {}", size, units[unit]);
 }
 
 std::string Utils::FormatDuration(std::chrono::seconds duration) {
@@ -215,9 +224,13 @@ std::string Utils::FormatDuration(std::chrono::seconds duration) {
     auto hours = (duration.count() % 86400) / 3600;
     auto minutes = (duration.count() % 3600) / 60;
 
-    std::stringstream ss;
-    if (days > 0) ss << days << "d ";
-    if (hours > 0) ss << hours << "h ";
-    ss << minutes << "m";
-    return ss.str();
+    if (days > 0) {
+        return std::format("{}d {}h {}m", days, hours, minutes);
+    }
+    else if (hours > 0) {
+        return std::format("{}h {}m", hours, minutes);
+    }
+    else {
+        return std::format("{}m", minutes);
+    }
 }

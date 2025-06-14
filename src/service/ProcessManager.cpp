@@ -7,7 +7,8 @@
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <algorithm>
-#include <sstream>
+#include <format>
+#include <ranges>
 
 ProcessManager::ProcessManager(const ServiceConfig& config, const PerformanceConfig& perfCfg)
     : running(true), perfConfig(perfCfg), m_pidMissCache(perfCfg.missCacheMaxSize) {
@@ -17,10 +18,10 @@ ProcessManager::ProcessManager(const ServiceConfig& config, const PerformanceCon
     selectedProcesses.clear();
     selectedProcesses.insert(config.selectedProcesses.begin(), config.selectedProcesses.end());
 
-    Logger::Instance().Info("ProcessManager initialized with " +
-        std::to_string(selectedProcesses.size()) + " selected processes:");
+    Logger::Instance().Info(std::format("ProcessManager initialized with {} selected processes:",
+        selectedProcesses.size()));
     for (const auto& proc : selectedProcesses) {
-        Logger::Instance().Info("  - " + proc);
+        Logger::Instance().Info(std::format("  - {}", proc));
     }
 
     updateThread = std::thread(&ProcessManager::UpdateThreadFunc, this);
@@ -37,7 +38,7 @@ ProcessManager::~ProcessManager() {
             Logger::Instance().Debug("ProcessManager::~ProcessManager - Update thread joined");
         }
         catch (const std::exception& e) {
-            Logger::Instance().Error("ProcessManager::~ProcessManager - Exception joining thread: " + std::string(e.what()));
+            Logger::Instance().Error(std::format("ProcessManager::~ProcessManager - Exception joining thread: {}", e.what()));
         }
     }
 }
@@ -65,8 +66,7 @@ std::optional<CachedProcessInfo> ProcessManager::GetCachedInfo(DWORD pid) {
     {
         std::shared_lock lock(cachesMutex);
 
-        auto it = m_pidCache.find(pid);
-        if (it != m_pidCache.end()) {
+        if (auto it = m_pidCache.find(pid); it != m_pidCache.end()) {
             stats.hits.fetch_add(1);
             return it->second;
         }
@@ -102,8 +102,7 @@ std::optional<CachedProcessInfo> ProcessManager::CheckProcessAndCache(DWORD pid)
 void ProcessManager::UpdateVerificationTime(DWORD pid) {
     std::unique_lock lock(cachesMutex);
 
-    auto it = m_pidCache.find(pid);
-    if (it != m_pidCache.end()) {
+    if (auto it = m_pidCache.find(pid); it != m_pidCache.end()) {
         it->second.lastVerified = std::chrono::steady_clock::now();
         stats.verificationChecks.fetch_add(1);
     }
@@ -113,7 +112,7 @@ void ProcessManager::AddToPidCache(DWORD pid, const CachedProcessInfo& info) {
     std::unique_lock lock(cachesMutex);
 
     if (m_pidCache.size() >= perfConfig.mainCacheMaxSize) {
-        Logger::Instance().Warning("Main cache full, not adding PID " + std::to_string(pid));
+        Logger::Instance().Warning(std::format("Main cache full, not adding PID {}", pid));
         return;
     }
 
@@ -132,18 +131,12 @@ bool ProcessManager::IsProcessSelected(const std::string& processName) const {
 bool ProcessManager::IsProcessSelectedInternal(const std::string& processName) const {
     std::lock_guard<std::mutex> lock(selectedMutex);
 
-    for (const auto& selected : selectedProcesses) {
-        if (selected.find('*') != std::string::npos) {
-            if (MatchesWildcard(processName, selected)) {
-                return true;
-            }
+    return std::ranges::any_of(selectedProcesses, [&processName, this](const auto& selected) {
+        if (selected.contains('*')) {
+            return MatchesWildcard(processName, selected);
         }
-        else if (_stricmp(processName.c_str(), selected.c_str()) == 0) {
-            return true;
-        }
-    }
-
-    return false;
+        return _stricmp(processName.c_str(), selected.c_str()) == 0;
+        });
 }
 
 void ProcessManager::SetSelectedProcesses(const std::vector<std::string>& processes) {
@@ -206,7 +199,7 @@ void ProcessManager::UpdateThreadFunc() {
             LogPerformanceStats();
         }
         catch (const std::exception& e) {
-            Logger::Instance().Error("ProcessManager::UpdateThreadFunc - Exception: " + std::string(e.what()));
+            Logger::Instance().Error(std::format("ProcessManager::UpdateThreadFunc - Exception: {}", e.what()));
         }
     }
 
@@ -275,7 +268,7 @@ std::optional<CachedProcessInfo> ProcessManager::GetCompleteProcessInfo(DWORD pi
 
 void ProcessManager::MergeMissCacheIntoMain(std::unordered_map<DWORD, CachedProcessInfo>& mainCache) {
     m_pidMissCache.forEach([&](DWORD pid, const CachedProcessInfo& cachedInfo) {
-        if (mainCache.find(pid) == mainCache.end()) {
+        if (!mainCache.contains(pid)) {
             auto currentInfo = GetCompleteProcessInfo(pid);
             if (currentInfo.has_value()) {
                 mainCache[pid] = *currentInfo;
@@ -297,23 +290,20 @@ void ProcessManager::LogPerformanceStats() const {
 
     if (hits + misses == 0) return;
 
-    double hitRate = hits / (double)(hits + misses) * 100;
+    double hitRate = hits / static_cast<double>(hits + misses) * 100;
 
-    Logger::Instance().Info(
-        "ProcessManager Cache: " + std::to_string(hits) + " hits, " +
-        std::to_string(misses) + " misses (" +
-        std::to_string(hitRate) + "% hit rate), " +
-        std::to_string(verifications) + " verifications, " +
-        std::to_string(newChecks) + " new process checks"
-    );
+    Logger::Instance().Info(std::format(
+        "ProcessManager Cache: {} hits, {} misses ({:.1f}% hit rate), {} verifications, {} new process checks",
+        hits, misses, hitRate, verifications, newChecks
+    ));
 }
 
 bool ProcessManager::MatchesWildcard(const std::string& processName, const std::string& pattern) const {
     std::string lowerProcess = processName;
     std::string lowerPattern = pattern;
 
-    std::transform(lowerProcess.begin(), lowerProcess.end(), lowerProcess.begin(), ::tolower);
-    std::transform(lowerPattern.begin(), lowerPattern.end(), lowerPattern.begin(), ::tolower);
+    std::ranges::transform(lowerProcess, lowerProcess.begin(), ::tolower);
+    std::ranges::transform(lowerPattern, lowerPattern.begin(), ::tolower);
 
     size_t patternPos = 0;
     size_t processPos = 0;
@@ -348,13 +338,11 @@ bool ProcessManager::MatchesWildcard(const std::string& processName, const std::
 
 void ProcessManager::CleanupStalePids(std::unordered_map<DWORD, CachedProcessInfo>& cache,
     const std::unordered_set<DWORD>& alivePids) {
-    for (auto it = cache.begin(); it != cache.end();) {
-        if (alivePids.find(it->first) == alivePids.end()) {
-            it = cache.erase(it);
+    std::erase_if(cache, [&alivePids, this](const auto& pair) {
+        bool shouldErase = !alivePids.contains(pair.first);
+        if (shouldErase) {
             stats.cacheEvictions.fetch_add(1);
         }
-        else {
-            ++it;
-        }
-    }
+        return shouldErase;
+        });
 }
