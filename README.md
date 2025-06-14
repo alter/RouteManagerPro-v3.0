@@ -52,7 +52,7 @@ Route Manager Pro automatically creates and manages Windows network routes based
 
 ### Advanced Features
 
-#### AI Preload
+#### Preloaded Routes
 Enable "Preload IPs" to pre-configure routes for popular services:
 - Discord voice servers
 - Cloud gaming platforms
