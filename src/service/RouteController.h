@@ -14,7 +14,6 @@
 #include "../common/Models.h"
 #include "RouteOptimizer.h"
 
-// Структура для представления системного маршрута
 struct SystemRoute {
     uint32_t address;
     uint32_t mask;
@@ -40,7 +39,6 @@ public:
     void UpdateConfig(const ServiceConfig& newConfig);
     void RunOptimizationManual();
 
-    // Новые методы для улучшенной оптимизации
     void SyncWithSystemTable();
     void PerformFullCleanup();
     void CleanupRedundantRoutes();
@@ -51,12 +49,10 @@ private:
     mutable std::mutex routesMutex;
     std::atomic<bool> running;
 
-    // Threads
     std::thread verifyThread;
     std::thread persistThread;
     std::thread optimizationThread;
 
-    // Optimization
     std::unique_ptr<RouteOptimizer> optimizer;
     std::chrono::steady_clock::time_point lastOptimizationTime;
     std::condition_variable optimizationCV;
@@ -65,12 +61,10 @@ private:
     NET_IFINDEX cachedInterfaceIndex;
     std::mutex interfaceCacheMutex;
 
-    // Persistence
     std::atomic<bool> routesDirty{ false };
     std::chrono::steady_clock::time_point lastSaveTime;
     static constexpr auto SAVE_INTERVAL = std::chrono::minutes(10);
 
-    // System route management
     bool AddSystemRoute(const std::string& ip);
     bool AddSystemRouteWithMask(const std::string& ip, int prefixLength);
     bool AddSystemRouteOldAPI(const std::string& ip);
@@ -78,17 +72,14 @@ private:
     bool RemoveSystemRoute(const std::string& ip, const std::string& gatewayIp);
     bool RemoveSystemRouteWithMask(const std::string& ip, int prefixLength, const std::string& gatewayIp);
 
-    // Thread functions
     void VerifyRoutesThreadFunc();
     void PersistenceThreadFunc();
     void OptimizationThreadFunc();
 
-    // Persistence
     void SaveRoutesToDisk();
     void SaveRoutesToDiskAsync();
     void LoadRoutesFromDisk();
 
-    // Helpers
     bool IsGatewayReachable();
     void InvalidateInterfaceCache();
     void MigrateExistingRoutes(const std::string& oldGateway, const std::string& newGateway);
@@ -99,14 +90,12 @@ private:
     uint32_t CreateMask(int prefixLength);
     void NotifyUIRouteCountChanged();
 
-    // Новые вспомогательные методы
     std::vector<SystemRoute> GetSystemRoutesForGateway();
     std::vector<SystemRoute> GetSystemRoutesOldAPI();
     void RemoveRedundantSystemRoutes(const std::vector<HostRoute>& hostRoutes,
         const std::vector<SystemRoute>& aggregatedRoutes);
     int CountBits(uint32_t mask);
 
-    // Preload
     struct PreloadService {
         std::string name;
         bool enabled;

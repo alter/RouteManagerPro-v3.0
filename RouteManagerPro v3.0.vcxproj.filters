@@ -137,9 +137,6 @@
     <ClInclude Include="src\common\ShutdownCoordinator.h">
       <Filter>Header Files\common</Filter>
     </ClInclude>
-    <ClInclude Include="src\service\ProcessManager.hpp">
-      <Filter>Source Files\service</Filter>
-    </ClInclude>
     <ClInclude Include="src\common\WinHandles.h">
       <Filter>Header Files\common</Filter>
     </ClInclude>

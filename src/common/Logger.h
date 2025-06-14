@@ -7,6 +7,11 @@
 #include <sstream>
 #include <filesystem>
 #include <ctime>
+#include <format>
+
+#ifdef __cpp_lib_stacktrace
+#include <stacktrace>
+#endif
 
 class Logger {
 public:
@@ -68,6 +73,18 @@ public:
     void Warning(const std::string& message) {
         Log("WARNING: " + message, LogLevel::LEVEL_WARNING);
     }
+
+#ifdef __cpp_lib_stacktrace
+    void LogWithStackTrace(const std::string& message, LogLevel level) {
+        Log(message, level);
+        if (level >= LogLevel::LEVEL_ERROR) {
+            auto trace = std::stacktrace::current();
+            for (const auto& entry : trace) {
+                Log(std::format("  at {}", entry.description()), LogLevel::LEVEL_DEBUG);
+            }
+        }
+    }
+#endif
 
 private:
     Logger() {

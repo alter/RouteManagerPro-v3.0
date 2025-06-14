@@ -56,7 +56,6 @@
     <ClInclude Include="src\service\ConfigManager.h" />
     <ClInclude Include="src\service\NetworkMonitor.h" />
     <ClInclude Include="src\service\ProcessManager.h" />
-    <ClInclude Include="src\service\ProcessManager.hpp" />
     <ClInclude Include="src\service\RouteController.h" />
     <ClInclude Include="src\service\RouteOptimizer.h" />
     <ClInclude Include="src\service\ServiceMain.h" />
