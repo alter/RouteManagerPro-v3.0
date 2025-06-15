@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <ranges>
 #include <algorithm>
+#include <bit>
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
@@ -33,9 +34,9 @@ lastOptimizationTime(std::chrono::steady_clock::now()) {
     optConfig.waste_thresholds = config.optimizerSettings.wasteThresholds;
     optimizer = std::make_unique<RouteOptimizer>(optConfig);
 
-    verifyThread = std::thread(&RouteController::VerifyRoutesThreadFunc, this);
-    persistThread = std::thread(&RouteController::PersistenceThreadFunc, this);
-    optimizationThread = std::thread(&RouteController::OptimizationThreadFunc, this);
+    verifyThread = std::jthread([this](std::stop_token token) { VerifyRoutesThreadFunc(token); });
+    persistThread = std::jthread([this](std::stop_token token) { PersistenceThreadFunc(token); });
+    optimizationThread = std::jthread([this](std::stop_token token) { OptimizationThreadFunc(token); });
 
     if (config.aiPreloadEnabled) {
         PreloadAIRoutes();
@@ -48,23 +49,7 @@ RouteController::~RouteController() {
     running = false;
     optimizationCV.notify_all();
 
-    if (verifyThread.joinable()) {
-        Logger::Instance().Info("Waiting for verify thread to stop...");
-        verifyThread.join();
-        Logger::Instance().Info("Verify thread joined successfully");
-    }
-
-    if (persistThread.joinable()) {
-        Logger::Instance().Info("Waiting for persist thread to stop...");
-        persistThread.join();
-        Logger::Instance().Info("Persist thread joined successfully");
-    }
-
-    if (optimizationThread.joinable()) {
-        Logger::Instance().Info("Waiting for optimization thread to stop...");
-        optimizationThread.join();
-        Logger::Instance().Info("Optimization thread joined successfully");
-    }
+    // std::jthread автоматически вызовет request_stop() и join()
 
     if (routesDirty.load()) {
         Logger::Instance().Info("RouteController shutdown: Saving routes to disk");
@@ -74,19 +59,19 @@ RouteController::~RouteController() {
     Logger::Instance().Info("RouteController destructor - completed");
 }
 
-void RouteController::OptimizationThreadFunc() {
+void RouteController::OptimizationThreadFunc(std::stop_token stopToken) {
     Logger::Instance().Info("RouteController optimization thread started");
 
     try {
-        while (running.load() && !ShutdownCoordinator::Instance().isShuttingDown) {
+        while (!stopToken.stop_requested() && !ShutdownCoordinator::Instance().isShuttingDown) {
             std::unique_lock<std::mutex> lock(optimizationMutex);
 
             auto waitUntil = std::chrono::steady_clock::now() + std::chrono::hours(1);
-            optimizationCV.wait_until(lock, waitUntil, [this] {
-                return !running.load() || ShutdownCoordinator::Instance().isShuttingDown;
+            optimizationCV.wait_until(lock, waitUntil, [&stopToken, this] {
+                return stopToken.stop_requested() || ShutdownCoordinator::Instance().isShuttingDown;
                 });
 
-            if (!running.load() || ShutdownCoordinator::Instance().isShuttingDown) {
+            if (stopToken.stop_requested() || ShutdownCoordinator::Instance().isShuttingDown) {
                 break;
             }
 
@@ -167,13 +152,7 @@ std::vector<SystemRoute> RouteController::GetSystemRoutesOldAPI() {
 }
 
 int RouteController::CountBits(uint32_t mask) {
-    int count = 0;
-    uint32_t n = mask;
-    while (n) {
-        count++;
-        n &= (n - 1);
-    }
-    return count;
+    return std::popcount(mask);
 }
 
 void RouteController::RunOptimization() {
@@ -563,16 +542,16 @@ void RouteController::MigrateExistingRoutes(const std::string& oldGateway, const
         successCount, failCount));
 }
 
-void RouteController::PersistenceThreadFunc() {
+void RouteController::PersistenceThreadFunc(std::stop_token stopToken) {
     Logger::Instance().Info("RouteController persistence thread started");
 
     try {
-        while (running.load() && !ShutdownCoordinator::Instance().isShuttingDown) {
-            for (int i = 0; i < 60 && running.load() && !ShutdownCoordinator::Instance().isShuttingDown; i++) {
+        while (!stopToken.stop_requested() && !ShutdownCoordinator::Instance().isShuttingDown) {
+            for (int i = 0; i < 60 && !stopToken.stop_requested() && !ShutdownCoordinator::Instance().isShuttingDown; i++) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
 
-            if (!running.load() || ShutdownCoordinator::Instance().isShuttingDown) {
+            if (stopToken.stop_requested() || ShutdownCoordinator::Instance().isShuttingDown) {
                 break;
             }
 
@@ -828,7 +807,7 @@ uint32_t RouteController::IPToUInt(const std::string& ip) {
     return 0;
 }
 
-uint32_t RouteController::CreateMask(int prefixLength) {
+constexpr uint32_t RouteController::CreateMask(int prefixLength) {
     if (prefixLength <= 0) return 0;
     if (prefixLength >= 32) return 0xFFFFFFFF;
     return ~((1u << (32 - prefixLength)) - 1);
@@ -1025,17 +1004,17 @@ bool RouteController::RemoveSystemRouteWithMask(const std::string& ip, int prefi
     }
 }
 
-void RouteController::VerifyRoutesThreadFunc() {
+void RouteController::VerifyRoutesThreadFunc(std::stop_token stopToken) {
     Logger::Instance().Info("RouteController verify thread started");
 
     try {
-        while (running.load() && !ShutdownCoordinator::Instance().isShuttingDown) {
+        while (!stopToken.stop_requested() && !ShutdownCoordinator::Instance().isShuttingDown) {
             for (int i = 0; i < Constants::ROUTE_VERIFY_INTERVAL_SEC &&
-                running.load() && !ShutdownCoordinator::Instance().isShuttingDown; i++) {
+                !stopToken.stop_requested() && !ShutdownCoordinator::Instance().isShuttingDown; i++) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
 
-            if (!running.load() || ShutdownCoordinator::Instance().isShuttingDown) {
+            if (stopToken.stop_requested() || ShutdownCoordinator::Instance().isShuttingDown) {
                 break;
             }
 
@@ -1047,7 +1026,7 @@ void RouteController::VerifyRoutesThreadFunc() {
             std::vector<std::pair<std::string, int>> routesToVerify;
             {
                 std::lock_guard<std::mutex> lock(routesMutex);
-                if (!running.load() || ShutdownCoordinator::Instance().isShuttingDown) {
+                if (stopToken.stop_requested() || ShutdownCoordinator::Instance().isShuttingDown) {
                     break;
                 }
 
@@ -1057,7 +1036,7 @@ void RouteController::VerifyRoutesThreadFunc() {
             }
 
             for (const auto& [ip, prefixLength] : routesToVerify) {
-                if (!running.load() || ShutdownCoordinator::Instance().isShuttingDown) {
+                if (stopToken.stop_requested() || ShutdownCoordinator::Instance().isShuttingDown) {
                     Logger::Instance().Info("Route verification interrupted by shutdown");
                     break;
                 }

@@ -54,9 +54,9 @@ private:
     mutable std::mutex routesMutex;
     std::atomic<bool> running;
 
-    std::thread verifyThread;
-    std::thread persistThread;
-    std::thread optimizationThread;
+    std::jthread verifyThread;
+    std::jthread persistThread;
+    std::jthread optimizationThread;
 
     std::unique_ptr<RouteOptimizer> optimizer;
     std::chrono::steady_clock::time_point lastOptimizationTime;
@@ -89,9 +89,9 @@ private:
     void SetLastError(const RouteError& error);
     void ClearLastError();
 
-    void VerifyRoutesThreadFunc();
-    void PersistenceThreadFunc();
-    void OptimizationThreadFunc();
+    void VerifyRoutesThreadFunc(std::stop_token stopToken);
+    void PersistenceThreadFunc(std::stop_token stopToken);
+    void OptimizationThreadFunc(std::stop_token stopToken);
 
     void SaveRoutesToDisk();
     void SaveRoutesToDiskAsync();
@@ -104,7 +104,7 @@ private:
     void ApplyOptimizationPlan(const OptimizationPlan& plan);
     bool IsIPCoveredByExistingRoute(const std::string& ip);
     uint32_t IPToUInt(const std::string& ip);
-    uint32_t CreateMask(int prefixLength);
+    static constexpr uint32_t CreateMask(int prefixLength);
     void NotifyUIRouteCountChanged();
 
     std::vector<SystemRoute> GetSystemRoutesForGateway();

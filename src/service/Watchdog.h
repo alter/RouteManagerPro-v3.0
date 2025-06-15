@@ -21,10 +21,10 @@ public:
 private:
     ServiceMain* service;
     std::atomic<bool> running;
-    std::thread watchThread;
+    std::jthread watchThread;
     std::chrono::system_clock::time_point startTime;
 
-    void WatchThreadFunc();
+    void WatchThreadFunc(std::stop_token stopToken);
     void CheckMemoryUsage();
     void ForceGarbageCollection();
 };

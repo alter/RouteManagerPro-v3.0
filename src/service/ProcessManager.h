@@ -10,6 +10,7 @@
 #include <chrono>
 #include <optional>
 #include <list>
+#include <concepts>
 #include "../common/Models.h"
 #include "../common/WinHandles.h"
 
@@ -89,6 +90,7 @@ public:
     }
 
     template<typename Func>
+        requires std::invocable<Func, const K&, const V&>
     void forEach(Func func) const {
         std::shared_lock lock(mutex);
         for (const auto& node : list) {
@@ -144,12 +146,12 @@ private:
     std::vector<ProcessInfo> allProcesses;
 
     std::atomic<bool> running;
-    std::thread updateThread;
+    std::jthread updateThread;
 
     PerformanceConfig perfConfig;
     mutable CacheStats stats;
 
-    void UpdateThreadFunc();
+    void UpdateThreadFunc(std::stop_token stopToken);
     std::unordered_map<DWORD, CachedProcessInfo> BuildProcessSnapshot();
     std::optional<CachedProcessInfo> GetCompleteProcessInfo(DWORD pid);
     bool MatchesWildcard(const std::string& processName, const std::string& pattern) const;

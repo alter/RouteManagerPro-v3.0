@@ -1,4 +1,4 @@
-// src/service/Watchdog.cpp
+﻿// src/service/Watchdog.cpp
 #include <winsock2.h>
 #include <windows.h>
 #include "Watchdog.h"
@@ -23,18 +23,13 @@ void Watchdog::Start() {
 
     Logger::Instance().Debug("Watchdog::Start - Starting watchdog");
     running = true;
-    watchThread = std::thread(&Watchdog::WatchThreadFunc, this);
+    watchThread = std::jthread([this](std::stop_token token) { WatchThreadFunc(token); });
 }
 
 void Watchdog::Stop() {
     Logger::Instance().Debug("Watchdog::Stop - Stopping watchdog");
     running = false;
-
-    if (watchThread.joinable()) {
-        Logger::Instance().Debug("Watchdog::Stop - Waiting for watch thread");
-        watchThread.join();
-        Logger::Instance().Debug("Watchdog::Stop - Watch thread joined");
-    }
+    // std::jthread автоматически вызовет request_stop() и join()
 }
 
 size_t Watchdog::GetMemoryUsageMB() const {
@@ -55,10 +50,10 @@ std::chrono::seconds Watchdog::GetUptime() const {
     return std::chrono::duration_cast<std::chrono::seconds>(now - startTime);
 }
 
-void Watchdog::WatchThreadFunc() {
+void Watchdog::WatchThreadFunc(std::stop_token stopToken) {
     Logger::Instance().Debug("Watchdog::WatchThreadFunc - Started");
 
-    while (running.load() && !ShutdownCoordinator::Instance().isShuttingDown) {
+    while (!stopToken.stop_requested() && !ShutdownCoordinator::Instance().isShuttingDown) {
         try {
             CheckMemoryUsage();
         }
@@ -67,7 +62,7 @@ void Watchdog::WatchThreadFunc() {
         }
 
         for (int i = 0; i < Constants::WATCHDOG_INTERVAL_SEC * 10; i++) {
-            if (!running.load() || ShutdownCoordinator::Instance().isShuttingDown) {
+            if (stopToken.stop_requested() || ShutdownCoordinator::Instance().isShuttingDown) {
                 break;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));

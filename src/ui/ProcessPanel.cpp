@@ -303,10 +303,10 @@ void ProcessPanel::UpdateProcessList() {
 
                 if (processNameStr == "System" || processNameStr == "Registry" ||
                     processNameStr == "Idle" || processNameStr.empty() ||
-                    processNameStr.find("svchost") != std::string::npos ||
-                    processNameStr.find("RuntimeBroker") != std::string::npos ||
-                    processNameStr.find("backgroundTask") != std::string::npos ||
-                    processNameStr.find("conhost") != std::string::npos) {
+                    processNameStr.contains("svchost") ||
+                    processNameStr.contains("RuntimeBroker") ||
+                    processNameStr.contains("backgroundTask") ||
+                    processNameStr.contains("conhost")) {
                     continue;
                 }
 
@@ -322,9 +322,9 @@ void ProcessPanel::UpdateProcessList() {
                             std::wstring pathLower = processPath;
                             std::transform(pathLower.begin(), pathLower.end(), pathLower.begin(), ::tolower);
 
-                            if (pathLower.find(L"windows\\system32") != std::wstring::npos ||
-                                pathLower.find(L"windows\\syswow64") != std::wstring::npos ||
-                                pathLower.find(L"\\windowsapps\\") != std::wstring::npos) {
+                            if (pathLower.contains(L"windows\\system32") ||
+                                pathLower.contains(L"windows\\syswow64") ||
+                                pathLower.contains(L"\\windowsapps\\")) {
                                 CloseHandle(process);
                                 continue;
                             }
@@ -355,7 +355,7 @@ void ProcessPanel::UpdateProcessList() {
             if (!currentSearchFilter.empty()) {
                 std::string nameLower = Utils::WStringToString(info.name);
                 std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::tolower);
-                if (nameLower.find(currentSearchFilter) == std::string::npos) {
+                if (!nameLower.contains(currentSearchFilter)) {
                     continue;
                 }
             }
@@ -642,10 +642,10 @@ void ProcessPanel::UpdateListsImmediately() {
 
                 if (processNameStr == "System" || processNameStr == "Registry" ||
                     processNameStr == "Idle" || processNameStr.empty() ||
-                    processNameStr.find("svchost") != std::string::npos ||
-                    processNameStr.find("RuntimeBroker") != std::string::npos ||
-                    processNameStr.find("backgroundTask") != std::string::npos ||
-                    processNameStr.find("conhost") != std::string::npos) {
+                    processNameStr.contains("svchost") ||
+                    processNameStr.contains("RuntimeBroker") ||
+                    processNameStr.contains("backgroundTask") ||
+                    processNameStr.contains("conhost")) {
                     continue;
                 }
 
@@ -661,9 +661,9 @@ void ProcessPanel::UpdateListsImmediately() {
                             std::wstring pathLower = processPath;
                             std::transform(pathLower.begin(), pathLower.end(), pathLower.begin(), ::tolower);
 
-                            if (pathLower.find(L"windows\\system32") != std::wstring::npos ||
-                                pathLower.find(L"windows\\syswow64") != std::wstring::npos ||
-                                pathLower.find(L"\\windowsapps\\") != std::wstring::npos) {
+                            if (pathLower.contains(L"windows\\system32") ||
+                                pathLower.contains(L"windows\\syswow64") ||
+                                pathLower.contains(L"\\windowsapps\\")) {
                                 CloseHandle(process);
                                 continue;
                             }
@@ -694,7 +694,7 @@ void ProcessPanel::UpdateListsImmediately() {
             if (!currentSearchFilter.empty()) {
                 std::string nameLower = Utils::WStringToString(info.name);
                 std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::tolower);
-                if (nameLower.find(currentSearchFilter) == std::string::npos) {
+                if (!nameLower.contains(currentSearchFilter)) {
                     continue;
                 }
             }

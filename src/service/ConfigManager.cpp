@@ -1,4 +1,4 @@
-// src/service/ConfigManager.cpp
+﻿// src/service/ConfigManager.cpp
 #include "ConfigManager.h"
 #include "../common/Constants.h"
 #include "../common/Utils.h"
@@ -12,17 +12,15 @@
 #include <format>
 
 ConfigManager::ConfigManager() : configDirty(false),
-lastSaveTime(std::chrono::steady_clock::now()),
-persistThread(&ConfigManager::PersistenceThreadFunc, this) {
+lastSaveTime(std::chrono::steady_clock::now()) {
     configPath = std::format("{}\\{}", Utils::GetCurrentDirectory(), Constants::CONFIG_FILE);
     LoadConfig();
+    persistThread = std::jthread([this](std::stop_token token) { PersistenceThreadFunc(token); });
 }
 
 ConfigManager::~ConfigManager() {
     running = false;
-    if (persistThread.joinable()) {
-        persistThread.join();
-    }
+    // std::jthread автоматически вызовет request_stop() и join()
 
     if (configDirty.load()) {
         Logger::Instance().Info("ConfigManager shutdown: Saving config to disk");
@@ -30,16 +28,16 @@ ConfigManager::~ConfigManager() {
     }
 }
 
-void ConfigManager::PersistenceThreadFunc() {
+void ConfigManager::PersistenceThreadFunc(std::stop_token stopToken) {
     Logger::Instance().Info("ConfigManager persistence thread started");
 
     try {
-        while (running.load() && !ShutdownCoordinator::Instance().isShuttingDown) {
-            for (int i = 0; i < 600 && running.load() && !ShutdownCoordinator::Instance().isShuttingDown; i++) {
+        while (!stopToken.stop_requested() && !ShutdownCoordinator::Instance().isShuttingDown) {
+            for (int i = 0; i < 600 && !stopToken.stop_requested() && !ShutdownCoordinator::Instance().isShuttingDown; i++) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
 
-            if (!running.load() || ShutdownCoordinator::Instance().isShuttingDown) {
+            if (stopToken.stop_requested() || ShutdownCoordinator::Instance().isShuttingDown) {
                 break;
             }
 

@@ -27,24 +27,15 @@ ProcessManager::ProcessManager(const ServiceConfig& config, const PerformanceCon
         Logger::Instance().Info(std::format("  - {}", proc));
     }
 
-    updateThread = std::thread(&ProcessManager::UpdateThreadFunc, this);
+    updateThread = std::jthread([this](std::stop_token token) { UpdateThreadFunc(token); });
 }
 
 ProcessManager::~ProcessManager() {
     Logger::Instance().Debug("ProcessManager::~ProcessManager - Destructor called");
     running = false;
-
-    if (updateThread.joinable()) {
-        Logger::Instance().Debug("ProcessManager::~ProcessManager - Joining update thread");
-        try {
-            updateThread.join();
-            Logger::Instance().Debug("ProcessManager::~ProcessManager - Update thread joined");
-        }
-        catch (const std::exception& e) {
-            Logger::Instance().Error(std::format("ProcessManager::~ProcessManager - Exception joining thread: {}", e.what()));
-        }
-    }
+    // std::jthread автоматически вызовет request_stop() и join()
 }
+
 
 bool ProcessManager::IsSelectedProcessByPid(DWORD pid) {
     PERF_TIMER("ProcessManager::IsSelectedProcessByPid");
@@ -163,18 +154,18 @@ std::vector<std::string> ProcessManager::GetSelectedProcesses() const {
     return std::vector<std::string>(selectedProcesses.begin(), selectedProcesses.end());
 }
 
-void ProcessManager::UpdateThreadFunc() {
+void ProcessManager::UpdateThreadFunc(std::stop_token stopToken) {
     Logger::Instance().Debug("ProcessManager::UpdateThreadFunc - Started");
 
-    while (running.load() && !ShutdownCoordinator::Instance().isShuttingDown) {
+    while (!stopToken.stop_requested() && !ShutdownCoordinator::Instance().isShuttingDown) {
         for (int i = 0; i < 50; i++) {
-            if (!running.load() || ShutdownCoordinator::Instance().isShuttingDown) {
+            if (stopToken.stop_requested() || ShutdownCoordinator::Instance().isShuttingDown) {
                 break;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
-        if (!running.load() || ShutdownCoordinator::Instance().isShuttingDown) {
+        if (stopToken.stop_requested() || ShutdownCoordinator::Instance().isShuttingDown) {
             break;
         }
 

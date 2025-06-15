@@ -1,26 +1,58 @@
 ﻿// src/common/IPCSerializer.cpp
 #include "IPCProtocol.h"
 #include <cstring>
+#include <span>
+
+// Вспомогательная функция для записи данных
+template<typename T>
+static void WriteData(std::span<uint8_t> buffer, size_t& offset, const T& data) {
+    if (offset + sizeof(T) <= buffer.size()) {
+        std::memcpy(buffer.data() + offset, &data, sizeof(T));
+        offset += sizeof(T);
+    }
+}
+
+// Вспомогательная функция для записи массива байт
+static void WriteBytes(std::span<uint8_t> buffer, size_t& offset, const void* data, size_t size) {
+    if (offset + size <= buffer.size()) {
+        std::memcpy(buffer.data() + offset, data, size);
+        offset += size;
+    }
+}
+
+// Вспомогательная функция для чтения данных
+template<typename T>
+static bool ReadData(std::span<const uint8_t> buffer, size_t& offset, T& data) {
+    if (offset + sizeof(T) <= buffer.size()) {
+        std::memcpy(&data, buffer.data() + offset, sizeof(T));
+        offset += sizeof(T);
+        return true;
+    }
+    return false;
+}
+
+// Вспомогательная функция для чтения массива байт
+static bool ReadBytes(std::span<const uint8_t> buffer, size_t& offset, void* data, size_t size) {
+    if (offset + size <= buffer.size()) {
+        std::memcpy(data, buffer.data() + offset, size);
+        offset += size;
+        return true;
+    }
+    return false;
+}
 
 std::vector<uint8_t> IPCSerializer::SerializeServiceStatus(const ServiceStatus& status) {
     std::vector<uint8_t> data;
     data.resize(sizeof(bool) * 2 + sizeof(size_t) * 2 + sizeof(int64_t));
 
     size_t offset = 0;
-    memcpy(data.data() + offset, &status.isRunning, sizeof(bool));
-    offset += sizeof(bool);
-
-    memcpy(data.data() + offset, &status.monitorActive, sizeof(bool));
-    offset += sizeof(bool);
-
-    memcpy(data.data() + offset, &status.activeRoutes, sizeof(size_t));
-    offset += sizeof(size_t);
-
-    memcpy(data.data() + offset, &status.memoryUsageMB, sizeof(size_t));
-    offset += sizeof(size_t);
+    WriteData(std::span(data), offset, status.isRunning);
+    WriteData(std::span(data), offset, status.monitorActive);
+    WriteData(std::span(data), offset, status.activeRoutes);
+    WriteData(std::span(data), offset, status.memoryUsageMB);
 
     int64_t uptimeCount = status.uptime.count();
-    memcpy(data.data() + offset, &uptimeCount, sizeof(int64_t));
+    WriteData(std::span(data), offset, uptimeCount);
 
     return data;
 }
@@ -32,20 +64,13 @@ ServiceStatus IPCSerializer::DeserializeServiceStatus(const std::vector<uint8_t>
     }
 
     size_t offset = 0;
-    memcpy(&status.isRunning, data.data() + offset, sizeof(bool));
-    offset += sizeof(bool);
-
-    memcpy(&status.monitorActive, data.data() + offset, sizeof(bool));
-    offset += sizeof(bool);
-
-    memcpy(&status.activeRoutes, data.data() + offset, sizeof(size_t));
-    offset += sizeof(size_t);
-
-    memcpy(&status.memoryUsageMB, data.data() + offset, sizeof(size_t));
-    offset += sizeof(size_t);
+    ReadData(std::span(data), offset, status.isRunning);
+    ReadData(std::span(data), offset, status.monitorActive);
+    ReadData(std::span(data), offset, status.activeRoutes);
+    ReadData(std::span(data), offset, status.memoryUsageMB);
 
     int64_t uptimeCount;
-    memcpy(&uptimeCount, data.data() + offset, sizeof(int64_t));
+    ReadData(std::span(data), offset, uptimeCount);
     status.uptime = std::chrono::seconds(uptimeCount);
 
     return status;

@@ -26,10 +26,10 @@ private:
     std::chrono::steady_clock::time_point lastSaveTime;
     static constexpr auto SAVE_INTERVAL = std::chrono::minutes(10);
     std::atomic<bool> running{ true };
-    std::thread persistThread;
+    std::jthread persistThread;
 
     void LoadConfig();
     void SaveConfig();
     ServiceConfig GetDefaultConfig();
-    void PersistenceThreadFunc();
+    void PersistenceThreadFunc(std::stop_token stopToken);
 };
