@@ -1,4 +1,4 @@
-﻿// src/service/NetworkMonitor.cpp
+﻿// NetworkMonitor.cpp
 #include "NetworkMonitor.h"
 #include "RouteController.h"
 #include "ProcessManager.h"
@@ -43,7 +43,6 @@ void NetworkMonitor::Start() {
 
     Logger::Instance().Info("WinDivert handle opened successfully");
 
-    // Увеличиваем размеры буферов для лучшей производительности
     WinDivertSetParam(divertHandle, WINDIVERT_PARAM_QUEUE_LENGTH, 32768);
     WinDivertSetParam(divertHandle, WINDIVERT_PARAM_QUEUE_TIME, 1);
     WinDivertSetParam(divertHandle, WINDIVERT_PARAM_QUEUE_SIZE, 16777216);
@@ -83,20 +82,15 @@ void NetworkMonitor::Stop() {
 }
 
 void NetworkMonitor::MonitorThreadFunc() {
-    // Привязываем поток к процессору для лучшей производительности
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
-
-    // Пытаемся привязать к конкретному CPU для уменьшения cache misses
-    DWORD_PTR mask = 1; // CPU 0
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    DWORD_PTR mask = 1;
     SetThreadAffinityMask(GetCurrentThread(), mask);
 
-    EventBatch eventBatch;
     WINDIVERT_ADDRESS addr;
 
     active.store(true, std::memory_order_release);
     auto lastCleanup = std::chrono::steady_clock::now();
     auto lastStats = std::chrono::steady_clock::now();
-    auto lastBatchFlush = std::chrono::steady_clock::now();
     int eventCount = 0;
 
     Logger::Instance().Info("Monitor thread started - waiting for FLOW events");
@@ -141,45 +135,30 @@ void NetworkMonitor::MonitorThreadFunc() {
                 if (eventCount <= 10 || eventCount % 100 == 0) {
                     Logger::Instance().Info(std::format("Processing FLOW event #{}", eventCount));
                 }
-                ProcessFlowEvent(addr, eventBatch);
+                ProcessFlowEvent(addr);
             }
         }
 
         auto now = std::chrono::steady_clock::now();
 
-        // Флушим батч если он полный или прошло достаточно времени
-        if (eventBatch.isFull() ||
-            std::chrono::duration_cast<std::chrono::milliseconds>(now - lastBatchFlush).count() > 100) {
-            FlushEventBatch(eventBatch);
-            lastBatchFlush = now;
-        }
-
-        // Реже выполняем cleanup
         if (std::chrono::duration_cast<std::chrono::seconds>(now - lastCleanup).count() > 120) {
             CleanupOldConnections();
             lastCleanup = now;
         }
 
-        // Log performance stats every 5 minutes
         if (std::chrono::duration_cast<std::chrono::minutes>(now - lastStats).count() >= 5) {
             LogPerformanceStats();
             lastStats = now;
         }
     }
 
-    // Флушим оставшиеся события
-    if (!eventBatch.isEmpty()) {
-        FlushEventBatch(eventBatch);
-    }
-
     active.store(false, std::memory_order_release);
     Logger::Instance().Info(std::format("Monitor thread exiting cleanly after processing {} events", eventCount));
 }
 
-void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr, EventBatch& batch) {
+void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr) {
     PERF_TIMER("NetworkMonitor::ProcessFlowEvent");
 
-    // Запоминаем время начала обработки события
     auto eventStartTime = std::chrono::high_resolution_clock::now();
 
     bool isSelected = processManager->IsSelectedProcessByPid(addr.Flow.ProcessId);
@@ -192,7 +171,6 @@ void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr, EventBatch&
     std::string processName = cachedInfo.has_value() ?
         Utils::WStringToString(cachedInfo->name) : "Unknown";
 
-    // Используем thread_local буфер для конвертации адресов
     thread_local char localStr[INET6_ADDRSTRLEN];
     thread_local char remoteStr[INET6_ADDRSTRLEN];
 
@@ -226,18 +204,27 @@ void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr, EventBatch&
     if (addr.Event == WINDIVERT_EVENT_FLOW_ESTABLISHED) {
         PERF_COUNT("NetworkMonitor.FlowEvent.Established");
 
-        // Сохраняем время начала для этого маршрута
-        {
-            std::lock_guard<std::mutex> lock(routeTimingMutex);
-            routeAddStartTimes[remoteIp] = eventStartTime;
+        // IMMEDIATE PROCESSING - NO BATCHING!
+        Logger::Instance().Info(std::format("Adding route IMMEDIATELY for {} (process: {})", remoteIp, processName));
+
+        auto routeAddStart = std::chrono::high_resolution_clock::now();
+        bool success = routeController->AddRoute(remoteIp, processName);
+        auto routeAddEnd = std::chrono::high_resolution_clock::now();
+
+        auto totalTime = std::chrono::duration_cast<std::chrono::microseconds>(routeAddEnd - routeAddStart);
+        PerformanceMonitor::Instance().RecordOperation("RouteAddLatency", totalTime);
+
+        if (success) {
+            PERF_COUNT("NetworkMonitor.RouteAdded");
+            Logger::Instance().Info(std::format("Route added successfully for {}: {}µs", remoteIp, totalTime.count()));
+        }
+        else {
+            Logger::Instance().Error(std::format("Failed to add route for {}", remoteIp));
         }
 
-        // Добавляем в батч вместо немедленной обработки
-        batch.add(remoteIp, processName);
-
+        // Update connections tracking
         std::lock_guard<std::mutex> lock(connectionsMutex);
 
-        // Check connection limit
         if (connections.size() >= MAX_CONNECTIONS) {
             PERF_COUNT("NetworkMonitor.ConnectionLimitReached");
             Logger::Instance().Warning(std::format("Connection limit reached ({}), cleaning up old connections", MAX_CONNECTIONS));
@@ -265,68 +252,10 @@ void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr, EventBatch&
         connections.erase(flowId);
         Logger::Instance().Debug(std::format("Flow deleted for {}", processName));
     }
-}
 
-void NetworkMonitor::FlushEventBatch(EventBatch& batch) {
-    if (batch.isEmpty()) return;
-
-    PERF_TIMER("NetworkMonitor::FlushEventBatch");
-
-    if (routeController) {
-        for (size_t i = 0; i < batch.count; ++i) {
-            const auto& [ip, process] = batch.events[i];
-
-            auto routeAddStart = std::chrono::high_resolution_clock::now();
-
-            // Получаем время начала для этого маршрута
-            {
-                std::lock_guard<std::mutex> lock(routeTimingMutex);
-                auto it = routeAddStartTimes.find(ip);
-                if (it != routeAddStartTimes.end()) {
-                    routeAddStart = it->second;
-                    routeAddStartTimes.erase(it);
-                }
-            }
-
-            Logger::Instance().Info(std::format("Adding route (batched) for {} (process: {})", ip, process));
-
-            bool success = routeController->AddRoute(ip, process);
-
-            if (success) {
-                auto routeAddEnd = std::chrono::high_resolution_clock::now();
-                auto totalTime = std::chrono::duration_cast<std::chrono::microseconds>(routeAddEnd - routeAddStart);
-
-                // Записываем метрику времени добавления маршрута
-                PerformanceMonitor::Instance().RecordOperation("RouteAddLatency", totalTime);
-
-                PERF_COUNT("NetworkMonitor.RouteAdded");
-
-                // Логируем время добавления маршрута
-                if (totalTime.count() > 1000) { // Если больше 1мс
-                    Logger::Instance().Warning(std::format("Route add latency for {}: {}µs", ip, totalTime.count()));
-                }
-                else {
-                    Logger::Instance().Debug(std::format("Route add latency for {}: {}µs", ip, totalTime.count()));
-                }
-
-                // Обновляем статистику
-                {
-                    std::lock_guard<std::mutex> lock(routeTimingMutex);
-                    totalRoutesAdded.fetch_add(1, std::memory_order_relaxed);
-                    totalRouteAddTime += totalTime;
-
-                    if (totalTime < minRouteAddTime || minRouteAddTime.count() == 0) {
-                        minRouteAddTime = totalTime;
-                    }
-                    if (totalTime > maxRouteAddTime) {
-                        maxRouteAddTime = totalTime;
-                    }
-                }
-            }
-        }
-    }
-
-    batch.clear();
+    auto eventEndTime = std::chrono::high_resolution_clock::now();
+    auto eventTotalTime = std::chrono::duration_cast<std::chrono::microseconds>(eventEndTime - eventStartTime);
+    Logger::Instance().Debug(std::format("Total event processing time: {}µs", eventTotalTime.count()));
 }
 
 void NetworkMonitor::CleanupOldConnections() {
@@ -336,7 +265,6 @@ void NetworkMonitor::CleanupOldConnections() {
     auto now = std::chrono::system_clock::now();
     int cleaned = 0;
 
-    // Используем std::erase_if для более эффективного удаления
     for (auto it = connections.begin(); it != connections.end();) {
         auto duration = std::chrono::duration_cast<std::chrono::hours>(now - it->second.lastSeen);
         if (duration.count() >= Constants::CONNECTION_CLEANUP_HOURS) {
@@ -358,7 +286,6 @@ void NetworkMonitor::ForceCleanupOldConnections() {
     auto now = std::chrono::system_clock::now();
     int cleaned = 0;
 
-    // More aggressive cleanup - remove connections older than 30 minutes
     for (auto it = connections.begin(); it != connections.end();) {
         auto duration = std::chrono::duration_cast<std::chrono::minutes>(now - it->second.lastSeen);
         if (duration.count() >= 30) {
@@ -370,9 +297,7 @@ void NetworkMonitor::ForceCleanupOldConnections() {
         }
     }
 
-    // If still too many, remove oldest connections
     if (connections.size() > MAX_CONNECTIONS * 0.8) {
-        // Используем partial_sort вместо полной сортировки
         std::vector<std::pair<UINT64, std::chrono::system_clock::time_point>> sortedConnections;
         sortedConnections.reserve(connections.size());
 
@@ -396,7 +321,6 @@ void NetworkMonitor::ForceCleanupOldConnections() {
 }
 
 std::string NetworkMonitor::GetProcessPathFromFlowId(UINT64 flowId, UINT32 processId) {
-    // Используем UniqueHandle для автоматического закрытия
     UniqueHandle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId), HandleDeleter{});
     if (!process) return "";
 
@@ -424,19 +348,6 @@ void NetworkMonitor::LogPerformanceStats() {
         if (op.name.starts_with("NetworkMonitor::") || op.name == "RouteAddLatency") {
             Logger::Instance().Info(std::format("{}: {} calls, avg: {}us, p95: {}us",
                 op.name, op.count, op.avgTime.count(), op.p95Time.count()));
-        }
-    }
-
-    // Логируем статистику времени добавления маршрутов
-    {
-        std::lock_guard<std::mutex> lock(routeTimingMutex);
-        uint64_t routesAdded = totalRoutesAdded.load(std::memory_order_relaxed);
-        if (routesAdded > 0) {
-            auto avgTime = totalRouteAddTime / routesAdded;
-            Logger::Instance().Info(std::format("Route Add Statistics: {} routes added", routesAdded));
-            Logger::Instance().Info(std::format("  Average time: {}µs", avgTime.count()));
-            Logger::Instance().Info(std::format("  Min time: {}µs", minRouteAddTime.count()));
-            Logger::Instance().Info(std::format("  Max time: {}µs", maxRouteAddTime.count()));
         }
     }
 }

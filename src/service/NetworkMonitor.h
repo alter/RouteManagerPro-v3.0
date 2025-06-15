@@ -1,4 +1,4 @@
-// src/service/NetworkMonitor.h
+// NetworkMonitor.h
 #pragma once
 #include <winsock2.h>
 #include <windows.h>
@@ -7,7 +7,6 @@
 #include <thread>
 #include <unordered_map>
 #include <mutex>
-#include <array>
 #include <chrono>
 #include "../common/Models.h"
 
@@ -40,49 +39,14 @@ private:
         size_t packetCount;
     };
 
-    // Event batching structure
-    struct EventBatch {
-        static constexpr size_t MAX_BATCH_SIZE = 16;
-        std::array<std::pair<std::string, std::string>, MAX_BATCH_SIZE> events;
-        size_t count = 0;
-
-        void add(const std::string& ip, const std::string& process) {
-            if (count < MAX_BATCH_SIZE) {
-                events[count++] = { ip, process };
-            }
-        }
-
-        void clear() { count = 0; }
-        bool isFull() const { return count >= MAX_BATCH_SIZE; }
-        bool isEmpty() const { return count == 0; }
-    };
-
-    // Connection tracking limits
     static constexpr size_t MAX_CONNECTIONS = 10000;
-    static constexpr size_t CLEANUP_TRIGGER_PERCENT = 80;
-    static constexpr auto AGGRESSIVE_CLEANUP_AGE = std::chrono::minutes(30);
-
     std::unordered_map<UINT64, ConnectionInfo> connections;
     std::mutex connectionsMutex;
 
-    // Route timing metrics
-    std::mutex routeTimingMutex;
-    std::unordered_map<std::string, std::chrono::high_resolution_clock::time_point> routeAddStartTimes;
-
-    // Performance statistics
-    std::atomic<uint64_t> totalRoutesAdded{ 0 };
-    std::chrono::microseconds totalRouteAddTime{ 0 };
-    std::chrono::microseconds minRouteAddTime{ 0 };
-    std::chrono::microseconds maxRouteAddTime{ 0 };
-
     void MonitorThreadFunc();
-    void ProcessFlowEvent(const WINDIVERT_ADDRESS& addr, EventBatch& batch);
-    void FlushEventBatch(EventBatch& batch);
-    void HandleNewProcess(DWORD pid, const std::string& remoteIp, WINDIVERT_EVENT event);
-    bool VerifyProcessIdentity(DWORD pid, const FILETIME& expectedTime);
+    void ProcessFlowEvent(const WINDIVERT_ADDRESS& addr);
     void CleanupOldConnections();
     void ForceCleanupOldConnections();
     std::string GetProcessPathFromFlowId(UINT64 flowId, UINT32 processId);
-    void LogDetailedStats();
     void LogPerformanceStats();
 };
