@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <mutex>
 #include <array>
+#include <chrono>
 #include "../common/Models.h"
 
 class RouteController;
@@ -63,6 +64,16 @@ private:
 
     std::unordered_map<UINT64, ConnectionInfo> connections;
     std::mutex connectionsMutex;
+
+    // Route timing metrics
+    std::mutex routeTimingMutex;
+    std::unordered_map<std::string, std::chrono::high_resolution_clock::time_point> routeAddStartTimes;
+
+    // Performance statistics
+    std::atomic<uint64_t> totalRoutesAdded{ 0 };
+    std::chrono::microseconds totalRouteAddTime{ 0 };
+    std::chrono::microseconds minRouteAddTime{ 0 };
+    std::chrono::microseconds maxRouteAddTime{ 0 };
 
     void MonitorThreadFunc();
     void ProcessFlowEvent(const WINDIVERT_ADDRESS& addr, EventBatch& batch);

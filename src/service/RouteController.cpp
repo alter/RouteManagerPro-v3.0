@@ -9,6 +9,7 @@
 #include "../common/Utils.h"
 #include "../common/Logger.h"
 #include "../common/ShutdownCoordinator.h"
+#include "PerformanceMonitor.h"
 #include <format>
 #include <fstream>
 #include <filesystem>
@@ -23,6 +24,12 @@
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
+
+// Thread-local кэши для переиспользования структур
+thread_local MIB_IPFORWARD_ROW2 tlRoute = { 0 };
+thread_local bool tlRouteInitialized = false;
+thread_local MIB_IPFORWARDROW tlOldRoute = { 0 };
+thread_local std::unordered_map<std::string, uint32_t> tlIPCache;
 
 RouteController::RouteController(const ServiceConfig& cfg) : config(cfg), running(true),
 lastSaveTime(std::chrono::steady_clock::now()), cachedInterfaceIndex(0),
@@ -294,7 +301,7 @@ void RouteController::RemoveRedundantSystemRoutes(
             if (RemoveSystemRouteWithMask(hostRoute.ip, 32, config.gatewayIp)) {
                 removedCount++;
 
-                std::lock_guard<std::mutex> lock(routesMutex);
+                std::lock_guard<std::shared_mutex> lock(routesMutex);
                 std::string routeKey = std::format("{}/32", hostRoute.ip);
                 routes.erase(routeKey);
                 routesDirty = true;
@@ -326,7 +333,7 @@ void RouteController::SyncWithSystemTable() {
 
     std::vector<std::string> toRemove;
     {
-        std::lock_guard<std::mutex> lock(routesMutex);
+        std::shared_lock<std::shared_mutex> lock(routesMutex);
 
         for (const auto& [routeKey, routeInfo] : routes) {
             if (!systemRouteKeys.contains(routeKey)) {
@@ -335,7 +342,10 @@ void RouteController::SyncWithSystemTable() {
                 toRemove.push_back(routeKey);
             }
         }
+    }
 
+    {
+        std::unique_lock<std::shared_mutex> lock(routesMutex);
         for (const auto& key : toRemove) {
             routes.erase(key);
         }
@@ -345,7 +355,7 @@ void RouteController::SyncWithSystemTable() {
     for (const auto& sysRoute : systemRoutes) {
         std::string key = std::format("{}/{}", sysRoute.ipString, sysRoute.prefixLength);
 
-        std::lock_guard<std::mutex> lock(routesMutex);
+        std::unique_lock<std::shared_mutex> lock(routesMutex);
         if (!routes.contains(key)) {
             auto route = std::make_unique<RouteInfo>();
             route->ip = sysRoute.ipString;
@@ -444,7 +454,7 @@ void RouteController::ApplyOptimizationPlan(const OptimizationPlan& plan) {
     }
 
     {
-        std::lock_guard<std::mutex> lock(routesMutex);
+        std::unique_lock<std::shared_mutex> lock(routesMutex);
 
         for (const auto& change : plan.changes) {
             if (change.type == OptimizationPlan::RouteChange::ADD) {
@@ -469,6 +479,7 @@ void RouteController::ApplyOptimizationPlan(const OptimizationPlan& plan) {
 }
 
 void RouteController::NotifyUIRouteCountChanged() {
+    // Асинхронное уведомление UI без блокировки
     HWND uiWindow = FindWindow(L"RouteManagerProWindow", nullptr);
     if (uiWindow) {
         PostMessage(uiWindow, WM_USER + 101, 0, 0);
@@ -482,13 +493,13 @@ void RouteController::RunOptimizationManual() {
 }
 
 void RouteController::InvalidateInterfaceCache() {
-    std::lock_guard<std::mutex> lock(interfaceCacheMutex);
+    std::unique_lock<std::shared_mutex> lock(interfaceCacheMutex);
     cachedInterfaceIndex = 0;
     Logger::Instance().Info("Interface cache invalidated");
 }
 
 void RouteController::UpdateConfig(const ServiceConfig& newConfig) {
-    std::lock_guard<std::mutex> lock(routesMutex);
+    std::unique_lock<std::shared_mutex> lock(routesMutex);
 
     bool gatewayChanged = (config.gatewayIp != newConfig.gatewayIp);
     bool metricChanged = (config.metric != newConfig.metric);
@@ -579,7 +590,7 @@ void RouteController::PersistenceThreadFunc(std::stop_token stopToken) {
 void RouteController::SaveRoutesToDiskAsync() {
     std::vector<std::pair<std::string, RouteInfo>> snapshot;
     {
-        std::lock_guard<std::mutex> lock(routesMutex);
+        std::shared_lock<std::shared_mutex> lock(routesMutex);
         for (const auto& [key, routeInfo] : routes) {
             snapshot.emplace_back(key, *routeInfo);
         }
@@ -623,46 +634,95 @@ bool RouteController::AddRoute(const std::string& ip, const std::string& process
 }
 
 bool RouteController::AddRouteWithMask(const std::string& ip, int prefixLength, const std::string& processName) {
-    if (!Utils::IsValidIPv4(ip)) return false;
+    PERF_TIMER("RouteController::AddRouteWithMask");
+    auto routeStartTime = std::chrono::high_resolution_clock::now();
 
+    // Супер-быстрая проверка валидности IP (без regex)
+    if (!Utils::IsValidIPv4(ip)) {
+        PERF_COUNT("RouteController.InvalidIP");
+        return false;
+    }
+
+    // Супер-быстрая проверка приватных IP (только битовые операции)
     if (Utils::IsPrivateIP(ip)) {
+        PERF_COUNT("RouteController.PrivateIPSkipped");
         Logger::Instance().Debug(std::format("Skipping private IP: {}", ip));
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(routesMutex);
-
-    if (IsIPCoveredByExistingRoute(ip)) {
-        Logger::Instance().Info(std::format("IP {} is already covered by an aggregated route, skipping addition", ip));
-        return true;
-    }
-
     std::string routeKey = std::format("{}/{}", ip, prefixLength);
 
-    if (routes.size() >= Constants::MAX_ROUTES) {
-        CleanupOldRoutes();
+    // ОПТИМИЗАЦИЯ: Сначала проверяем существование с read-only lock
+    {
+        std::shared_lock<std::shared_mutex> lock(routesMutex);
+
+        // Быстрая проверка покрытия
+        if (IsIPCoveredByExistingRoute(ip)) {
+            PERF_COUNT("RouteController.IPAlreadyCovered");
+            Logger::Instance().Info(std::format("IP {} is already covered by an aggregated route", ip));
+            return true;
+        }
+
+        // Проверяем существование маршрута
+        auto it = routes.find(routeKey);
+        if (it != routes.end()) {
+            it->second->refCount.fetch_add(1, std::memory_order_relaxed);
+            PERF_COUNT("RouteController.RouteExists");
+            Logger::Instance().Info(std::format("Route exists, ref count: {} (refs: {})",
+                routeKey, it->second->refCount.load(std::memory_order_relaxed)));
+            return true;
+        }
     }
 
-    auto it = routes.find(routeKey);
-    if (it != routes.end()) {
-        it->second->refCount++;
-        Logger::Instance().Info(std::format("Route already exists, incrementing ref count: {} (refs: {})",
-            routeKey, it->second->refCount.load()));
-        return true;
+    // КРИТИЧЕСКАЯ ОПТИМИЗАЦИЯ: Добавляем системный маршрут БЕЗ блокировки!
+    // Это самая медленная операция, другие потоки не ждут
+    bool systemRouteAdded = AddSystemRouteWithMask(ip, prefixLength);
+
+    if (!systemRouteAdded) {
+        PERF_COUNT("RouteController.SystemRouteAddFailed");
+        return false;
     }
 
-    if (AddSystemRouteWithMask(ip, prefixLength)) {
+    PERF_COUNT("RouteController.SystemRouteAdded");
+
+    // Теперь быстро обновляем внутренние структуры
+    {
+        std::unique_lock<std::shared_mutex> lock(routesMutex);
+
+        // Двойная проверка после блокировки
+        auto it = routes.find(routeKey);
+        if (it != routes.end()) {
+            it->second->refCount.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+
+        // Проверка лимитов
+        if (routes.size() >= Constants::MAX_ROUTES) {
+            CleanupOldRoutes();
+        }
+
+        // Быстрое добавление
         auto routeInfo = std::make_unique<RouteInfo>(ip, processName);
         routeInfo->prefixLength = prefixLength;
         routes[routeKey] = std::move(routeInfo);
-        Logger::Instance().Info(std::format("Added new route: {} for process: {}", routeKey, processName));
-        routesDirty = true;
 
-        NotifyUIRouteCountChanged();
-        return true;
+        routesDirty.store(true, std::memory_order_relaxed);
     }
 
-    return false;
+    // Метрика времени добавления
+    auto routeEndTime = std::chrono::high_resolution_clock::now();
+    auto totalTime = std::chrono::duration_cast<std::chrono::microseconds>(routeEndTime - routeStartTime);
+    PerformanceMonitor::Instance().RecordOperation("RouteController.AddRouteTotal", totalTime);
+
+    Logger::Instance().Info(std::format("Added route: {} for {}, time: {}µs",
+        routeKey, processName, totalTime.count()));
+
+    // ОПТИМИЗАЦИЯ: Асинхронное уведомление UI (не блокирует)
+    std::thread([this]() {
+        NotifyUIRouteCountChanged();
+        }).detach();
+
+    return true;
 }
 
 bool RouteController::RemoveRoute(const std::string& ip) {
@@ -670,7 +730,7 @@ bool RouteController::RemoveRoute(const std::string& ip) {
 }
 
 bool RouteController::RemoveRouteWithMask(const std::string& ip, int prefixLength) {
-    std::lock_guard<std::mutex> lock(routesMutex);
+    std::unique_lock<std::shared_mutex> lock(routesMutex);
 
     std::string routeKey = std::format("{}/{}", ip, prefixLength);
     auto it = routes.find(routeKey);
@@ -696,7 +756,7 @@ void RouteController::CleanupAllRoutes() {
     std::vector<std::pair<std::string, int>> routesToDelete;
     bool hadPreloadRoutes = false;
     {
-        std::lock_guard<std::mutex> lock(routesMutex);
+        std::unique_lock<std::shared_mutex> lock(routesMutex);
         if (routes.empty()) {
             Logger::Instance().Info("CleanupAllRoutes - No routes to clean");
             return;
@@ -762,12 +822,12 @@ void RouteController::CleanupOldRoutes() {
 }
 
 size_t RouteController::GetRouteCount() const {
-    std::lock_guard<std::mutex> lock(routesMutex);
+    std::shared_lock<std::shared_mutex> lock(routesMutex);
     return routes.size();
 }
 
 std::vector<RouteInfo> RouteController::GetActiveRoutes() const {
-    std::lock_guard<std::mutex> lock(routesMutex);
+    std::shared_lock<std::shared_mutex> lock(routesMutex);
     std::vector<RouteInfo> result;
 
     for (const auto& [key, routeInfo] : routes) {
@@ -782,16 +842,43 @@ std::vector<RouteInfo> RouteController::GetActiveRoutes() const {
 }
 
 bool RouteController::IsIPCoveredByExistingRoute(const std::string& ip) {
-    uint32_t ipAddr = IPToUInt(ip);
+    // Используем быстрое преобразование IP
+    uint32_t ipAddr = 0;
 
+    // Проверяем thread-local кэш
+    auto it = tlIPCache.find(ip);
+    if (it != tlIPCache.end()) {
+        ipAddr = it->second;
+    }
+    else {
+        ipAddr = Utils::FastIPToUInt(ip);
+        if (tlIPCache.size() > 1000) {
+            tlIPCache.clear();
+        }
+        tlIPCache[ip] = ipAddr;
+    }
+
+    // ОПТИМИЗАЦИЯ: Сначала проверяем крупные агрегаты (более вероятны)
     for (const auto& [routeKey, routeInfo] : routes) {
-        if (routeInfo->prefixLength >= 32) continue;
+        if (routeInfo->prefixLength >= 24) continue;
 
         uint32_t routeAddr = IPToUInt(routeInfo->ip);
         uint32_t mask = CreateMask(routeInfo->prefixLength);
 
         if ((ipAddr & mask) == (routeAddr & mask)) {
-            Logger::Instance().Debug(std::format("IP {} is covered by route {}", ip, routeKey));
+            PERF_COUNT("RouteController.CoveredByLargeAggregate");
+            return true;
+        }
+    }
+
+    // Затем проверяем /24 сети
+    uint32_t network24 = ipAddr & 0xFFFFFF00;
+    for (const auto& [routeKey, routeInfo] : routes) {
+        if (routeInfo->prefixLength != 24) continue;
+
+        uint32_t routeNetwork = IPToUInt(routeInfo->ip) & 0xFFFFFF00;
+        if (network24 == routeNetwork) {
+            PERF_COUNT("RouteController.CoveredBy24");
             return true;
         }
     }
@@ -800,11 +887,21 @@ bool RouteController::IsIPCoveredByExistingRoute(const std::string& ip) {
 }
 
 uint32_t RouteController::IPToUInt(const std::string& ip) {
-    struct in_addr addr;
-    if (inet_pton(AF_INET, ip.c_str(), &addr) == 1) {
-        return ntohl(addr.s_addr);
+    // Проверяем thread-local кэш
+    auto it = tlIPCache.find(ip);
+    if (it != tlIPCache.end()) {
+        return it->second;
     }
-    return 0;
+
+    uint32_t result = Utils::FastIPToUInt(ip);
+
+    // Ограничиваем размер кэша
+    if (tlIPCache.size() > 1000) {
+        tlIPCache.clear();
+    }
+
+    tlIPCache[ip] = result;
+    return result;
 }
 
 constexpr uint32_t RouteController::CreateMask(int prefixLength) {
@@ -818,72 +915,62 @@ bool RouteController::AddSystemRoute(const std::string& ip) {
 }
 
 bool RouteController::AddSystemRouteWithMask(const std::string& ip, int prefixLength) {
-    MIB_IPFORWARD_ROW2 route;
-    InitializeIpForwardEntry(&route);
+    PERF_TIMER("RouteController::AddSystemRouteWithMask");
+
+    // Используем thread-local структуру для избежания аллокаций
+    if (!tlRouteInitialized) {
+        InitializeIpForwardEntry(&tlRoute);
+        tlRouteInitialized = true;
+    }
 
     SOCKADDR_INET destAddr = { 0 };
     SOCKADDR_INET nextHop = { 0 };
 
     destAddr.si_family = AF_INET;
-    if (inet_pton(AF_INET, ip.c_str(), &destAddr.Ipv4.sin_addr) != 1) {
-        Logger::Instance().Error(std::format("Invalid destination IP: {}", ip));
-        return false;
-    }
+    inet_pton(AF_INET, ip.c_str(), &destAddr.Ipv4.sin_addr);
 
     nextHop.si_family = AF_INET;
-    if (inet_pton(AF_INET, config.gatewayIp.c_str(), &nextHop.Ipv4.sin_addr) != 1) {
-        Logger::Instance().Error(std::format("Invalid gateway IP: {}", config.gatewayIp));
-        return false;
-    }
+    inet_pton(AF_INET, config.gatewayIp.c_str(), &nextHop.Ipv4.sin_addr);
 
     NET_IFINDEX bestInterface = 0;
+
+    // Используем кэшированный интерфейс
     {
-        std::lock_guard<std::mutex> lock(interfaceCacheMutex);
-        if (cachedInterfaceIndex != 0) {
-            bestInterface = cachedInterfaceIndex;
-        }
+        std::shared_lock<std::shared_mutex> lock(interfaceCacheMutex);
+        bestInterface = cachedInterfaceIndex;
     }
 
     if (bestInterface == 0) {
         DWORD result = GetBestInterface(nextHop.Ipv4.sin_addr.s_addr, &bestInterface);
         if (result != NO_ERROR) {
-            Logger::Instance().Error(std::format("GetBestInterface failed: {}", result));
             return false;
         }
-        std::lock_guard<std::mutex> lock(interfaceCacheMutex);
+
+        std::unique_lock<std::shared_mutex> lock(interfaceCacheMutex);
         cachedInterfaceIndex = bestInterface;
     }
 
-    route.InterfaceIndex = bestInterface;
-    route.DestinationPrefix.Prefix = destAddr;
-    route.DestinationPrefix.PrefixLength = prefixLength;
-    route.NextHop = nextHop;
-    route.Protocol = MIB_IPPROTO_NETMGMT;
-    route.Metric = config.metric;
+    // Переиспользуем thread-local структуру
+    tlRoute.InterfaceIndex = bestInterface;
+    tlRoute.DestinationPrefix.Prefix = destAddr;
+    tlRoute.DestinationPrefix.PrefixLength = prefixLength;
+    tlRoute.NextHop = nextHop;
+    tlRoute.Protocol = MIB_IPPROTO_NETMGMT;
+    tlRoute.Metric = config.metric;
 
-    Logger::Instance().Debug(std::format("Adding route via CreateIpForwardEntry2: {}/{} -> {} (interface: {})",
-        ip, prefixLength, config.gatewayIp, bestInterface));
+    DWORD result = CreateIpForwardEntry2(&tlRoute);
 
-    DWORD result = CreateIpForwardEntry2(&route);
-
-    if (result == NO_ERROR) {
-        Logger::Instance().Info(std::format("Successfully added route: {}/{} -> {}",
-            ip, prefixLength, config.gatewayIp));
+    if (result == NO_ERROR || result == ERROR_OBJECT_ALREADY_EXISTS) {
+        PERF_COUNT("RouteController.SystemRouteSuccess");
         return true;
     }
-    else if (result == ERROR_OBJECT_ALREADY_EXISTS) {
-        Logger::Instance().Debug(std::format("Route already exists: {}/{}", ip, prefixLength));
-        return true;
-    }
-    else {
-        Logger::Instance().Error(std::format("CreateIpForwardEntry2 failed: {}", result));
 
-        if (result == ERROR_NOT_FOUND || result == ERROR_INVALID_FUNCTION) {
-            return AddSystemRouteOldAPIWithMask(ip, prefixLength);
-        }
-
-        return false;
+    // Fallback на старый API
+    if (result == ERROR_NOT_FOUND || result == ERROR_INVALID_FUNCTION) {
+        return AddSystemRouteOldAPIWithMask(ip, prefixLength);
     }
+
+    return false;
 }
 
 bool RouteController::AddSystemRouteOldAPI(const std::string& ip) {
@@ -891,76 +978,35 @@ bool RouteController::AddSystemRouteOldAPI(const std::string& ip) {
 }
 
 bool RouteController::AddSystemRouteOldAPIWithMask(const std::string& ip, int prefixLength) {
-    Logger::Instance().Info("Falling back to old API for compatibility");
+    PERF_TIMER("RouteController::AddSystemRouteOldAPI");
 
-    MIB_IPFORWARDROW route = { 0 };
-
-    route.dwForwardDest = inet_addr(ip.c_str());
-    if (route.dwForwardDest == INADDR_NONE) {
-        Logger::Instance().Error(std::format("Invalid IP address: {}", ip));
+    // Переиспользуем thread-local структуру
+    tlOldRoute.dwForwardDest = inet_addr(ip.c_str());
+    if (tlOldRoute.dwForwardDest == INADDR_NONE) {
         return false;
     }
 
     DWORD mask = prefixLength == 0 ? 0 : (0xFFFFFFFF << (32 - prefixLength));
-    route.dwForwardMask = htonl(mask);
-
-    route.dwForwardPolicy = 0;
-    route.dwForwardNextHop = inet_addr(config.gatewayIp.c_str());
-
-    if (route.dwForwardNextHop == INADDR_NONE) {
-        Logger::Instance().Error(std::format("Invalid gateway IP: {}", config.gatewayIp));
-        return false;
-    }
+    tlOldRoute.dwForwardMask = htonl(mask);
+    tlOldRoute.dwForwardPolicy = 0;
+    tlOldRoute.dwForwardNextHop = inet_addr(config.gatewayIp.c_str());
 
     DWORD bestInterface = 0;
-    DWORD result = GetBestInterface(route.dwForwardNextHop, &bestInterface);
-    if (result != NO_ERROR) {
-        Logger::Instance().Error(std::format("GetBestInterface failed: {}", result));
-        return false;
-    }
+    GetBestInterface(tlOldRoute.dwForwardNextHop, &bestInterface);
+    tlOldRoute.dwForwardIfIndex = bestInterface;
 
-    route.dwForwardIfIndex = bestInterface;
+    tlOldRoute.dwForwardType = 4;
+    tlOldRoute.dwForwardProto = 3;
+    tlOldRoute.dwForwardAge = 0;
+    tlOldRoute.dwForwardNextHopAS = 0;
+    tlOldRoute.dwForwardMetric1 = config.metric;
+    tlOldRoute.dwForwardMetric2 = 0xFFFFFFFF;
+    tlOldRoute.dwForwardMetric3 = 0xFFFFFFFF;
+    tlOldRoute.dwForwardMetric4 = 0xFFFFFFFF;
+    tlOldRoute.dwForwardMetric5 = 0xFFFFFFFF;
 
-    MIB_IPINTERFACE_ROW iface;
-    InitializeIpInterfaceEntry(&iface);
-    iface.Family = AF_INET;
-    iface.InterfaceIndex = bestInterface;
-
-    ULONG minMetric = config.metric;
-    result = GetIpInterfaceEntry(&iface);
-    if (result == NO_ERROR) {
-        minMetric = iface.Metric + config.metric;
-        Logger::Instance().Info(std::format("Interface metric: {}, using route metric: {}",
-            iface.Metric, minMetric));
-    }
-    else {
-        Logger::Instance().Warning(std::format("GetIpInterfaceEntry failed: {}, using default metric", result));
-    }
-
-    route.dwForwardType = 4;
-    route.dwForwardProto = 3;
-    route.dwForwardAge = 0;
-    route.dwForwardNextHopAS = 0;
-    route.dwForwardMetric1 = minMetric;
-    route.dwForwardMetric2 = 0xFFFFFFFF;
-    route.dwForwardMetric3 = 0xFFFFFFFF;
-    route.dwForwardMetric4 = 0xFFFFFFFF;
-    route.dwForwardMetric5 = 0xFFFFFFFF;
-
-    result = CreateIpForwardEntry(&route);
-
-    if (result == NO_ERROR) {
-        Logger::Instance().Info(std::format("Successfully added route via old API: {}/{}", ip, prefixLength));
-        return true;
-    }
-    else if (result == ERROR_OBJECT_ALREADY_EXISTS) {
-        Logger::Instance().Debug(std::format("Route already exists: {}/{}", ip, prefixLength));
-        return true;
-    }
-    else {
-        Logger::Instance().Error(std::format("CreateIpForwardEntry failed: {}", result));
-        return false;
-    }
+    DWORD result = CreateIpForwardEntry(&tlOldRoute);
+    return (result == NO_ERROR || result == ERROR_OBJECT_ALREADY_EXISTS);
 }
 
 bool RouteController::RemoveSystemRoute(const std::string& ip, const std::string& gatewayIp) {
@@ -1009,38 +1055,54 @@ void RouteController::VerifyRoutesThreadFunc(std::stop_token stopToken) {
 
     try {
         while (!stopToken.stop_requested() && !ShutdownCoordinator::Instance().isShuttingDown) {
-            for (int i = 0; i < Constants::ROUTE_VERIFY_INTERVAL_SEC &&
-                !stopToken.stop_requested() && !ShutdownCoordinator::Instance().isShuttingDown; i++) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-            }
-
-            if (stopToken.stop_requested() || ShutdownCoordinator::Instance().isShuttingDown) {
+            // Используем condition variable вместо sleep loop
+            std::unique_lock<std::mutex> lock(optimizationMutex);
+            if (optimizationCV.wait_for(lock, std::chrono::seconds(Constants::ROUTE_VERIFY_INTERVAL_SEC),
+                [&stopToken] { return stopToken.stop_requested(); })) {
                 break;
             }
+            lock.unlock();
 
             if (!IsGatewayReachable()) {
                 InvalidateInterfaceCache();
                 continue;
             }
 
-            std::vector<std::pair<std::string, int>> routesToVerify;
+            // Собираем маршруты для верификации батчами
+            constexpr size_t BATCH_SIZE = 100;
+            std::vector<std::pair<std::string, int>> routeBatch;
+            routeBatch.reserve(BATCH_SIZE);
+
             {
-                std::lock_guard<std::mutex> lock(routesMutex);
-                if (stopToken.stop_requested() || ShutdownCoordinator::Instance().isShuttingDown) {
-                    break;
-                }
+                std::shared_lock<std::shared_mutex> lock(routesMutex);
 
                 for (const auto& [key, routeInfo] : routes) {
-                    routesToVerify.emplace_back(routeInfo->ip, routeInfo->prefixLength);
+                    routeBatch.emplace_back(routeInfo->ip, routeInfo->prefixLength);
+
+                    if (routeBatch.size() >= BATCH_SIZE) {
+                        lock.unlock();
+
+                        // Верифицируем батч
+                        for (const auto& [ip, prefixLength] : routeBatch) {
+                            if (stopToken.stop_requested() || ShutdownCoordinator::Instance().isShuttingDown) {
+                                Logger::Instance().Info("Route verification interrupted by shutdown");
+                                return;
+                            }
+                            AddSystemRouteWithMask(ip, prefixLength);
+                        }
+
+                        routeBatch.clear();
+                        lock.lock();
+                    }
                 }
             }
 
-            for (const auto& [ip, prefixLength] : routesToVerify) {
+            // Верифицируем оставшиеся маршруты
+            for (const auto& [ip, prefixLength] : routeBatch) {
                 if (stopToken.stop_requested() || ShutdownCoordinator::Instance().isShuttingDown) {
                     Logger::Instance().Info("Route verification interrupted by shutdown");
                     break;
                 }
-
                 AddSystemRouteWithMask(ip, prefixLength);
             }
         }
@@ -1053,7 +1115,7 @@ void RouteController::VerifyRoutesThreadFunc(std::stop_token stopToken) {
 }
 
 void RouteController::SaveRoutesToDisk() {
-    std::lock_guard<std::mutex> lock(routesMutex);
+    std::unique_lock<std::shared_mutex> lock(routesMutex);
 
     std::ofstream file(Constants::STATE_FILE + ".tmp");
     if (!file.is_open()) return;

@@ -1,9 +1,10 @@
-﻿// src/service/RouteController.h
+﻿// src/service/RouteController.h (обновленная версия)
 #pragma once
 #include <string>
 #include <unordered_map>
 #include <vector>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <atomic>
 #include <chrono>
@@ -27,7 +28,7 @@ public:
     RouteController(const ServiceConfig& config);
     ~RouteController();
 
-    // Public API - unchanged
+    // Public API
     bool AddRoute(const std::string& ip, const std::string& processName);
     bool AddRouteWithMask(const std::string& ip, int prefixLength, const std::string& processName);
     bool RemoveRoute(const std::string& ip);
@@ -45,13 +46,12 @@ public:
     void PerformFullCleanup();
     void CleanupRedundantRoutes();
 
-    // New method for detailed error info when needed
     const RouteError& GetLastError() const { return lastError; }
 
 private:
     ServiceConfig config;
     std::unordered_map<std::string, std::unique_ptr<RouteInfo>> routes;
-    mutable std::mutex routesMutex;
+    mutable std::shared_mutex routesMutex;  // Read-write lock для маршрутов
     std::atomic<bool> running;
 
     std::jthread verifyThread;
@@ -64,7 +64,7 @@ private:
     std::mutex optimizationMutex;
 
     NET_IFINDEX cachedInterfaceIndex;
-    std::mutex interfaceCacheMutex;
+    mutable std::shared_mutex interfaceCacheMutex;  // Read-write lock для кэша интерфейса
 
     std::atomic<bool> routesDirty{ false };
     std::chrono::steady_clock::time_point lastSaveTime;
@@ -82,7 +82,6 @@ private:
     bool RemoveSystemRoute(const std::string& ip, const std::string& gatewayIp);
     bool RemoveSystemRouteWithMask(const std::string& ip, int prefixLength, const std::string& gatewayIp);
 
-    // New internal methods with Result for better error handling
     Result<void> AddSystemRouteEx(const std::string& ip, int prefixLength);
     Result<void> RemoveSystemRouteEx(const std::string& ip, int prefixLength, const std::string& gatewayIp);
 

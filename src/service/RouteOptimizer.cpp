@@ -40,6 +40,8 @@ OptimizationPlan RouteOptimizer::OptimizeRoutes(const std::vector<HostRoute>& ho
 
     // Filter out private IPs
     std::vector<HostRoute> publicRoutes;
+    publicRoutes.reserve(hostRoutes.size()); // Pre-allocate for efficiency
+
     for (const auto& route : hostRoutes) {
         if (!IsPrivateNetwork(route.ipNum)) {
             publicRoutes.push_back(route);
@@ -249,7 +251,7 @@ int RouteOptimizer::AggregateEnhancedTrie(TrieNode* node, int depth) {
         // Check waste threshold
         auto it = config.waste_thresholds.find(prefixLen);
         if (it != config.waste_thresholds.end()) {
-            long double totalPossibleHosts = pow(2.0L, 32 - depth);
+            long double totalPossibleHosts = std::exp2l(32 - depth); // More efficient than pow
             float wasteRatio = static_cast<float>((totalPossibleHosts - totalCount) / totalPossibleHosts);
 
             if (wasteRatio <= it->second) {
@@ -385,8 +387,7 @@ uint32_t RouteOptimizer::CreateMask(int prefixLength) {
     if (prefixLength >= 32) return 0xFFFFFFFF;
 
     // Optimized version using bit rotation intrinsics
-    // Instead of: return ~((1u << (32 - prefixLength)) - 1);
-    // We can use std::rotr for potentially better performance on modern CPUs
+    // This is more efficient than: return ~((1u << (32 - prefixLength)) - 1);
     return std::rotr(0xFFFFFFFF, 32 - prefixLength);
 }
 
@@ -402,18 +403,21 @@ std::string RouteOptimizer::UIntToIP(uint32_t ip) {
 
 bool RouteOptimizer::IsPrivateNetwork(uint32_t ip) {
     // Check for private IP ranges using optimized bit operations
+    // Using constexpr for compile-time evaluation
+    constexpr uint32_t MASK_8 = 0xFF000000;
+    constexpr uint32_t MASK_12 = 0xFFF00000;
+    constexpr uint32_t MASK_16 = 0xFFFF0000;
 
-    // 10.0.0.0/8 - Check if top 8 bits equal 0x0A
-    if ((ip & 0xFF000000) == 0x0A000000) return true;
+    constexpr uint32_t NET_10 = 0x0A000000;     // 10.0.0.0/8
+    constexpr uint32_t NET_172_16 = 0xAC100000; // 172.16.0.0/12
+    constexpr uint32_t NET_192_168 = 0xC0A80000; // 192.168.0.0/16
+    constexpr uint32_t NET_127 = 0x7F000000;     // 127.0.0.0/8 (loopback)
 
-    // 172.16.0.0/12 - Check if top 12 bits equal 0xAC1
-    if ((ip & 0xFFF00000) == 0xAC100000) return true;
-
-    // 192.168.0.0/16 - Check if top 16 bits equal 0xC0A8
-    if ((ip & 0xFFFF0000) == 0xC0A80000) return true;
-
-    // 127.0.0.0/8 (loopback) - Check if top 8 bits equal 0x7F
-    if ((ip & 0xFF000000) == 0x7F000000) return true;
+    // Use single comparison per range for better branch prediction
+    if ((ip & MASK_8) == NET_10) return true;
+    if ((ip & MASK_12) == NET_172_16) return true;
+    if ((ip & MASK_16) == NET_192_168) return true;
+    if ((ip & MASK_8) == NET_127) return true;
 
     return false;
 }

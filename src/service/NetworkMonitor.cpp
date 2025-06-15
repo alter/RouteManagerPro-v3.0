@@ -86,6 +86,10 @@ void NetworkMonitor::MonitorThreadFunc() {
     // Привязываем поток к процессору для лучшей производительности
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 
+    // Пытаемся привязать к конкретному CPU для уменьшения cache misses
+    DWORD_PTR mask = 1; // CPU 0
+    SetThreadAffinityMask(GetCurrentThread(), mask);
+
     EventBatch eventBatch;
     WINDIVERT_ADDRESS addr;
 
@@ -175,6 +179,9 @@ void NetworkMonitor::MonitorThreadFunc() {
 void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr, EventBatch& batch) {
     PERF_TIMER("NetworkMonitor::ProcessFlowEvent");
 
+    // Запоминаем время начала обработки события
+    auto eventStartTime = std::chrono::high_resolution_clock::now();
+
     bool isSelected = processManager->IsSelectedProcessByPid(addr.Flow.ProcessId);
     if (!isSelected) {
         PERF_COUNT("NetworkMonitor.FlowEvent.Filtered");
@@ -219,6 +226,12 @@ void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr, EventBatch&
     if (addr.Event == WINDIVERT_EVENT_FLOW_ESTABLISHED) {
         PERF_COUNT("NetworkMonitor.FlowEvent.Established");
 
+        // Сохраняем время начала для этого маршрута
+        {
+            std::lock_guard<std::mutex> lock(routeTimingMutex);
+            routeAddStartTimes[remoteIp] = eventStartTime;
+        }
+
         // Добавляем в батч вместо немедленной обработки
         batch.add(remoteIp, processName);
 
@@ -262,9 +275,54 @@ void NetworkMonitor::FlushEventBatch(EventBatch& batch) {
     if (routeController) {
         for (size_t i = 0; i < batch.count; ++i) {
             const auto& [ip, process] = batch.events[i];
+
+            auto routeAddStart = std::chrono::high_resolution_clock::now();
+
+            // Получаем время начала для этого маршрута
+            {
+                std::lock_guard<std::mutex> lock(routeTimingMutex);
+                auto it = routeAddStartTimes.find(ip);
+                if (it != routeAddStartTimes.end()) {
+                    routeAddStart = it->second;
+                    routeAddStartTimes.erase(it);
+                }
+            }
+
             Logger::Instance().Info(std::format("Adding route (batched) for {} (process: {})", ip, process));
-            routeController->AddRoute(ip, process);
-            PERF_COUNT("NetworkMonitor.RouteAdded");
+
+            bool success = routeController->AddRoute(ip, process);
+
+            if (success) {
+                auto routeAddEnd = std::chrono::high_resolution_clock::now();
+                auto totalTime = std::chrono::duration_cast<std::chrono::microseconds>(routeAddEnd - routeAddStart);
+
+                // Записываем метрику времени добавления маршрута
+                PerformanceMonitor::Instance().RecordOperation("RouteAddLatency", totalTime);
+
+                PERF_COUNT("NetworkMonitor.RouteAdded");
+
+                // Логируем время добавления маршрута
+                if (totalTime.count() > 1000) { // Если больше 1мс
+                    Logger::Instance().Warning(std::format("Route add latency for {}: {}µs", ip, totalTime.count()));
+                }
+                else {
+                    Logger::Instance().Debug(std::format("Route add latency for {}: {}µs", ip, totalTime.count()));
+                }
+
+                // Обновляем статистику
+                {
+                    std::lock_guard<std::mutex> lock(routeTimingMutex);
+                    totalRoutesAdded.fetch_add(1, std::memory_order_relaxed);
+                    totalRouteAddTime += totalTime;
+
+                    if (totalTime < minRouteAddTime || minRouteAddTime.count() == 0) {
+                        minRouteAddTime = totalTime;
+                    }
+                    if (totalTime > maxRouteAddTime) {
+                        maxRouteAddTime = totalTime;
+                    }
+                }
+            }
         }
     }
 
@@ -363,9 +421,22 @@ void NetworkMonitor::LogPerformanceStats() {
     }
 
     for (const auto& op : report.operations) {
-        if (op.name.starts_with("NetworkMonitor::")) {
+        if (op.name.starts_with("NetworkMonitor::") || op.name == "RouteAddLatency") {
             Logger::Instance().Info(std::format("{}: {} calls, avg: {}us, p95: {}us",
                 op.name, op.count, op.avgTime.count(), op.p95Time.count()));
+        }
+    }
+
+    // Логируем статистику времени добавления маршрутов
+    {
+        std::lock_guard<std::mutex> lock(routeTimingMutex);
+        uint64_t routesAdded = totalRoutesAdded.load(std::memory_order_relaxed);
+        if (routesAdded > 0) {
+            auto avgTime = totalRouteAddTime / routesAdded;
+            Logger::Instance().Info(std::format("Route Add Statistics: {} routes added", routesAdded));
+            Logger::Instance().Info(std::format("  Average time: {}µs", avgTime.count()));
+            Logger::Instance().Info(std::format("  Min time: {}µs", minRouteAddTime.count()));
+            Logger::Instance().Info(std::format("  Max time: {}µs", maxRouteAddTime.count()));
         }
     }
 }
