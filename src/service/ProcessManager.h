@@ -160,6 +160,10 @@ private:
     void CleanupStalePids(std::unordered_map<DWORD, CachedProcessInfo>& cache,
         const std::unordered_set<DWORD>& alivePids);
 
+    // New cache optimization methods
+    void PromoteToMainCache(DWORD pid, const CachedProcessInfo& info);
+    void MergeWithExistingCache(std::unordered_map<DWORD, CachedProcessInfo>& newCache);
+
     // Optimized string conversion with caching
     std::string CachedWStringToString(const std::wstring& wstr);
     std::wstring CachedStringToWString(const std::string& str);

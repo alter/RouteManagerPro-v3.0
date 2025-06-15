@@ -10,7 +10,7 @@
 #include <algorithm>
 #include <format>
 #include <ranges>
-#include <execution>  // для параллельных алгоритмов
+#include <execution>
 
 ProcessManager::ProcessManager(const ServiceConfig& config, const PerformanceConfig& perfCfg)
     : running(true), perfConfig(perfCfg), m_pidMissCache(perfCfg.missCacheMaxSize),
@@ -34,22 +34,35 @@ ProcessManager::ProcessManager(const ServiceConfig& config, const PerformanceCon
 ProcessManager::~ProcessManager() {
     Logger::Instance().Debug("ProcessManager::~ProcessManager - Destructor called");
     running = false;
-    // std::jthread автоматически вызовет request_stop() и join()
 }
 
 bool ProcessManager::IsSelectedProcessByPid(DWORD pid) {
     PERF_TIMER("ProcessManager::IsSelectedProcessByPid");
 
-    // Оптимизация: сначала проверяем кэш без блокировки
+    // Check cache first
     auto cachedInfo = GetCachedInfo(pid);
     if (cachedInfo.has_value()) {
-        stats.hits.fetch_add(1, std::memory_order_relaxed);  // Используем relaxed ordering
+        stats.hits.fetch_add(1, std::memory_order_relaxed);
         return cachedInfo->isSelected;
     }
 
+    // Cache miss - get complete info
     auto info = GetCompleteProcessInfo(pid);
     if (info.has_value()) {
+        // CRITICAL FIX: Add to BOTH caches immediately
+        {
+            std::unique_lock lock(cachesMutex);
+
+            // Add to main cache if there's room
+            if (m_pidCache.size() < perfConfig.mainCacheMaxSize) {
+                m_pidCache[pid] = *info;
+                Logger::Instance().Debug(std::format("Added PID {} to main cache immediately", pid));
+            }
+        }
+
+        // Also add to miss cache for redundancy
         m_pidMissCache.put(pid, *info);
+
         stats.misses.fetch_add(1, std::memory_order_relaxed);
         stats.newProcessChecks.fetch_add(1, std::memory_order_relaxed);
         return info->isSelected;
@@ -60,24 +73,51 @@ bool ProcessManager::IsSelectedProcessByPid(DWORD pid) {
 }
 
 std::optional<CachedProcessInfo> ProcessManager::GetCachedInfo(DWORD pid) {
-    // Оптимизация: используем read-write lock вместо обычного mutex
+    // Check main cache first with shared lock
     {
         std::shared_lock lock(cachesMutex);
 
         if (auto it = m_pidCache.find(pid); it != m_pidCache.end()) {
+            // OPTIMIZATION: Update access time for LRU-like behavior
+            it->second.lastVerified = std::chrono::steady_clock::now();
             stats.hits.fetch_add(1, std::memory_order_relaxed);
             return it->second;
         }
     }
 
+    // Check miss cache
     auto missInfo = m_pidMissCache.get(pid);
     if (missInfo.has_value()) {
+        // OPTIMIZATION: Promote from miss cache to main cache if frequently accessed
+        PromoteToMainCache(pid, *missInfo);
         stats.hits.fetch_add(1, std::memory_order_relaxed);
         return missInfo;
     }
 
     stats.misses.fetch_add(1, std::memory_order_relaxed);
     return std::nullopt;
+}
+
+void ProcessManager::PromoteToMainCache(DWORD pid, const CachedProcessInfo& info) {
+    std::unique_lock lock(cachesMutex);
+
+    // Only promote if there's room or if we can evict old entries
+    if (m_pidCache.size() >= perfConfig.mainCacheMaxSize) {
+        // Find and remove the oldest entry
+        auto oldest = std::min_element(m_pidCache.begin(), m_pidCache.end(),
+            [](const auto& a, const auto& b) {
+                return a.second.lastVerified < b.second.lastVerified;
+            });
+
+        if (oldest != m_pidCache.end()) {
+            Logger::Instance().Debug(std::format("Evicting old PID {} from main cache", oldest->first));
+            m_pidCache.erase(oldest);
+            stats.cacheEvictions.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    m_pidCache[pid] = info;
+    Logger::Instance().Debug(std::format("Promoted PID {} from miss cache to main cache", pid));
 }
 
 std::optional<CachedProcessInfo> ProcessManager::CheckProcessAndCache(DWORD pid) {
@@ -90,6 +130,13 @@ std::optional<CachedProcessInfo> ProcessManager::CheckProcessAndCache(DWORD pid)
 
     auto info = GetCompleteProcessInfo(pid);
     if (info.has_value() && info->isSelected) {
+        // Add to both caches
+        {
+            std::unique_lock lock(cachesMutex);
+            if (m_pidCache.size() < perfConfig.mainCacheMaxSize) {
+                m_pidCache[pid] = *info;
+            }
+        }
         m_pidMissCache.put(pid, *info);
         return info;
     }
@@ -110,8 +157,16 @@ void ProcessManager::AddToPidCache(DWORD pid, const CachedProcessInfo& info) {
     std::unique_lock lock(cachesMutex);
 
     if (m_pidCache.size() >= perfConfig.mainCacheMaxSize) {
-        Logger::Instance().Warning(std::format("Main cache full, not adding PID {}", pid));
-        return;
+        // Evict oldest entry
+        auto oldest = std::min_element(m_pidCache.begin(), m_pidCache.end(),
+            [](const auto& a, const auto& b) {
+                return a.second.lastVerified < b.second.lastVerified;
+            });
+
+        if (oldest != m_pidCache.end()) {
+            m_pidCache.erase(oldest);
+            stats.cacheEvictions.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     m_pidCache[pid] = info;
@@ -129,7 +184,6 @@ bool ProcessManager::IsProcessSelected(const std::string& processName) const {
 bool ProcessManager::IsProcessSelectedInternal(const std::string& processName) const {
     std::lock_guard<std::mutex> lock(selectedMutex);
 
-    // Оптимизация: используем параллельный поиск для больших списков
     if (selectedProcesses.size() > 100) {
         return std::any_of(std::execution::par_unseq,
             selectedProcesses.begin(), selectedProcesses.end(),
@@ -157,11 +211,17 @@ void ProcessManager::SetSelectedProcesses(const std::vector<std::string>& proces
         selectedProcesses.insert(processes.begin(), processes.end());
     }
 
+    // Don't clear caches completely - just mark entries as needing verification
     {
         std::unique_lock lock(cachesMutex);
-        m_pidCache.clear();
-        m_pidMissCache.clear();
+        for (auto& [pid, info] : m_pidCache) {
+            // Recalculate isSelected for existing entries
+            info.isSelected = IsProcessSelectedInternal(CachedWStringToString(info.name));
+        }
     }
+
+    // Clear miss cache as it might have outdated selection info
+    m_pidMissCache.clear();
 }
 
 std::vector<std::string> ProcessManager::GetSelectedProcesses() const {
@@ -172,14 +232,12 @@ std::vector<std::string> ProcessManager::GetSelectedProcesses() const {
 void ProcessManager::UpdateThreadFunc(std::stop_token stopToken) {
     Logger::Instance().Debug("ProcessManager::UpdateThreadFunc - Started");
 
-    // Оптимизация: используем condition variable вместо sleep loop
     std::mutex updateMutex;
     std::condition_variable_any updateCV;
 
     while (!stopToken.stop_requested() && !ShutdownCoordinator::Instance().isShuttingDown) {
         std::unique_lock<std::mutex> lock(updateMutex);
 
-        // Ждем 5 секунд или пока не придет stop_requested
         if (updateCV.wait_for(lock, stopToken, std::chrono::seconds(5),
             [&stopToken] { return stopToken.stop_requested(); })) {
             break;
@@ -194,15 +252,18 @@ void ProcessManager::UpdateThreadFunc(std::stop_token stopToken) {
 
             auto newCache = BuildProcessSnapshot();
 
-            MergeMissCacheIntoMain(newCache);
+            // Merge with existing cache to preserve frequently accessed entries
+            MergeWithExistingCache(newCache);
 
             {
                 std::unique_lock lock(cachesMutex);
                 m_pidCache = std::move(newCache);
-                m_pidMissCache.clear();
+
+                // Don't clear miss cache - it has valuable data
+                // m_pidMissCache.clear();
 
                 allProcesses.clear();
-                allProcesses.reserve(m_pidCache.size());  // Оптимизация: резервируем память заранее
+                allProcesses.reserve(m_pidCache.size());
 
                 for (const auto& [pid, info] : m_pidCache) {
                     ProcessInfo procInfo;
@@ -212,7 +273,7 @@ void ProcessManager::UpdateThreadFunc(std::stop_token stopToken) {
                     procInfo.isSelected = info.isSelected;
                     procInfo.isGame = Utils::IsGameProcess(CachedWStringToString(info.name));
                     procInfo.isDiscord = Utils::IsDiscordProcess(CachedWStringToString(info.name));
-                    allProcesses.push_back(std::move(procInfo));  // Используем move semantics
+                    allProcesses.push_back(std::move(procInfo));
                 }
             }
 
@@ -226,16 +287,30 @@ void ProcessManager::UpdateThreadFunc(std::stop_token stopToken) {
     Logger::Instance().Debug("ProcessManager::UpdateThreadFunc - Exiting");
 }
 
+void ProcessManager::MergeWithExistingCache(std::unordered_map<DWORD, CachedProcessInfo>& newCache) {
+    std::shared_lock lock(cachesMutex);
+
+    // Preserve access times for existing entries
+    for (auto& [pid, newInfo] : newCache) {
+        if (auto it = m_pidCache.find(pid); it != m_pidCache.end()) {
+            // Preserve the last verified time if the process info hasn't changed
+            if (it->second.creationTime.dwLowDateTime == newInfo.creationTime.dwLowDateTime &&
+                it->second.creationTime.dwHighDateTime == newInfo.creationTime.dwHighDateTime) {
+                newInfo.lastVerified = it->second.lastVerified;
+            }
+        }
+    }
+}
+
 std::unordered_map<DWORD, CachedProcessInfo> ProcessManager::BuildProcessSnapshot() {
     PERF_TIMER("ProcessManager::BuildProcessSnapshot");
 
     std::unordered_map<DWORD, CachedProcessInfo> newCache;
-    newCache.reserve(1000);  // Оптимизация: резервируем память для типичного количества процессов
+    newCache.reserve(1000);
 
     std::unordered_set<DWORD> alivePids;
     alivePids.reserve(1000);
 
-    // Оптимизация: используем более эффективный способ итерации
     UniqueHandle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0), HandleDeleter{});
     if (!snapshot || snapshot.get() == INVALID_HANDLE_VALUE) {
         Logger::Instance().Error("ProcessManager::BuildProcessSnapshot - Failed to create snapshot");
@@ -253,7 +328,7 @@ std::unordered_map<DWORD, CachedProcessInfo> ProcessManager::BuildProcessSnapsho
 
             auto infoOpt = GetCompleteProcessInfo(pe32.th32ProcessID);
             if (infoOpt.has_value()) {
-                newCache.emplace(pe32.th32ProcessID, std::move(*infoOpt));  // Используем emplace и move
+                newCache.emplace(pe32.th32ProcessID, std::move(*infoOpt));
             }
 
         } while (Process32NextW(snapshot.get(), &pe32));
@@ -297,7 +372,7 @@ void ProcessManager::MergeMissCacheIntoMain(std::unordered_map<DWORD, CachedProc
         if (!mainCache.contains(pid)) {
             auto currentInfo = GetCompleteProcessInfo(pid);
             if (currentInfo.has_value()) {
-                mainCache.emplace(pid, std::move(*currentInfo));  // Используем emplace и move
+                mainCache.emplace(pid, std::move(*currentInfo));
             }
         }
         });
@@ -333,7 +408,6 @@ void ProcessManager::LogPerformanceStats() const {
 }
 
 bool ProcessManager::MatchesWildcard(const std::string& processName, const std::string& pattern) const {
-    // Оптимизация: кэшируем результаты сравнения для часто используемых паттернов
     static thread_local std::unordered_map<std::string, bool> matchCache;
 
     std::string cacheKey = processName + "|" + pattern;
@@ -341,7 +415,7 @@ bool ProcessManager::MatchesWildcard(const std::string& processName, const std::
         return it->second;
     }
 
-    if (matchCache.size() > 1000) {  // Очищаем кэш если он слишком большой
+    if (matchCache.size() > 1000) {
         matchCache.clear();
     }
 
@@ -399,7 +473,6 @@ void ProcessManager::CleanupStalePids(std::unordered_map<DWORD, CachedProcessInf
 std::string ProcessManager::CachedWStringToString(const std::wstring& wstr) {
     PERF_TIMER("ProcessManager::StringConversion");
 
-    // Check cache first
     auto cached = m_wstringToStringCache.get(wstr);
     if (cached.has_value()) {
         stats.stringCacheHits.fetch_add(1, std::memory_order_relaxed);
@@ -408,10 +481,7 @@ std::string ProcessManager::CachedWStringToString(const std::wstring& wstr) {
 
     stats.stringCacheMisses.fetch_add(1, std::memory_order_relaxed);
 
-    // Convert
     std::string result = Utils::WStringToString(wstr);
-
-    // Cache the result
     m_wstringToStringCache.put(wstr, result);
 
     return result;
@@ -420,7 +490,6 @@ std::string ProcessManager::CachedWStringToString(const std::wstring& wstr) {
 std::wstring ProcessManager::CachedStringToWString(const std::string& str) {
     PERF_TIMER("ProcessManager::StringConversion");
 
-    // Check cache first
     auto cached = m_stringToWstringCache.get(str);
     if (cached.has_value()) {
         stats.stringCacheHits.fetch_add(1, std::memory_order_relaxed);
@@ -429,10 +498,7 @@ std::wstring ProcessManager::CachedStringToWString(const std::string& str) {
 
     stats.stringCacheMisses.fetch_add(1, std::memory_order_relaxed);
 
-    // Convert
     std::wstring result = Utils::StringToWString(str);
-
-    // Cache the result
     m_stringToWstringCache.put(str, result);
 
     return result;
