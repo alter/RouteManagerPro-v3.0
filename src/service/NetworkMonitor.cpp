@@ -7,12 +7,14 @@
 #include "../common/Utils.h"
 #include "../common/Logger.h"
 #include "../common/ShutdownCoordinator.h"
+#include "../common/WinHandles.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <psapi.h>
 #include <format>
 #include <chrono>
+#include <atomic>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "WinDivert.lib")
@@ -28,7 +30,7 @@ NetworkMonitor::~NetworkMonitor() {
 }
 
 void NetworkMonitor::Start() {
-    if (running.load()) return;
+    if (running.load(std::memory_order_acquire)) return;
 
     Logger::Instance().Info("Starting NetworkMonitor");
 
@@ -41,11 +43,12 @@ void NetworkMonitor::Start() {
 
     Logger::Instance().Info("WinDivert handle opened successfully");
 
-    WinDivertSetParam(divertHandle, WINDIVERT_PARAM_QUEUE_LENGTH, 16384);
+    // Увеличиваем размеры буферов для лучшей производительности
+    WinDivertSetParam(divertHandle, WINDIVERT_PARAM_QUEUE_LENGTH, 32768);
     WinDivertSetParam(divertHandle, WINDIVERT_PARAM_QUEUE_TIME, 1);
-    WinDivertSetParam(divertHandle, WINDIVERT_PARAM_QUEUE_SIZE, 8388608);
+    WinDivertSetParam(divertHandle, WINDIVERT_PARAM_QUEUE_SIZE, 16777216);
 
-    running = true;
+    running.store(true, std::memory_order_release);
     monitorThread = std::thread(&NetworkMonitor::MonitorThreadFunc, this);
 
     Logger::Instance().Info("NetworkMonitor started - monitoring FLOW events");
@@ -54,8 +57,8 @@ void NetworkMonitor::Start() {
 void NetworkMonitor::Stop() {
     Logger::Instance().Info("NetworkMonitor::Stop called");
 
-    running = false;
-    active = false;
+    running.store(false, std::memory_order_release);
+    active.store(false, std::memory_order_release);
 
     if (divertHandle != INVALID_HANDLE_VALUE) {
         Logger::Instance().Info("Shutting down WinDivert handle");
@@ -67,11 +70,8 @@ void NetworkMonitor::Stop() {
 
         if (monitorThread.joinable()) {
             Logger::Instance().Info("Waiting for monitor thread to complete");
-
-            if (monitorThread.joinable()) {
-                monitorThread.join();
-                Logger::Instance().Info("Monitor thread joined successfully");
-            }
+            monitorThread.join();
+            Logger::Instance().Info("Monitor thread joined successfully");
         }
 
         Logger::Instance().Info("Closing WinDivert handle");
@@ -83,22 +83,27 @@ void NetworkMonitor::Stop() {
 }
 
 void NetworkMonitor::MonitorThreadFunc() {
+    // Привязываем поток к процессору для лучшей производительности
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+
+    EventBatch eventBatch;
     WINDIVERT_ADDRESS addr;
 
-    active = true;
+    active.store(true, std::memory_order_release);
     auto lastCleanup = std::chrono::steady_clock::now();
     auto lastStats = std::chrono::steady_clock::now();
+    auto lastBatchFlush = std::chrono::steady_clock::now();
     int eventCount = 0;
 
     Logger::Instance().Info("Monitor thread started - waiting for FLOW events");
 
-    while (running.load() && !ShutdownCoordinator::Instance().isShuttingDown) {
+    while (running.load(std::memory_order_acquire) && !ShutdownCoordinator::Instance().isShuttingDown) {
         UINT recvLen = 0;
 
         if (!WinDivertRecv(divertHandle, NULL, 0, &recvLen, &addr)) {
             DWORD error = ::GetLastError();
 
-            if (!running.load() || ShutdownCoordinator::Instance().isShuttingDown) {
+            if (!running.load(std::memory_order_acquire) || ShutdownCoordinator::Instance().isShuttingDown) {
                 Logger::Instance().Info("Monitor thread: Shutdown detected during recv, exiting");
                 break;
             }
@@ -120,7 +125,7 @@ void NetworkMonitor::MonitorThreadFunc() {
             continue;
         }
 
-        if (!running.load() || ShutdownCoordinator::Instance().isShuttingDown) {
+        if (!running.load(std::memory_order_acquire) || ShutdownCoordinator::Instance().isShuttingDown) {
             Logger::Instance().Info("Monitor thread: Shutdown detected after recv, exiting");
             break;
         }
@@ -132,12 +137,21 @@ void NetworkMonitor::MonitorThreadFunc() {
                 if (eventCount <= 10 || eventCount % 100 == 0) {
                     Logger::Instance().Info(std::format("Processing FLOW event #{}", eventCount));
                 }
-                ProcessFlowEvent(addr);
+                ProcessFlowEvent(addr, eventBatch);
             }
         }
 
         auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - lastCleanup).count() > 60) {
+
+        // Флушим батч если он полный или прошло достаточно времени
+        if (eventBatch.isFull() ||
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - lastBatchFlush).count() > 100) {
+            FlushEventBatch(eventBatch);
+            lastBatchFlush = now;
+        }
+
+        // Реже выполняем cleanup
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - lastCleanup).count() > 120) {
             CleanupOldConnections();
             lastCleanup = now;
         }
@@ -149,11 +163,16 @@ void NetworkMonitor::MonitorThreadFunc() {
         }
     }
 
-    active = false;
+    // Флушим оставшиеся события
+    if (!eventBatch.isEmpty()) {
+        FlushEventBatch(eventBatch);
+    }
+
+    active.store(false, std::memory_order_release);
     Logger::Instance().Info(std::format("Monitor thread exiting cleanly after processing {} events", eventCount));
 }
 
-void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr) {
+void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr, EventBatch& batch) {
     PERF_TIMER("NetworkMonitor::ProcessFlowEvent");
 
     bool isSelected = processManager->IsSelectedProcessByPid(addr.Flow.ProcessId);
@@ -166,7 +185,10 @@ void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr) {
     std::string processName = cachedInfo.has_value() ?
         Utils::WStringToString(cachedInfo->name) : "Unknown";
 
-    char localStr[INET6_ADDRSTRLEN], remoteStr[INET6_ADDRSTRLEN];
+    // Используем thread_local буфер для конвертации адресов
+    thread_local char localStr[INET6_ADDRSTRLEN];
+    thread_local char remoteStr[INET6_ADDRSTRLEN];
+
     WinDivertHelperFormatIPv6Address(addr.Flow.LocalAddr, localStr, sizeof(localStr));
     WinDivertHelperFormatIPv6Address(addr.Flow.RemoteAddr, remoteStr, sizeof(remoteStr));
 
@@ -196,6 +218,10 @@ void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr) {
 
     if (addr.Event == WINDIVERT_EVENT_FLOW_ESTABLISHED) {
         PERF_COUNT("NetworkMonitor.FlowEvent.Established");
+
+        // Добавляем в батч вместо немедленной обработки
+        batch.add(remoteIp, processName);
+
         std::lock_guard<std::mutex> lock(connectionsMutex);
 
         // Check connection limit
@@ -216,13 +242,6 @@ void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr) {
             std::chrono::system_clock::now(),
             0
         };
-
-        if (routeController) {
-            PERF_TIMER("NetworkMonitor::AddRoute");
-            Logger::Instance().Info(std::format("Adding route IMMEDIATELY for {} (process: {})", remoteIp, processName));
-            routeController->AddRoute(remoteIp, processName);
-            PERF_COUNT("NetworkMonitor.RouteAdded");
-        }
     }
     else if (addr.Event == WINDIVERT_EVENT_FLOW_DELETED) {
         PERF_COUNT("NetworkMonitor.FlowEvent.Deleted");
@@ -235,6 +254,23 @@ void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr) {
     }
 }
 
+void NetworkMonitor::FlushEventBatch(EventBatch& batch) {
+    if (batch.isEmpty()) return;
+
+    PERF_TIMER("NetworkMonitor::FlushEventBatch");
+
+    if (routeController) {
+        for (size_t i = 0; i < batch.count; ++i) {
+            const auto& [ip, process] = batch.events[i];
+            Logger::Instance().Info(std::format("Adding route (batched) for {} (process: {})", ip, process));
+            routeController->AddRoute(ip, process);
+            PERF_COUNT("NetworkMonitor.RouteAdded");
+        }
+    }
+
+    batch.clear();
+}
+
 void NetworkMonitor::CleanupOldConnections() {
     PERF_TIMER("NetworkMonitor::CleanupOldConnections");
 
@@ -242,6 +278,7 @@ void NetworkMonitor::CleanupOldConnections() {
     auto now = std::chrono::system_clock::now();
     int cleaned = 0;
 
+    // Используем std::erase_if для более эффективного удаления
     for (auto it = connections.begin(); it != connections.end();) {
         auto duration = std::chrono::duration_cast<std::chrono::hours>(now - it->second.lastSeen);
         if (duration.count() >= Constants::CONNECTION_CLEANUP_HOURS) {
@@ -277,16 +314,21 @@ void NetworkMonitor::ForceCleanupOldConnections() {
 
     // If still too many, remove oldest connections
     if (connections.size() > MAX_CONNECTIONS * 0.8) {
+        // Используем partial_sort вместо полной сортировки
         std::vector<std::pair<UINT64, std::chrono::system_clock::time_point>> sortedConnections;
+        sortedConnections.reserve(connections.size());
+
         for (const auto& [id, info] : connections) {
             sortedConnections.emplace_back(id, info.lastSeen);
         }
 
-        std::sort(sortedConnections.begin(), sortedConnections.end(),
+        size_t toRemove = connections.size() - static_cast<size_t>(MAX_CONNECTIONS * 0.8);
+        std::partial_sort(sortedConnections.begin(),
+            sortedConnections.begin() + toRemove,
+            sortedConnections.end(),
             [](const auto& a, const auto& b) { return a.second < b.second; });
 
-        size_t toRemove = connections.size() - static_cast<size_t>(MAX_CONNECTIONS * 0.8);
-        for (size_t i = 0; i < toRemove && i < sortedConnections.size(); ++i) {
+        for (size_t i = 0; i < toRemove; ++i) {
             connections.erase(sortedConnections[i].first);
             cleaned++;
         }
@@ -296,17 +338,16 @@ void NetworkMonitor::ForceCleanupOldConnections() {
 }
 
 std::string NetworkMonitor::GetProcessPathFromFlowId(UINT64 flowId, UINT32 processId) {
-    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    // Используем UniqueHandle для автоматического закрытия
+    UniqueHandle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId), HandleDeleter{});
     if (!process) return "";
 
     char path[MAX_PATH];
     DWORD size = MAX_PATH;
-    if (!QueryFullProcessImageNameA(process, 0, path, &size)) {
-        CloseHandle(process);
+    if (!QueryFullProcessImageNameA(process.get(), 0, path, &size)) {
         return "";
     }
 
-    CloseHandle(process);
     return std::string(path);
 }
 

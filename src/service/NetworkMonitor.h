@@ -7,6 +7,7 @@
 #include <thread>
 #include <unordered_map>
 #include <mutex>
+#include <array>
 #include "../common/Models.h"
 
 class RouteController;
@@ -38,6 +39,23 @@ private:
         size_t packetCount;
     };
 
+    // Event batching structure
+    struct EventBatch {
+        static constexpr size_t MAX_BATCH_SIZE = 16;
+        std::array<std::pair<std::string, std::string>, MAX_BATCH_SIZE> events;
+        size_t count = 0;
+
+        void add(const std::string& ip, const std::string& process) {
+            if (count < MAX_BATCH_SIZE) {
+                events[count++] = { ip, process };
+            }
+        }
+
+        void clear() { count = 0; }
+        bool isFull() const { return count >= MAX_BATCH_SIZE; }
+        bool isEmpty() const { return count == 0; }
+    };
+
     // Connection tracking limits
     static constexpr size_t MAX_CONNECTIONS = 10000;
     static constexpr size_t CLEANUP_TRIGGER_PERCENT = 80;
@@ -47,7 +65,8 @@ private:
     std::mutex connectionsMutex;
 
     void MonitorThreadFunc();
-    void ProcessFlowEvent(const WINDIVERT_ADDRESS& addr);
+    void ProcessFlowEvent(const WINDIVERT_ADDRESS& addr, EventBatch& batch);
+    void FlushEventBatch(EventBatch& batch);
     void HandleNewProcess(DWORD pid, const std::string& remoteIp, WINDIVERT_EVENT event);
     bool VerifyProcessIdentity(DWORD pid, const FILETIME& expectedTime);
     void CleanupOldConnections();

@@ -8,6 +8,7 @@
 #include <functional>
 #include <cmath>
 #include <set>
+#include <bit>
 
 RouteOptimizer::RouteOptimizer(const OptimizerConfig& cfg) : config(cfg) {
     Logger::Instance().Info("RouteOptimizer initialized with caching support");
@@ -382,7 +383,11 @@ void RouteOptimizer::CollectRoutesForRemoval(TrieNode* node, uint32_t subnet, in
 uint32_t RouteOptimizer::CreateMask(int prefixLength) {
     if (prefixLength <= 0) return 0;
     if (prefixLength >= 32) return 0xFFFFFFFF;
-    return ~((1u << (32 - prefixLength)) - 1);
+
+    // Optimized version using bit rotation intrinsics
+    // Instead of: return ~((1u << (32 - prefixLength)) - 1);
+    // We can use std::rotr for potentially better performance on modern CPUs
+    return std::rotr(0xFFFFFFFF, 32 - prefixLength);
 }
 
 std::string RouteOptimizer::UIntToIP(uint32_t ip) {
@@ -396,17 +401,18 @@ std::string RouteOptimizer::UIntToIP(uint32_t ip) {
 }
 
 bool RouteOptimizer::IsPrivateNetwork(uint32_t ip) {
-    // Check for private IP ranges
-    // 10.0.0.0/8
+    // Check for private IP ranges using optimized bit operations
+
+    // 10.0.0.0/8 - Check if top 8 bits equal 0x0A
     if ((ip & 0xFF000000) == 0x0A000000) return true;
 
-    // 172.16.0.0/12
+    // 172.16.0.0/12 - Check if top 12 bits equal 0xAC1
     if ((ip & 0xFFF00000) == 0xAC100000) return true;
 
-    // 192.168.0.0/16
+    // 192.168.0.0/16 - Check if top 16 bits equal 0xC0A8
     if ((ip & 0xFFFF0000) == 0xC0A80000) return true;
 
-    // 127.0.0.0/8 (loopback)
+    // 127.0.0.0/8 (loopback) - Check if top 8 bits equal 0x7F
     if ((ip & 0xFF000000) == 0x7F000000) return true;
 
     return false;

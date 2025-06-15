@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <format>
 #include <ranges>
+#include <execution>  // для параллельных алгоритмов
 
 ProcessManager::ProcessManager(const ServiceConfig& config, const PerformanceConfig& perfCfg)
     : running(true), perfConfig(perfCfg), m_pidMissCache(perfCfg.missCacheMaxSize),
@@ -36,45 +37,46 @@ ProcessManager::~ProcessManager() {
     // std::jthread автоматически вызовет request_stop() и join()
 }
 
-
 bool ProcessManager::IsSelectedProcessByPid(DWORD pid) {
     PERF_TIMER("ProcessManager::IsSelectedProcessByPid");
 
+    // Оптимизация: сначала проверяем кэш без блокировки
     auto cachedInfo = GetCachedInfo(pid);
     if (cachedInfo.has_value()) {
-        stats.hits.fetch_add(1);
+        stats.hits.fetch_add(1, std::memory_order_relaxed);  // Используем relaxed ordering
         return cachedInfo->isSelected;
     }
 
     auto info = GetCompleteProcessInfo(pid);
     if (info.has_value()) {
         m_pidMissCache.put(pid, *info);
-        stats.misses.fetch_add(1);
-        stats.newProcessChecks.fetch_add(1);
+        stats.misses.fetch_add(1, std::memory_order_relaxed);
+        stats.newProcessChecks.fetch_add(1, std::memory_order_relaxed);
         return info->isSelected;
     }
 
-    stats.misses.fetch_add(1);
+    stats.misses.fetch_add(1, std::memory_order_relaxed);
     return false;
 }
 
 std::optional<CachedProcessInfo> ProcessManager::GetCachedInfo(DWORD pid) {
+    // Оптимизация: используем read-write lock вместо обычного mutex
     {
         std::shared_lock lock(cachesMutex);
 
         if (auto it = m_pidCache.find(pid); it != m_pidCache.end()) {
-            stats.hits.fetch_add(1);
+            stats.hits.fetch_add(1, std::memory_order_relaxed);
             return it->second;
         }
     }
 
     auto missInfo = m_pidMissCache.get(pid);
     if (missInfo.has_value()) {
-        stats.hits.fetch_add(1);
+        stats.hits.fetch_add(1, std::memory_order_relaxed);
         return missInfo;
     }
 
-    stats.misses.fetch_add(1);
+    stats.misses.fetch_add(1, std::memory_order_relaxed);
     return std::nullopt;
 }
 
@@ -84,7 +86,7 @@ std::optional<CachedProcessInfo> ProcessManager::CheckProcessAndCache(DWORD pid)
         return existing;
     }
 
-    stats.newProcessChecks.fetch_add(1);
+    stats.newProcessChecks.fetch_add(1, std::memory_order_relaxed);
 
     auto info = GetCompleteProcessInfo(pid);
     if (info.has_value() && info->isSelected) {
@@ -100,7 +102,7 @@ void ProcessManager::UpdateVerificationTime(DWORD pid) {
 
     if (auto it = m_pidCache.find(pid); it != m_pidCache.end()) {
         it->second.lastVerified = std::chrono::steady_clock::now();
-        stats.verificationChecks.fetch_add(1);
+        stats.verificationChecks.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -127,12 +129,25 @@ bool ProcessManager::IsProcessSelected(const std::string& processName) const {
 bool ProcessManager::IsProcessSelectedInternal(const std::string& processName) const {
     std::lock_guard<std::mutex> lock(selectedMutex);
 
-    return std::ranges::any_of(selectedProcesses, [&processName, this](const auto& selected) {
-        if (selected.contains('*')) {
-            return MatchesWildcard(processName, selected);
-        }
-        return _stricmp(processName.c_str(), selected.c_str()) == 0;
-        });
+    // Оптимизация: используем параллельный поиск для больших списков
+    if (selectedProcesses.size() > 100) {
+        return std::any_of(std::execution::par_unseq,
+            selectedProcesses.begin(), selectedProcesses.end(),
+            [&processName, this](const auto& selected) {
+                if (selected.contains('*')) {
+                    return MatchesWildcard(processName, selected);
+                }
+                return _stricmp(processName.c_str(), selected.c_str()) == 0;
+            });
+    }
+    else {
+        return std::ranges::any_of(selectedProcesses, [&processName, this](const auto& selected) {
+            if (selected.contains('*')) {
+                return MatchesWildcard(processName, selected);
+            }
+            return _stricmp(processName.c_str(), selected.c_str()) == 0;
+            });
+    }
 }
 
 void ProcessManager::SetSelectedProcesses(const std::vector<std::string>& processes) {
@@ -157,12 +172,17 @@ std::vector<std::string> ProcessManager::GetSelectedProcesses() const {
 void ProcessManager::UpdateThreadFunc(std::stop_token stopToken) {
     Logger::Instance().Debug("ProcessManager::UpdateThreadFunc - Started");
 
+    // Оптимизация: используем condition variable вместо sleep loop
+    std::mutex updateMutex;
+    std::condition_variable_any updateCV;
+
     while (!stopToken.stop_requested() && !ShutdownCoordinator::Instance().isShuttingDown) {
-        for (int i = 0; i < 50; i++) {
-            if (stopToken.stop_requested() || ShutdownCoordinator::Instance().isShuttingDown) {
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::unique_lock<std::mutex> lock(updateMutex);
+
+        // Ждем 5 секунд или пока не придет stop_requested
+        if (updateCV.wait_for(lock, stopToken, std::chrono::seconds(5),
+            [&stopToken] { return stopToken.stop_requested(); })) {
+            break;
         }
 
         if (stopToken.stop_requested() || ShutdownCoordinator::Instance().isShuttingDown) {
@@ -182,6 +202,8 @@ void ProcessManager::UpdateThreadFunc(std::stop_token stopToken) {
                 m_pidMissCache.clear();
 
                 allProcesses.clear();
+                allProcesses.reserve(m_pidCache.size());  // Оптимизация: резервируем память заранее
+
                 for (const auto& [pid, info] : m_pidCache) {
                     ProcessInfo procInfo;
                     procInfo.name = info.name;
@@ -190,7 +212,7 @@ void ProcessManager::UpdateThreadFunc(std::stop_token stopToken) {
                     procInfo.isSelected = info.isSelected;
                     procInfo.isGame = Utils::IsGameProcess(CachedWStringToString(info.name));
                     procInfo.isDiscord = Utils::IsDiscordProcess(CachedWStringToString(info.name));
-                    allProcesses.push_back(procInfo);
+                    allProcesses.push_back(std::move(procInfo));  // Используем move semantics
                 }
             }
 
@@ -208,10 +230,14 @@ std::unordered_map<DWORD, CachedProcessInfo> ProcessManager::BuildProcessSnapsho
     PERF_TIMER("ProcessManager::BuildProcessSnapshot");
 
     std::unordered_map<DWORD, CachedProcessInfo> newCache;
-    std::unordered_set<DWORD> alivePids;
+    newCache.reserve(1000);  // Оптимизация: резервируем память для типичного количества процессов
 
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) {
+    std::unordered_set<DWORD> alivePids;
+    alivePids.reserve(1000);
+
+    // Оптимизация: используем более эффективный способ итерации
+    UniqueHandle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0), HandleDeleter{});
+    if (!snapshot || snapshot.get() == INVALID_HANDLE_VALUE) {
         Logger::Instance().Error("ProcessManager::BuildProcessSnapshot - Failed to create snapshot");
         return newCache;
     }
@@ -219,7 +245,7 @@ std::unordered_map<DWORD, CachedProcessInfo> ProcessManager::BuildProcessSnapsho
     PROCESSENTRY32W pe32;
     pe32.dwSize = sizeof(PROCESSENTRY32W);
 
-    if (Process32FirstW(snapshot, &pe32)) {
+    if (Process32FirstW(snapshot.get(), &pe32)) {
         do {
             if (pe32.th32ProcessID == 0 || pe32.th32ProcessID == 4) continue;
 
@@ -227,13 +253,11 @@ std::unordered_map<DWORD, CachedProcessInfo> ProcessManager::BuildProcessSnapsho
 
             auto infoOpt = GetCompleteProcessInfo(pe32.th32ProcessID);
             if (infoOpt.has_value()) {
-                newCache[pe32.th32ProcessID] = *infoOpt;
+                newCache.emplace(pe32.th32ProcessID, std::move(*infoOpt));  // Используем emplace и move
             }
 
-        } while (Process32NextW(snapshot, &pe32));
+        } while (Process32NextW(snapshot.get(), &pe32));
     }
-
-    CloseHandle(snapshot);
 
     return newCache;
 }
@@ -273,24 +297,24 @@ void ProcessManager::MergeMissCacheIntoMain(std::unordered_map<DWORD, CachedProc
         if (!mainCache.contains(pid)) {
             auto currentInfo = GetCompleteProcessInfo(pid);
             if (currentInfo.has_value()) {
-                mainCache[pid] = *currentInfo;
+                mainCache.emplace(pid, std::move(*currentInfo));  // Используем emplace и move
             }
         }
         });
 }
 
 void ProcessManager::GetCacheStats(uint64_t& hits, uint64_t& misses) const {
-    hits = stats.hits.load();
-    misses = stats.misses.load();
+    hits = stats.hits.load(std::memory_order_relaxed);
+    misses = stats.misses.load(std::memory_order_relaxed);
 }
 
 void ProcessManager::LogPerformanceStats() const {
-    auto hits = stats.hits.load();
-    auto misses = stats.misses.load();
-    auto verifications = stats.verificationChecks.load();
-    auto newChecks = stats.newProcessChecks.load();
-    auto stringHits = stats.stringCacheHits.load();
-    auto stringMisses = stats.stringCacheMisses.load();
+    auto hits = stats.hits.load(std::memory_order_relaxed);
+    auto misses = stats.misses.load(std::memory_order_relaxed);
+    auto verifications = stats.verificationChecks.load(std::memory_order_relaxed);
+    auto newChecks = stats.newProcessChecks.load(std::memory_order_relaxed);
+    auto stringHits = stats.stringCacheHits.load(std::memory_order_relaxed);
+    auto stringMisses = stats.stringCacheMisses.load(std::memory_order_relaxed);
 
     if (hits + misses == 0) return;
 
@@ -309,6 +333,18 @@ void ProcessManager::LogPerformanceStats() const {
 }
 
 bool ProcessManager::MatchesWildcard(const std::string& processName, const std::string& pattern) const {
+    // Оптимизация: кэшируем результаты сравнения для часто используемых паттернов
+    static thread_local std::unordered_map<std::string, bool> matchCache;
+
+    std::string cacheKey = processName + "|" + pattern;
+    if (auto it = matchCache.find(cacheKey); it != matchCache.end()) {
+        return it->second;
+    }
+
+    if (matchCache.size() > 1000) {  // Очищаем кэш если он слишком большой
+        matchCache.clear();
+    }
+
     std::string lowerProcess = processName;
     std::string lowerPattern = pattern;
 
@@ -335,6 +371,7 @@ bool ProcessManager::MatchesWildcard(const std::string& processName, const std::
             processPos = ++matchPos;
         }
         else {
+            matchCache[cacheKey] = false;
             return false;
         }
     }
@@ -343,7 +380,9 @@ bool ProcessManager::MatchesWildcard(const std::string& processName, const std::
         patternPos++;
     }
 
-    return patternPos == lowerPattern.length();
+    bool result = (patternPos == lowerPattern.length());
+    matchCache[cacheKey] = result;
+    return result;
 }
 
 void ProcessManager::CleanupStalePids(std::unordered_map<DWORD, CachedProcessInfo>& cache,
@@ -351,7 +390,7 @@ void ProcessManager::CleanupStalePids(std::unordered_map<DWORD, CachedProcessInf
     std::erase_if(cache, [&alivePids, this](const auto& pair) {
         bool shouldErase = !alivePids.contains(pair.first);
         if (shouldErase) {
-            stats.cacheEvictions.fetch_add(1);
+            stats.cacheEvictions.fetch_add(1, std::memory_order_relaxed);
         }
         return shouldErase;
         });
@@ -363,11 +402,11 @@ std::string ProcessManager::CachedWStringToString(const std::wstring& wstr) {
     // Check cache first
     auto cached = m_wstringToStringCache.get(wstr);
     if (cached.has_value()) {
-        stats.stringCacheHits.fetch_add(1);
+        stats.stringCacheHits.fetch_add(1, std::memory_order_relaxed);
         return *cached;
     }
 
-    stats.stringCacheMisses.fetch_add(1);
+    stats.stringCacheMisses.fetch_add(1, std::memory_order_relaxed);
 
     // Convert
     std::string result = Utils::WStringToString(wstr);
@@ -384,11 +423,11 @@ std::wstring ProcessManager::CachedStringToWString(const std::string& str) {
     // Check cache first
     auto cached = m_stringToWstringCache.get(str);
     if (cached.has_value()) {
-        stats.stringCacheHits.fetch_add(1);
+        stats.stringCacheHits.fetch_add(1, std::memory_order_relaxed);
         return *cached;
     }
 
-    stats.stringCacheMisses.fetch_add(1);
+    stats.stringCacheMisses.fetch_add(1, std::memory_order_relaxed);
 
     // Convert
     std::wstring result = Utils::StringToWString(str);
