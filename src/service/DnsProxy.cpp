@@ -225,18 +225,9 @@ void DnsProxy::OutboundThreadFunc() {
         WinDivertHelperParsePacket(
             packet, packetLen,
             &ipHdr, nullptr, nullptr, nullptr, nullptr,
-            &udpHdr, nullptr, nullptr
+            &tcpHdr, &udpHdr,
+            nullptr, nullptr, nullptr, nullptr
         );
-
-        // Also try to parse TCP header
-        tcpHdr = nullptr;
-        if (ipHdr && ipHdr->Protocol == 6) { // TCP
-            WinDivertHelperParsePacket(
-                packet, packetLen,
-                nullptr, nullptr, nullptr, nullptr,
-                &tcpHdr, nullptr, nullptr, nullptr
-            );
-        }
 
         if (!ipHdr || (!udpHdr && !tcpHdr)) {
             WinDivertSend(outboundHandle, packet, packetLen, nullptr, &addr);
@@ -302,17 +293,9 @@ void DnsProxy::InboundThreadFunc() {
         WinDivertHelperParsePacket(
             packet, packetLen,
             &ipHdr, nullptr, nullptr, nullptr, nullptr,
-            &udpHdr, nullptr, nullptr
+            &tcpHdr, &udpHdr,
+            nullptr, nullptr, nullptr, nullptr
         );
-
-        tcpHdr = nullptr;
-        if (ipHdr && ipHdr->Protocol == 6) {
-            WinDivertHelperParsePacket(
-                packet, packetLen,
-                nullptr, nullptr, nullptr, nullptr,
-                &tcpHdr, nullptr, nullptr, nullptr
-            );
-        }
 
         if (!ipHdr || (!udpHdr && !tcpHdr)) {
             WinDivertSend(inboundHandle, packet, packetLen, nullptr, &addr);
