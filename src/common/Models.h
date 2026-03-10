@@ -71,6 +71,7 @@ struct ServiceConfig {
     bool startMinimized = true;
     bool startWithWindows = true;
     bool aiPreloadEnabled = false;
+    bool dnsProxyEnabled = false;
     OptimizerSettings optimizerSettings;
 };
 

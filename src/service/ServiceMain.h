@@ -9,6 +9,7 @@ class RouteController;
 class ProcessManager;
 class Watchdog;
 class ConfigManager;
+class DnsProxy;
 
 class ServiceMain {
 public:
@@ -26,6 +27,7 @@ private:
     std::unique_ptr<ProcessManager> processManager;
     std::unique_ptr<Watchdog> watchdog;
     std::unique_ptr<ConfigManager> configManager;
+    std::unique_ptr<DnsProxy> dnsProxy;
 
     std::atomic<bool> running;
     HANDLE pipeThread;

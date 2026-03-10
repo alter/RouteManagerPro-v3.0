@@ -30,6 +30,7 @@
     <ClCompile Include="src\common\Utils.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\service\ConfigManager.cpp" />
+    <ClCompile Include="src\service\DnsProxy.cpp" />
     <ClCompile Include="src\service\NetworkMonitor.cpp" />
     <ClCompile Include="src\service\ProcessManager.cpp" />
     <ClCompile Include="src\service\RouteController.cpp" />
@@ -55,6 +56,7 @@
     <ClInclude Include="src\common\Utils.h" />
     <ClInclude Include="src\common\WinHandles.h" />
     <ClInclude Include="src\service\ConfigManager.h" />
+    <ClInclude Include="src\service\DnsProxy.h" />
     <ClInclude Include="src\service\NetworkMonitor.h" />
     <ClInclude Include="src\service\PerformanceMonitor.h" />
     <ClInclude Include="src\service\ProcessManager.h" />

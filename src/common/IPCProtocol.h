@@ -16,7 +16,8 @@ enum class IPCMessageType {
     ClearRoutes = 9,
     OptimizeRoutes = 10,
     SetAIPreload = 12,
-    CleanupRedundantRoutes = 13
+    CleanupRedundantRoutes = 13,
+    SetDnsProxy = 14
 };
 
 struct IPCMessage {

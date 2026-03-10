@@ -127,7 +127,7 @@ void MainWindow::CreateControls() {
     HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
 
     configGroupBox = CreateWindow(L"BUTTON", L"Configuration", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-        10, 10, 200, 120, hwnd, nullptr, hInstance, nullptr);
+        10, 10, 200, 140, hwnd, nullptr, hInstance, nullptr);
 
     CreateWindow(L"STATIC", L"Gateway:", WS_CHILD | WS_VISIBLE,
         20, 35, 60, 20, hwnd, nullptr, hInstance, nullptr);
@@ -155,8 +155,12 @@ void MainWindow::CreateControls() {
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
         115, 88, 85, 23, hwnd, (HMENU)1005, hInstance, nullptr);
 
+    dnsProxyCheckbox = CreateWindow(L"BUTTON", L"DNS Proxy",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        20, 113, 180, 20, hwnd, (HMENU)1007, hInstance, nullptr);
+
     statusGroupBox = CreateWindow(L"BUTTON", L"Status", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-        220, 10, 610, 120, hwnd, nullptr, hInstance, nullptr);
+        220, 10, 610, 140, hwnd, nullptr, hInstance, nullptr);
 
     statusLabel = CreateWindow(L"STATIC",
         L"Service: • Running\r\n"
@@ -165,9 +169,9 @@ void MainWindow::CreateControls() {
         L"Memory: 0 MB\r\n"
         L"Uptime: 0m",
         WS_CHILD | WS_VISIBLE,
-        230, 30, 590, 90, hwnd, nullptr, hInstance, nullptr);
+        230, 30, 590, 100, hwnd, nullptr, hInstance, nullptr);
 
-    processPanel->Create(10, 140, 820, 240);
+    processPanel->Create(10, 160, 820, 220);
     routeTable->Create(10, 390, 820, 180);
 
     minimizeButton = CreateWindow(L"BUTTON", L"Minimize to Tray",
@@ -204,6 +208,7 @@ LRESULT CALLBACK MainWindow::WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         case 1004: instance->OnViewLogs(); break;
         case 1005: instance->OnEditPreload(); break;
         case 1006: instance->OnOptimizeRoutes(); break;
+        case 1007: instance->OnDnsProxyToggle(); break;
         default:
             if (instance->processPanel) {
                 instance->processPanel->HandleCommand(wParam);
@@ -262,7 +267,9 @@ LRESULT CALLBACK MainWindow::WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             instance->config = instance->serviceClient->GetConfig();
             SendMessage(instance->aiPreloadCheckbox, BM_SETCHECK,
                 instance->config.aiPreloadEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
-            Logger::Instance().Info("MainWindow: Updated AI preload checkbox after route cleanup");
+            SendMessage(instance->dnsProxyCheckbox, BM_SETCHECK,
+                instance->config.dnsProxyEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+            Logger::Instance().Info("MainWindow: Updated checkboxes after route cleanup");
         }
         return 0;
 
@@ -322,12 +329,12 @@ void MainWindow::OnSize(int width, int height) {
     lastHeight = height;
 
     int statusWidth = width - 230;
-    SetWindowPos(statusGroupBox, NULL, 220, 10, statusWidth, 120, SWP_NOZORDER);
-    SetWindowPos(statusLabel, NULL, 230, 30, statusWidth - 10, 90, SWP_NOZORDER);
+    SetWindowPos(statusGroupBox, NULL, 220, 10, statusWidth, 140, SWP_NOZORDER);
+    SetWindowPos(statusLabel, NULL, 230, 30, statusWidth - 10, 100, SWP_NOZORDER);
 
     int panelWidth = width - 20;
     if (processPanel) {
-        processPanel->Resize(10, 140, panelWidth, 240);
+        processPanel->Resize(10, 160, panelWidth, 220);
     }
 
     if (routeTable) {
@@ -471,6 +478,7 @@ void MainWindow::OnApplyConfig() {
         config.startMinimized = currentConfig.startMinimized;
         config.startWithWindows = currentConfig.startWithWindows;
         config.aiPreloadEnabled = currentConfig.aiPreloadEnabled;
+        config.dnsProxyEnabled = currentConfig.dnsProxyEnabled;
         config.optimizerSettings = currentConfig.optimizerSettings;
     }
 
@@ -520,9 +528,21 @@ void MainWindow::OnAIPreloadToggle() {
     serviceClient->SetAIPreload(checked);
 }
 
+void MainWindow::OnDnsProxyToggle() {
+    bool checked = SendMessage(dnsProxyCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED;
+
+    if (serviceClient && serviceClient->IsConnected()) {
+        config = serviceClient->GetConfig();
+    }
+
+    config.dnsProxyEnabled = checked;
+    serviceClient->SetDnsProxy(checked);
+}
+
 void MainWindow::LoadConfiguration() {
     config = serviceClient->GetConfig();
     SetWindowTextA(gatewayEdit, config.gatewayIp.c_str());
     SetWindowTextA(metricEdit, std::to_string(config.metric).c_str());
     SendMessage(aiPreloadCheckbox, BM_SETCHECK, config.aiPreloadEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessage(dnsProxyCheckbox, BM_SETCHECK, config.dnsProxyEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
 }

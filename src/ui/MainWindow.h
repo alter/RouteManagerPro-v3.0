@@ -34,6 +34,7 @@ private:
     HWND metricEdit;
     HWND applyButton;
     HWND aiPreloadCheckbox;
+    HWND dnsProxyCheckbox;
     HWND editPreloadButton;
     HWND statusLabel;
     HWND minimizeButton;
@@ -56,6 +57,7 @@ private:
     void OnMinimizeToTray();
     void OnViewLogs();
     void OnAIPreloadToggle();
+    void OnDnsProxyToggle();
     void OnOptimizeRoutes();
     void LoadConfiguration();
     void OnClose();

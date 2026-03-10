@@ -81,6 +81,15 @@ void ConfigManager::SetAIPreloadEnabled(bool enabled) {
     SaveConfig();
 }
 
+void ConfigManager::SetDnsProxyEnabled(bool enabled) {
+    {
+        std::lock_guard<std::mutex> lock(configMutex);
+        config.dnsProxyEnabled = enabled;
+    }
+
+    SaveConfig();
+}
+
 void ConfigManager::LoadConfig() {
     if (!Utils::FileExists(configPath)) {
         Logger::Instance().Info("ConfigManager::LoadConfig - Config file not found, using defaults");
@@ -111,6 +120,7 @@ void ConfigManager::LoadConfig() {
     config.startMinimized = root.get("startMinimized", config.startMinimized).asBool();
     config.startWithWindows = root.get("startWithWindows", config.startWithWindows).asBool();
     config.aiPreloadEnabled = root.get("aiPreloadEnabled", config.aiPreloadEnabled).asBool();
+    config.dnsProxyEnabled = root.get("dnsProxyEnabled", config.dnsProxyEnabled).asBool();
 
     const Json::Value& optimizer = root["optimizerSettings"];
     if (optimizer.isObject()) {
@@ -166,6 +176,7 @@ void ConfigManager::SaveConfig() {
     root["startMinimized"] = configCopy.startMinimized;
     root["startWithWindows"] = configCopy.startWithWindows;
     root["aiPreloadEnabled"] = configCopy.aiPreloadEnabled;
+    root["dnsProxyEnabled"] = configCopy.dnsProxyEnabled;
 
     Json::Value optimizer;
     optimizer["minHostsToAggregate"] = configCopy.optimizerSettings.minHostsToAggregate;

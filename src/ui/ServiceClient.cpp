@@ -255,6 +255,16 @@ void ServiceClient::SetAIPreload(bool enabled) {
     SendMessage(msg);
 }
 
+void ServiceClient::SetDnsProxy(bool enabled) {
+    if (!connected) return;
+
+    IPCMessage msg;
+    msg.type = IPCMessageType::SetDnsProxy;
+    msg.data.push_back(enabled ? 1 : 0);
+
+    SendMessage(msg);
+}
+
 void ServiceClient::OptimizeRoutes() {
     if (!connected) return;
 
