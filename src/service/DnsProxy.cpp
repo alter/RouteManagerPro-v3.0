@@ -57,6 +57,12 @@ void DnsProxy::Start() {
         return;
     }
 
+    // Ensure 8.8.8.8 is routable through VPN gateway before intercepting DNS
+    if (routeController) {
+        routeController->AddRoute("8.8.8.8", "dns-proxy-target");
+        Logger::Instance().Info("DnsProxy::Start - Added route for 8.8.8.8 via VPN gateway");
+    }
+
     running = true;
     active = true;
 
