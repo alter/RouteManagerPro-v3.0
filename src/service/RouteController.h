@@ -11,7 +11,12 @@
 #include <memory>
 #include <condition_variable>
 #include <winsock2.h>
-#include <netioapi.h>
+#include <windows.h>
+#ifndef _NTDEF_
+typedef LONG NTSTATUS;
+typedef NTSTATUS *PNTSTATUS;
+#endif
+#include <iphlpapi.h>
 #include "../common/Models.h"
 #include "../common/Result.h"
 #include "RouteOptimizer.h"
