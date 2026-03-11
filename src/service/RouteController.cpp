@@ -753,6 +753,9 @@ bool RouteController::RemoveRouteWithMask(const std::string& ip, int prefixLengt
 void RouteController::CleanupAllRoutes() {
     Logger::Instance().Info("CleanupAllRoutes - Starting cleanup of all routes");
 
+    // Sync with system table first to catch any routes not in our internal map
+    SyncWithSystemTable();
+
     std::vector<std::pair<std::string, int>> routesToDelete;
     bool hadPreloadRoutes = false;
     {
@@ -777,7 +780,6 @@ void RouteController::CleanupAllRoutes() {
     int failCount = 0;
 
     for (const auto& [ip, prefixLength] : routesToDelete) {
-        Logger::Instance().Info(std::format("Removing Windows route for: {}/{}", ip, prefixLength));
         if (RemoveSystemRouteWithMask(ip, prefixLength, config.gatewayIp)) {
             successCount++;
         }
