@@ -114,10 +114,14 @@ void DnsProxy::Stop() {
         Logger::Instance().Info("DnsProxy::Stop - Removed route for 8.8.8.8");
     }
 
-    // Clear NAT table
+    // Clear NAT table and route cache
     {
         std::lock_guard lock(natMutex);
         natTable.clear();
+    }
+    {
+        std::lock_guard lock(addedRoutesMutex);
+        addedRoutes.clear();
     }
 
     Logger::Instance().Info("DnsProxy::Stop - DNS proxy stopped");
@@ -407,12 +411,27 @@ void DnsProxy::ParseDnsResponseAndAddRoutes(const uint8_t* dns, size_t dnsLen) {
 
         // A record: type=1, class=IN(1), rdlength=4
         if (rtype == 1 && rclass == 1 && rdlength == 4) {
+            uint32_t ipAddr;
+            memcpy(&ipAddr, &dns[offset], 4);
+
+            // Skip if already added this route
+            {
+                std::lock_guard lock(addedRoutesMutex);
+                if (addedRoutes.contains(ipAddr)) {
+                    offset += rdlength;
+                    continue;
+                }
+            }
+
             std::string ip = std::format("{}.{}.{}.{}",
                 dns[offset], dns[offset + 1], dns[offset + 2], dns[offset + 3]);
 
             if (!Utils::IsPrivateIP(ip)) {
                 Logger::Instance().Info(std::format("DnsProxy: DNS resolved -> {}, pre-adding route", ip));
                 routeController->AddRoute(ip, "dns-prefetch");
+
+                std::lock_guard lock(addedRoutesMutex);
+                addedRoutes.insert(ipAddr);
             }
         }
 

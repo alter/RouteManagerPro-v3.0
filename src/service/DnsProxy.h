@@ -6,6 +6,7 @@
 #include <atomic>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <mutex>
 #include <cstdint>
 
@@ -59,6 +60,10 @@ private:
     // NAT table: maps (src_ip, src_port) -> original DNS server IP
     std::unordered_map<NatKey, uint32_t, NatKeyHash> natTable;
     std::mutex natMutex;
+
+    // Cache of IPs already added as routes (avoid repeated AddRoute calls and ref count inflation)
+    std::unordered_set<uint32_t> addedRoutes;
+    std::mutex addedRoutesMutex;
 
     // Thread functions
     void OutboundThreadFunc();
