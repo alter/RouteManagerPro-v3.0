@@ -4,12 +4,15 @@
 #include <windows.h>
 #include "DnsProxy.h"
 #include "ProcessManager.h"
+#include "RouteController.h"
 #include "../common/Logger.h"
 #include "../common/ShutdownCoordinator.h"
+#include "../common/Utils.h"
 #include <format>
 
-DnsProxy::DnsProxy(ProcessManager* pm)
+DnsProxy::DnsProxy(ProcessManager* pm, RouteController* rc)
     : processManager(pm),
+    routeController(rc),
     flowHandle(INVALID_HANDLE_VALUE),
     outboundHandle(INVALID_HANDLE_VALUE),
     inboundHandle(INVALID_HANDLE_VALUE),
@@ -321,6 +324,28 @@ void DnsProxy::InboundThreadFunc() {
         }
 
         if (originalDns != 0) {
+            // Parse DNS response and proactively add routes for resolved IPs
+            if (routeController && udpHdr) {
+                const uint8_t* dnsPayload = reinterpret_cast<const uint8_t*>(udpHdr) + sizeof(WINDIVERT_UDPHDR);
+                size_t dnsLen = packetLen - (dnsPayload - packet);
+                if (dnsLen >= 12) {
+                    ParseDnsResponseAndAddRoutes(dnsPayload, dnsLen);
+                }
+            }
+            else if (routeController && tcpHdr) {
+                // TCP DNS: payload starts after TCP header, first 2 bytes are length prefix
+                uint32_t tcpHeaderLen = tcpHdr->HdrLength * 4;
+                const uint8_t* tcpPayload = reinterpret_cast<const uint8_t*>(tcpHdr) + tcpHeaderLen;
+                size_t tcpPayloadLen = packetLen - (tcpPayload - packet);
+                if (tcpPayloadLen > 2) {
+                    const uint8_t* dnsPayload = tcpPayload + 2; // skip 2-byte length prefix
+                    size_t dnsLen = tcpPayloadLen - 2;
+                    if (dnsLen >= 12) {
+                        ParseDnsResponseAndAddRoutes(dnsPayload, dnsLen);
+                    }
+                }
+            }
+
             // Rewrite source IP back to original DNS server
             ipHdr->SrcAddr = originalDns;
             WinDivertHelperCalcChecksums(packet, packetLen, &addr, 0);
@@ -371,5 +396,81 @@ void DnsProxy::CleanupExpiredFlows() {
 
     if (removed > 0) {
         Logger::Instance().Debug(std::format("DnsProxy: Cleaned up {} expired flow entries", removed));
+    }
+}
+
+void DnsProxy::ParseDnsResponseAndAddRoutes(const uint8_t* dns, size_t dnsLen) {
+    // DNS header: ID(2) Flags(2) QDCOUNT(2) ANCOUNT(2) NSCOUNT(2) ARCOUNT(2)
+    if (dnsLen < 12) return;
+
+    uint16_t flags = (dns[2] << 8) | dns[3];
+    bool isResponse = (flags & 0x8000) != 0;
+    uint8_t rcode = flags & 0x0F;
+
+    if (!isResponse || rcode != 0) return;
+
+    uint16_t qdcount = (dns[4] << 8) | dns[5];
+    uint16_t ancount = (dns[6] << 8) | dns[7];
+
+    if (ancount == 0) return;
+
+    // Skip question section
+    size_t offset = 12;
+    for (uint16_t i = 0; i < qdcount; i++) {
+        // Skip QNAME
+        while (offset < dnsLen) {
+            uint8_t labelLen = dns[offset];
+            if (labelLen == 0) {
+                offset++; // null terminator
+                break;
+            }
+            if ((labelLen & 0xC0) == 0xC0) {
+                offset += 2; // compression pointer
+                break;
+            }
+            offset += 1 + labelLen;
+        }
+        offset += 4; // QTYPE(2) + QCLASS(2)
+    }
+
+    // Parse answer section
+    for (uint16_t i = 0; i < ancount && offset < dnsLen; i++) {
+        // Skip NAME (may be compressed)
+        while (offset < dnsLen) {
+            uint8_t labelLen = dns[offset];
+            if (labelLen == 0) {
+                offset++;
+                break;
+            }
+            if ((labelLen & 0xC0) == 0xC0) {
+                offset += 2;
+                break;
+            }
+            offset += 1 + labelLen;
+        }
+
+        // Need at least TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2) = 10 bytes
+        if (offset + 10 > dnsLen) break;
+
+        uint16_t rtype = (dns[offset] << 8) | dns[offset + 1];
+        uint16_t rclass = (dns[offset + 2] << 8) | dns[offset + 3];
+        // TTL at offset+4..+7 (skip)
+        uint16_t rdlength = (dns[offset + 8] << 8) | dns[offset + 9];
+        offset += 10;
+
+        if (offset + rdlength > dnsLen) break;
+
+        // A record: type=1, class=IN(1), rdlength=4
+        if (rtype == 1 && rclass == 1 && rdlength == 4) {
+            std::string ip = std::format("{}.{}.{}.{}",
+                dns[offset], dns[offset + 1], dns[offset + 2], dns[offset + 3]);
+
+            if (!Utils::IsPrivateIP(ip)) {
+                Logger::Instance().Info(std::format("DnsProxy: DNS resolved -> {}, pre-adding route", ip));
+                routeController->AddRoute(ip, "dns-prefetch");
+            }
+        }
+
+        offset += rdlength;
     }
 }

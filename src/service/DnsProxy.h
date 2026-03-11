@@ -13,10 +13,11 @@
 #include <cstdint>
 
 class ProcessManager;
+class RouteController;
 
 class DnsProxy {
 public:
-    DnsProxy(ProcessManager* processManager);
+    DnsProxy(ProcessManager* processManager, RouteController* routeController);
     ~DnsProxy();
 
     void Start();
@@ -25,6 +26,7 @@ public:
 
 private:
     ProcessManager* processManager;
+    RouteController* routeController;
 
     // WinDivert handles
     HANDLE flowHandle;      // FLOW layer: track DNS flows from selected processes
@@ -80,4 +82,5 @@ private:
     // Helpers
     bool IsFlowTracked(const FlowKey& key) const;
     void CleanupExpiredFlows();
+    void ParseDnsResponseAndAddRoutes(const uint8_t* dnsPayload, size_t dnsLen);
 };

@@ -63,7 +63,7 @@ void ServiceMain::StartDirect() {
             routeController.get(), processManager.get());
 
         Logger::Instance().Debug("Step 8: Creating DnsProxy");
-        dnsProxy = std::make_unique<DnsProxy>(processManager.get());
+        dnsProxy = std::make_unique<DnsProxy>(processManager.get(), routeController.get());
 
         Logger::Instance().Debug("Step 9: Creating Watchdog");
         watchdog = std::make_unique<Watchdog>(this);
