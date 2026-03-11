@@ -16,7 +16,6 @@ DnsProxy::DnsProxy(ProcessManager* pm, RouteController* rc)
     routeController(rc),
     outboundHandle(INVALID_HANDLE_VALUE),
     inboundHandle(INVALID_HANDLE_VALUE),
-    running(false),
     active(false) {
     Logger::Instance().Info("DnsProxy: Created");
 }
@@ -26,7 +25,7 @@ DnsProxy::~DnsProxy() {
 }
 
 void DnsProxy::Start() {
-    if (running.load()) {
+    if (active.load()) {
         Logger::Instance().Warning("DnsProxy::Start - Already running");
         return;
     }
@@ -63,23 +62,21 @@ void DnsProxy::Start() {
         Logger::Instance().Info("DnsProxy::Start - Added route for 8.8.8.8 via VPN gateway");
     }
 
-    running = true;
     active = true;
 
-    outboundThread = std::thread(&DnsProxy::OutboundThreadFunc, this);
-    inboundThread = std::thread(&DnsProxy::InboundThreadFunc, this);
+    outboundThread = std::jthread([this](std::stop_token token) { OutboundThreadFunc(token); });
+    inboundThread = std::jthread([this](std::stop_token token) { InboundThreadFunc(token); });
 
     Logger::Instance().Info("DnsProxy::Start - DNS proxy started successfully (UDP + TCP)");
 }
 
 void DnsProxy::Stop() {
-    if (!running.load()) {
+    if (!active.load()) {
         return;
     }
 
     Logger::Instance().Info("DnsProxy::Stop - Stopping DNS proxy");
 
-    running = false;
     active = false;
 
     // Shutdown handles to unblock WinDivertRecv calls
@@ -90,13 +87,9 @@ void DnsProxy::Stop() {
         WinDivertShutdown(inboundHandle, WINDIVERT_SHUTDOWN_BOTH);
     }
 
-    // Join threads
-    if (outboundThread.joinable()) {
-        outboundThread.join();
-    }
-    if (inboundThread.joinable()) {
-        inboundThread.join();
-    }
+    // std::jthread automatically calls request_stop() and join() on destruction
+    outboundThread = {};
+    inboundThread = {};
 
     // Close handles
     if (outboundHandle != INVALID_HANDLE_VALUE) {
@@ -180,7 +173,7 @@ DWORD DnsProxy::LookupTcpPid(uint32_t localAddr, uint16_t localPort) {
     return 0;
 }
 
-void DnsProxy::OutboundThreadFunc() {
+void DnsProxy::OutboundThreadFunc(std::stop_token stopToken) {
     Logger::Instance().Info("DnsProxy::OutboundThreadFunc - Outbound DNS interception started");
 
     uint8_t packet[PACKET_BUFSIZE];
@@ -190,9 +183,9 @@ void DnsProxy::OutboundThreadFunc() {
     PWINDIVERT_UDPHDR udpHdr;
     PWINDIVERT_TCPHDR tcpHdr;
 
-    while (running.load() && !ShutdownCoordinator::Instance().isShuttingDown) {
+    while (!stopToken.stop_requested() && !ShutdownCoordinator::Instance().isShuttingDown) {
         if (!WinDivertRecv(outboundHandle, packet, sizeof(packet), &packetLen, &addr)) {
-            if (running.load()) {
+            if (!stopToken.stop_requested()) {
                 DWORD err = GetLastError();
                 if (err != ERROR_NO_DATA && err != ERROR_INVALID_HANDLE) {
                     Logger::Instance().Debug(std::format("DnsProxy::OutboundThreadFunc - Recv failed: {}", err));
@@ -261,7 +254,7 @@ void DnsProxy::OutboundThreadFunc() {
     Logger::Instance().Info("DnsProxy::OutboundThreadFunc - Outbound DNS interception exiting");
 }
 
-void DnsProxy::InboundThreadFunc() {
+void DnsProxy::InboundThreadFunc(std::stop_token stopToken) {
     Logger::Instance().Info("DnsProxy::InboundThreadFunc - Inbound DNS response rewriting started");
 
     uint8_t packet[PACKET_BUFSIZE];
@@ -271,9 +264,9 @@ void DnsProxy::InboundThreadFunc() {
     PWINDIVERT_UDPHDR udpHdr;
     PWINDIVERT_TCPHDR tcpHdr;
 
-    while (running.load() && !ShutdownCoordinator::Instance().isShuttingDown) {
+    while (!stopToken.stop_requested() && !ShutdownCoordinator::Instance().isShuttingDown) {
         if (!WinDivertRecv(inboundHandle, packet, sizeof(packet), &packetLen, &addr)) {
-            if (running.load()) {
+            if (!stopToken.stop_requested()) {
                 DWORD err = GetLastError();
                 if (err != ERROR_NO_DATA && err != ERROR_INVALID_HANDLE) {
                     Logger::Instance().Debug(std::format("DnsProxy::InboundThreadFunc - Recv failed: {}", err));
@@ -315,22 +308,22 @@ void DnsProxy::InboundThreadFunc() {
         if (originalDns != 0) {
             // Parse DNS response and proactively add routes for resolved IPs
             if (routeController && udpHdr) {
-                const uint8_t* dnsPayload = reinterpret_cast<const uint8_t*>(udpHdr) + sizeof(WINDIVERT_UDPHDR);
+                const auto* dnsPayload = reinterpret_cast<const uint8_t*>(udpHdr) + sizeof(WINDIVERT_UDPHDR);
                 size_t dnsLen = packetLen - (dnsPayload - packet);
                 if (dnsLen >= 12) {
-                    ParseDnsResponseAndAddRoutes(dnsPayload, dnsLen);
+                    ParseDnsResponseAndAddRoutes({dnsPayload, dnsLen});
                 }
             }
             else if (routeController && tcpHdr) {
                 // TCP DNS: payload starts after TCP header, first 2 bytes are length prefix
                 uint32_t tcpHeaderLen = tcpHdr->HdrLength * 4;
-                const uint8_t* tcpPayload = reinterpret_cast<const uint8_t*>(tcpHdr) + tcpHeaderLen;
+                const auto* tcpPayload = reinterpret_cast<const uint8_t*>(tcpHdr) + tcpHeaderLen;
                 size_t tcpPayloadLen = packetLen - (tcpPayload - packet);
                 if (tcpPayloadLen > 2) {
-                    const uint8_t* dnsPayload = tcpPayload + 2; // skip 2-byte length prefix
+                    const auto* dnsPayload = tcpPayload + 2; // skip 2-byte length prefix
                     size_t dnsLen = tcpPayloadLen - 2;
                     if (dnsLen >= 12) {
-                        ParseDnsResponseAndAddRoutes(dnsPayload, dnsLen);
+                        ParseDnsResponseAndAddRoutes({dnsPayload, dnsLen});
                     }
                 }
             }
@@ -348,9 +341,9 @@ void DnsProxy::InboundThreadFunc() {
     Logger::Instance().Info("DnsProxy::InboundThreadFunc - Inbound DNS response rewriting exiting");
 }
 
-void DnsProxy::ParseDnsResponseAndAddRoutes(const uint8_t* dns, size_t dnsLen) {
+void DnsProxy::ParseDnsResponseAndAddRoutes(std::span<const uint8_t> dns) {
     // DNS header: ID(2) Flags(2) QDCOUNT(2) ANCOUNT(2) NSCOUNT(2) ARCOUNT(2)
-    if (dnsLen < 12) return;
+    if (dns.size() < 12) return;
 
     uint16_t flags = (dns[2] << 8) | dns[3];
     bool isResponse = (flags & 0x8000) != 0;
@@ -367,7 +360,7 @@ void DnsProxy::ParseDnsResponseAndAddRoutes(const uint8_t* dns, size_t dnsLen) {
     size_t offset = 12;
     for (uint16_t i = 0; i < qdcount; i++) {
         // Skip QNAME
-        while (offset < dnsLen) {
+        while (offset < dns.size()) {
             uint8_t labelLen = dns[offset];
             if (labelLen == 0) {
                 offset++; // null terminator
@@ -383,9 +376,9 @@ void DnsProxy::ParseDnsResponseAndAddRoutes(const uint8_t* dns, size_t dnsLen) {
     }
 
     // Parse answer section
-    for (uint16_t i = 0; i < ancount && offset < dnsLen; i++) {
+    for (uint16_t i = 0; i < ancount && offset < dns.size(); i++) {
         // Skip NAME (may be compressed)
-        while (offset < dnsLen) {
+        while (offset < dns.size()) {
             uint8_t labelLen = dns[offset];
             if (labelLen == 0) {
                 offset++;
@@ -399,7 +392,7 @@ void DnsProxy::ParseDnsResponseAndAddRoutes(const uint8_t* dns, size_t dnsLen) {
         }
 
         // Need at least TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2) = 10 bytes
-        if (offset + 10 > dnsLen) break;
+        if (offset + 10 > dns.size()) break;
 
         uint16_t rtype = (dns[offset] << 8) | dns[offset + 1];
         uint16_t rclass = (dns[offset + 2] << 8) | dns[offset + 3];
@@ -407,7 +400,7 @@ void DnsProxy::ParseDnsResponseAndAddRoutes(const uint8_t* dns, size_t dnsLen) {
         uint16_t rdlength = (dns[offset + 8] << 8) | dns[offset + 9];
         offset += 10;
 
-        if (offset + rdlength > dnsLen) break;
+        if (offset + rdlength > dns.size()) break;
 
         // A record: type=1, class=IN(1), rdlength=4
         if (rtype == 1 && rclass == 1 && rdlength == 4) {
@@ -423,7 +416,7 @@ void DnsProxy::ParseDnsResponseAndAddRoutes(const uint8_t* dns, size_t dnsLen) {
                 }
             }
 
-            std::string ip = std::format("{}.{}.{}.{}",
+            auto ip = std::format("{}.{}.{}.{}",
                 dns[offset], dns[offset + 1], dns[offset + 2], dns[offset + 3]);
 
             if (!Utils::IsPrivateIP(ip)) {

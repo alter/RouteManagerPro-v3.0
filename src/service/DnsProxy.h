@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <mutex>
+#include <span>
 #include <cstdint>
 
 class ProcessManager;
@@ -20,7 +21,7 @@ public:
 
     void Start();
     void Stop();
-    bool IsActive() const { return active.load(); }
+    [[nodiscard]] bool IsActive() const { return active.load(); }
 
 private:
     ProcessManager* processManager;
@@ -30,11 +31,10 @@ private:
     HANDLE outboundHandle;  // NETWORK layer: rewrite outbound DNS dst -> 8.8.8.8
     HANDLE inboundHandle;   // NETWORK layer: rewrite inbound DNS src <- original
 
-    std::atomic<bool> running;
     std::atomic<bool> active;
 
-    std::thread outboundThread;
-    std::thread inboundThread;
+    std::jthread outboundThread;
+    std::jthread inboundThread;
 
     // Target DNS IP (8.8.8.8) in network byte order
     static constexpr uint32_t TARGET_DNS_NBO = 0x08080808;
@@ -46,14 +46,12 @@ private:
         uint32_t srcIp;
         uint16_t srcPort;
 
-        bool operator==(const NatKey& other) const {
-            return srcIp == other.srcIp && srcPort == other.srcPort;
-        }
+        bool operator==(const NatKey&) const = default;
     };
 
     struct NatKeyHash {
-        size_t operator()(const NatKey& k) const {
-            return std::hash<uint64_t>()(((uint64_t)k.srcIp << 16) | k.srcPort);
+        [[nodiscard]] size_t operator()(const NatKey& k) const noexcept {
+            return std::hash<uint64_t>{}(((uint64_t)k.srcIp << 16) | k.srcPort);
         }
     };
 
@@ -66,11 +64,11 @@ private:
     std::mutex addedRoutesMutex;
 
     // Thread functions
-    void OutboundThreadFunc();
-    void InboundThreadFunc();
+    void OutboundThreadFunc(std::stop_token stopToken);
+    void InboundThreadFunc(std::stop_token stopToken);
 
     // Helpers
-    DWORD LookupUdpPid(uint32_t localAddr, uint16_t localPort);
-    DWORD LookupTcpPid(uint32_t localAddr, uint16_t localPort);
-    void ParseDnsResponseAndAddRoutes(const uint8_t* dnsPayload, size_t dnsLen);
+    [[nodiscard]] DWORD LookupUdpPid(uint32_t localAddr, uint16_t localPort);
+    [[nodiscard]] DWORD LookupTcpPid(uint32_t localAddr, uint16_t localPort);
+    void ParseDnsResponseAndAddRoutes(std::span<const uint8_t> dnsPayload);
 };
