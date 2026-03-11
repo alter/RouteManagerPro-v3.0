@@ -34,7 +34,7 @@ void DnsProxy::Start() {
     // We use FLOW layer because it provides ProcessId, which NETWORK layer does not
     flowHandle = WinDivertOpen(
         "tcp.DstPort == 53 or udp.DstPort == 53 or tcp.SrcPort == 53 or udp.SrcPort == 53",
-        WINDIVERT_LAYER_FLOW, 0,
+        WINDIVERT_LAYER_FLOW, 1,
         WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY
     );
 

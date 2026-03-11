@@ -391,7 +391,11 @@ void ServiceMain::HandlePipeClient(HANDLE pipe) {
                     if (dnsProxy) {
                         if (enabled && !dnsProxy->IsActive()) {
                             dnsProxy->Start();
-                            Logger::Instance().Info("ServiceMain: DNS proxy started via IPC");
+                            if (dnsProxy->IsActive()) {
+                                Logger::Instance().Info("ServiceMain: DNS proxy started via IPC");
+                            } else {
+                                Logger::Instance().Error("ServiceMain: DNS proxy failed to start via IPC");
+                            }
                         }
                         else if (!enabled && dnsProxy->IsActive()) {
                             dnsProxy->Stop();
