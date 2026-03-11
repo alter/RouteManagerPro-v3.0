@@ -187,6 +187,13 @@ void DnsProxy::FlowThreadFunc() {
         FlowKey key{ localIp, htons(localPort) };
 
         {
+            char ipStr[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &localIp, ipStr, sizeof(ipStr));
+            Logger::Instance().Info(std::format("DnsProxy::Flow - Tracking DNS flow: {}:{} (PID {})",
+                ipStr, localPort, pid));
+        }
+
+        {
             std::unique_lock lock(flowsMutex);
             if (trackedFlows.size() < MAX_FLOW_ENTRIES) {
                 trackedFlows[key] = { std::chrono::steady_clock::now() };
@@ -240,19 +247,35 @@ void DnsProxy::OutboundThreadFunc() {
         uint16_t srcPort = udpHdr ? udpHdr->SrcPort : (tcpHdr ? tcpHdr->SrcPort : 0);
         uint32_t originalDst = ipHdr->DstAddr;
 
+        // Log all intercepted DNS packets for diagnostics
+        {
+            char srcIpStr[INET_ADDRSTRLEN], dstIpStr[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &ipHdr->SrcAddr, srcIpStr, sizeof(srcIpStr));
+            inet_ntop(AF_INET, &originalDst, dstIpStr, sizeof(dstIpStr));
+            Logger::Instance().Info(std::format("DnsProxy::Outbound - Intercepted DNS packet: {}:{} -> {}:53",
+                srcIpStr, ntohs(srcPort), dstIpStr));
+        }
+
         // Skip if already going to target DNS
         if (originalDst == htonl(TARGET_DNS_NBO)) {
+            Logger::Instance().Debug("DnsProxy::Outbound - Already going to 8.8.8.8, passing through");
             WinDivertSend(outboundHandle, packet, packetLen, nullptr, &addr);
             continue;
         }
 
         // Check if this flow belongs to a selected process
         FlowKey key{ ipHdr->SrcAddr, srcPort };
-        if (!IsFlowTracked(key)) {
+        bool tracked = IsFlowTracked(key);
+        Logger::Instance().Info(std::format("DnsProxy::Outbound - FlowTracked={}, trackedFlows.size={}",
+            tracked, trackedFlows.size()));
+
+        if (!tracked) {
             // Not a selected process — pass through unchanged
             WinDivertSend(outboundHandle, packet, packetLen, nullptr, &addr);
             continue;
         }
+
+        Logger::Instance().Info(std::format("DnsProxy::Outbound - Redirecting DNS to 8.8.8.8"));
 
         // Store original DNS server in NAT table
         {
