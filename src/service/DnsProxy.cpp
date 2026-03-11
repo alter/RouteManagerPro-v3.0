@@ -2,6 +2,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <iphlpapi.h>
 #include "DnsProxy.h"
 #include "ProcessManager.h"
 #include "RouteController.h"
@@ -13,7 +14,6 @@
 DnsProxy::DnsProxy(ProcessManager* pm, RouteController* rc)
     : processManager(pm),
     routeController(rc),
-    flowHandle(INVALID_HANDLE_VALUE),
     outboundHandle(INVALID_HANDLE_VALUE),
     inboundHandle(INVALID_HANDLE_VALUE),
     running(false),
@@ -33,19 +33,6 @@ void DnsProxy::Start() {
 
     Logger::Instance().Info("DnsProxy::Start - Starting DNS proxy");
 
-    // Open FLOW layer handle to track DNS connections (port 53) from selected processes
-    // We use FLOW layer because it provides ProcessId, which NETWORK layer does not
-    flowHandle = WinDivertOpen(
-        "remotePort == 53 or localPort == 53",
-        WINDIVERT_LAYER_FLOW, 1,
-        WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY
-    );
-
-    if (flowHandle == INVALID_HANDLE_VALUE) {
-        Logger::Instance().Error(std::format("DnsProxy::Start - Failed to open FLOW handle: {}", GetLastError()));
-        return;
-    }
-
     // Open NETWORK layer handle for outbound DNS interception (UDP and TCP port 53)
     outboundHandle = WinDivertOpen(
         "outbound and (udp.DstPort == 53 or tcp.DstPort == 53)",
@@ -54,8 +41,6 @@ void DnsProxy::Start() {
 
     if (outboundHandle == INVALID_HANDLE_VALUE) {
         Logger::Instance().Error(std::format("DnsProxy::Start - Failed to open outbound handle: {}", GetLastError()));
-        WinDivertClose(flowHandle);
-        flowHandle = INVALID_HANDLE_VALUE;
         return;
     }
 
@@ -69,15 +54,12 @@ void DnsProxy::Start() {
         Logger::Instance().Error(std::format("DnsProxy::Start - Failed to open inbound handle: {}", GetLastError()));
         WinDivertClose(outboundHandle);
         outboundHandle = INVALID_HANDLE_VALUE;
-        WinDivertClose(flowHandle);
-        flowHandle = INVALID_HANDLE_VALUE;
         return;
     }
 
     running = true;
     active = true;
 
-    flowThread = std::thread(&DnsProxy::FlowThreadFunc, this);
     outboundThread = std::thread(&DnsProxy::OutboundThreadFunc, this);
     inboundThread = std::thread(&DnsProxy::InboundThreadFunc, this);
 
@@ -95,9 +77,6 @@ void DnsProxy::Stop() {
     active = false;
 
     // Shutdown handles to unblock WinDivertRecv calls
-    if (flowHandle != INVALID_HANDLE_VALUE) {
-        WinDivertShutdown(flowHandle, WINDIVERT_SHUTDOWN_BOTH);
-    }
     if (outboundHandle != INVALID_HANDLE_VALUE) {
         WinDivertShutdown(outboundHandle, WINDIVERT_SHUTDOWN_BOTH);
     }
@@ -106,9 +85,6 @@ void DnsProxy::Stop() {
     }
 
     // Join threads
-    if (flowThread.joinable()) {
-        flowThread.join();
-    }
     if (outboundThread.joinable()) {
         outboundThread.join();
     }
@@ -117,10 +93,6 @@ void DnsProxy::Stop() {
     }
 
     // Close handles
-    if (flowHandle != INVALID_HANDLE_VALUE) {
-        WinDivertClose(flowHandle);
-        flowHandle = INVALID_HANDLE_VALUE;
-    }
     if (outboundHandle != INVALID_HANDLE_VALUE) {
         WinDivertClose(outboundHandle);
         outboundHandle = INVALID_HANDLE_VALUE;
@@ -130,11 +102,7 @@ void DnsProxy::Stop() {
         inboundHandle = INVALID_HANDLE_VALUE;
     }
 
-    // Clear tables
-    {
-        std::unique_lock lock(flowsMutex);
-        trackedFlows.clear();
-    }
+    // Clear NAT table
     {
         std::lock_guard lock(natMutex);
         natTable.clear();
@@ -143,72 +111,57 @@ void DnsProxy::Stop() {
     Logger::Instance().Info("DnsProxy::Stop - DNS proxy stopped");
 }
 
-void DnsProxy::FlowThreadFunc() {
-    Logger::Instance().Info("DnsProxy::FlowThreadFunc - Flow tracking thread started");
+DWORD DnsProxy::LookupUdpPid(uint32_t localAddr, uint16_t localPort) {
+    // localAddr and localPort are in network byte order (from packet headers)
+    // GetExtendedUdpTable also stores them in network byte order
 
-    WINDIVERT_ADDRESS addr;
-    uint8_t dummy[1];
-    UINT dummyLen = 0;
+    ULONG size = 0;
+    GetExtendedUdpTable(nullptr, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
+    if (size == 0) return 0;
 
-    auto lastCleanup = std::chrono::steady_clock::now();
+    auto buffer = std::make_unique<uint8_t[]>(size);
+    auto* table = reinterpret_cast<MIB_UDPTABLE_OWNER_PID*>(buffer.get());
 
-    while (running.load() && !ShutdownCoordinator::Instance().isShuttingDown) {
-        if (!WinDivertRecv(flowHandle, dummy, sizeof(dummy), &dummyLen, &addr)) {
-            if (running.load()) {
-                DWORD err = GetLastError();
-                if (err != ERROR_NO_DATA && err != ERROR_INVALID_HANDLE) {
-                    Logger::Instance().Debug(std::format("DnsProxy::FlowThreadFunc - Recv failed: {}", err));
-                }
-            }
-            break;
-        }
+    if (GetExtendedUdpTable(table, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0) != NO_ERROR) {
+        return 0;
+    }
 
-        // Only process FLOW_ESTABLISHED events for outbound connections
-        if (addr.Event != WINDIVERT_EVENT_FLOW_ESTABLISHED) {
-            continue;
-        }
-
-        DWORD pid = addr.Flow.ProcessId;
-        if (pid == 0) continue;
-
-        // Check if this process is in the selected list
-        if (!processManager->IsSelectedProcessByPid(pid)) {
-            continue;
-        }
-
-        // Extract local IP and port from the flow
-        // WinDivert stores IPv4 as IPv4-mapped IPv6 in Flow.LocalAddr
-        // For IPv4: LocalAddr[0-2] are 0, LocalAddr[3] contains the IPv4 address
-        uint32_t localIp = addr.Flow.LocalAddr[3];
-        uint16_t localPort = addr.Flow.LocalPort;
-
-        if (localIp == 0 || localPort == 0) continue;
-
-        FlowKey key{ localIp, htons(localPort) };
-
-        {
-            char ipStr[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &localIp, ipStr, sizeof(ipStr));
-            Logger::Instance().Info(std::format("DnsProxy::Flow - Tracking DNS flow: {}:{} (PID {})",
-                ipStr, localPort, pid));
-        }
-
-        {
-            std::unique_lock lock(flowsMutex);
-            if (trackedFlows.size() < MAX_FLOW_ENTRIES) {
-                trackedFlows[key] = { std::chrono::steady_clock::now() };
-            }
-        }
-
-        // Periodic cleanup
-        auto now = std::chrono::steady_clock::now();
-        if (now - lastCleanup > std::chrono::seconds(30)) {
-            CleanupExpiredFlows();
-            lastCleanup = now;
+    for (DWORD i = 0; i < table->dwNumEntries; i++) {
+        const auto& row = table->table[i];
+        // row.dwLocalAddr and row.dwLocalPort are in network byte order
+        // localAddr == 0.0.0.0 in table means bound to all interfaces
+        if ((row.dwLocalAddr == localAddr || row.dwLocalAddr == 0) &&
+            static_cast<uint16_t>(row.dwLocalPort) == localPort) {
+            return row.dwOwningPid;
         }
     }
 
-    Logger::Instance().Info("DnsProxy::FlowThreadFunc - Flow tracking thread exiting");
+    return 0;
+}
+
+DWORD DnsProxy::LookupTcpPid(uint32_t localAddr, uint16_t localPort) {
+    // localAddr and localPort are in network byte order (from packet headers)
+
+    ULONG size = 0;
+    GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+    if (size == 0) return 0;
+
+    auto buffer = std::make_unique<uint8_t[]>(size);
+    auto* table = reinterpret_cast<MIB_TCPTABLE_OWNER_PID*>(buffer.get());
+
+    if (GetExtendedTcpTable(table, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) != NO_ERROR) {
+        return 0;
+    }
+
+    for (DWORD i = 0; i < table->dwNumEntries; i++) {
+        const auto& row = table->table[i];
+        if ((row.dwLocalAddr == localAddr || row.dwLocalAddr == 0) &&
+            static_cast<uint16_t>(row.dwLocalPort) == localPort) {
+            return row.dwOwningPid;
+        }
+    }
+
+    return 0;
 }
 
 void DnsProxy::OutboundThreadFunc() {
@@ -244,40 +197,37 @@ void DnsProxy::OutboundThreadFunc() {
             continue;
         }
 
-        uint16_t srcPort = udpHdr ? udpHdr->SrcPort : (tcpHdr ? tcpHdr->SrcPort : 0);
+        bool isUdp = (udpHdr != nullptr);
+        uint16_t srcPort = isUdp ? udpHdr->SrcPort : tcpHdr->SrcPort;
         uint32_t originalDst = ipHdr->DstAddr;
-
-        // Log all intercepted DNS packets for diagnostics
-        {
-            char srcIpStr[INET_ADDRSTRLEN], dstIpStr[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &ipHdr->SrcAddr, srcIpStr, sizeof(srcIpStr));
-            inet_ntop(AF_INET, &originalDst, dstIpStr, sizeof(dstIpStr));
-            Logger::Instance().Info(std::format("DnsProxy::Outbound - Intercepted DNS packet: {}:{} -> {}:53",
-                srcIpStr, ntohs(srcPort), dstIpStr));
-        }
 
         // Skip if already going to target DNS
         if (originalDst == htonl(TARGET_DNS_NBO)) {
-            Logger::Instance().Debug("DnsProxy::Outbound - Already going to 8.8.8.8, passing through");
             WinDivertSend(outboundHandle, packet, packetLen, nullptr, &addr);
             continue;
         }
 
-        // Check if this flow belongs to a selected process
-        FlowKey key{ ipHdr->SrcAddr, srcPort };
-        bool tracked = IsFlowTracked(key);
-        Logger::Instance().Info(std::format("DnsProxy::Outbound - FlowTracked={}, trackedFlows.size={}",
-            tracked, trackedFlows.size()));
+        // Look up PID via system tables
+        DWORD pid = isUdp
+            ? LookupUdpPid(ipHdr->SrcAddr, srcPort)
+            : LookupTcpPid(ipHdr->SrcAddr, srcPort);
 
-        if (!tracked) {
+        if (pid == 0 || !processManager->IsSelectedProcessByPid(pid)) {
             // Not a selected process — pass through unchanged
             WinDivertSend(outboundHandle, packet, packetLen, nullptr, &addr);
             continue;
         }
 
-        Logger::Instance().Info(std::format("DnsProxy::Outbound - Redirecting DNS to 8.8.8.8"));
+        {
+            char srcIpStr[INET_ADDRSTRLEN], dstIpStr[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &ipHdr->SrcAddr, srcIpStr, sizeof(srcIpStr));
+            inet_ntop(AF_INET, &originalDst, dstIpStr, sizeof(dstIpStr));
+            Logger::Instance().Info(std::format("DnsProxy::Outbound - PID {} -> redirecting {}:{} -> {}:53 to 8.8.8.8",
+                pid, srcIpStr, ntohs(srcPort), dstIpStr));
+        }
 
         // Store original DNS server in NAT table
+        NatKey key{ ipHdr->SrcAddr, srcPort };
         {
             std::lock_guard lock(natMutex);
             natTable[key] = originalDst;
@@ -330,7 +280,7 @@ void DnsProxy::InboundThreadFunc() {
 
         // For inbound: DstAddr is our local IP, DstPort is our local port
         uint16_t dstPort = udpHdr ? udpHdr->DstPort : (tcpHdr ? tcpHdr->DstPort : 0);
-        FlowKey key{ ipHdr->DstAddr, dstPort };
+        NatKey key{ ipHdr->DstAddr, dstPort };
 
         uint32_t originalDns = 0;
         {
@@ -380,46 +330,6 @@ void DnsProxy::InboundThreadFunc() {
     }
 
     Logger::Instance().Info("DnsProxy::InboundThreadFunc - Inbound DNS response rewriting exiting");
-}
-
-bool DnsProxy::IsFlowTracked(const FlowKey& key) const {
-    std::shared_lock lock(flowsMutex);
-    return trackedFlows.contains(key);
-}
-
-void DnsProxy::CleanupExpiredFlows() {
-    auto now = std::chrono::steady_clock::now();
-    size_t removed = 0;
-
-    {
-        std::unique_lock lock(flowsMutex);
-        for (auto it = trackedFlows.begin(); it != trackedFlows.end();) {
-            if (now - it->second.createdAt > FLOW_EXPIRY) {
-                it = trackedFlows.erase(it);
-                removed++;
-            }
-            else {
-                ++it;
-            }
-        }
-    }
-
-    // Also clean up NAT table entries without corresponding flows
-    {
-        std::lock_guard lock(natMutex);
-        for (auto it = natTable.begin(); it != natTable.end();) {
-            if (!IsFlowTracked(it->first)) {
-                it = natTable.erase(it);
-            }
-            else {
-                ++it;
-            }
-        }
-    }
-
-    if (removed > 0) {
-        Logger::Instance().Debug(std::format("DnsProxy: Cleaned up {} expired flow entries", removed));
-    }
 }
 
 void DnsProxy::ParseDnsResponseAndAddRoutes(const uint8_t* dns, size_t dnsLen) {
