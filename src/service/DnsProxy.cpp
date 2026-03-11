@@ -108,6 +108,12 @@ void DnsProxy::Stop() {
         inboundHandle = INVALID_HANDLE_VALUE;
     }
 
+    // Remove route for 8.8.8.8
+    if (routeController) {
+        routeController->RemoveRoute("8.8.8.8");
+        Logger::Instance().Info("DnsProxy::Stop - Removed route for 8.8.8.8");
+    }
+
     // Clear NAT table
     {
         std::lock_guard lock(natMutex);
