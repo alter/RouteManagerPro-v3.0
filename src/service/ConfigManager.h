@@ -15,6 +15,7 @@ public:
     ServiceConfig GetConfig() const;
     void SetConfig(const ServiceConfig& config);
     void SetAIPreloadEnabled(bool enabled);
+    void SetDnsProxyEnabled(bool enabled);
 
 private:
     mutable std::mutex configMutex;

@@ -190,7 +190,7 @@ void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr) {
 
     Logger::Instance().Info(std::format("Flow event: {} Process: {} ({}) Remote: {}:{} Protocol: {}",
         addr.Event == WINDIVERT_EVENT_FLOW_ESTABLISHED ? "ESTABLISHED" : "DELETED",
-        processName, addr.Flow.ProcessId, remoteIp, ntohs(addr.Flow.RemotePort),
+        processName, addr.Flow.ProcessId, remoteIp, addr.Flow.RemotePort,
         static_cast<int>(addr.Flow.Protocol)));
 
     if (Utils::IsPrivateIP(remoteIp)) {
@@ -238,7 +238,7 @@ void NetworkMonitor::ProcessFlowEvent(const WINDIVERT_ADDRESS& addr) {
         connections[flowId] = {
             processName,
             remoteIp,
-            ntohs(addr.Flow.RemotePort),
+            addr.Flow.RemotePort,
             std::chrono::system_clock::now(),
             0
         };

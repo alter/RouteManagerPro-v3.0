@@ -7,8 +7,8 @@ IDI_SMALL       ICON    "app.ico"
 
 // Информация о версии
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     3, 0, 0, 0
-PRODUCTVERSION  3, 0, 0, 0
+FILEVERSION     3, 0, 1, 0
+PRODUCTVERSION  3, 0, 1, 0
 FILEFLAGSMASK   0x3fL
 FILEFLAGS       0x0L
 FILEOS          VOS_NT_WINDOWS32
@@ -20,13 +20,13 @@ BEGIN
 		BLOCK "040904E4"
 		BEGIN
 			VALUE "agup", "Personal Use"
-			VALUE "FileDescription", "Route Manager Pro - VPN Routing Application"
-			VALUE "FileVersion", "3.0.0.0"
+			VALUE "FileDescription", "Route Manager Pro - VPN Split Tunneling & DNS Proxy"
+			VALUE "FileVersion", "3.0.1.0"
 			VALUE "InternalName", "RouteManagerPro"
 			VALUE "LegalCopyright", "Copyright (C) 2025"
 			VALUE "OriginalFilename", "RouteManagerPro.exe"
 			VALUE "ProductName", "Route Manager Pro"
-			VALUE "ProductVersion", "3.0.0.0"
+			VALUE "ProductVersion", "3.0.1.0"
 		END
 	END
 	BLOCK "VarFileInfo"

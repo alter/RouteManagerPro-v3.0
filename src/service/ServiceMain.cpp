@@ -7,6 +7,7 @@
 #include "ProcessManager.h"
 #include "Watchdog.h"
 #include "ConfigManager.h"
+#include "DnsProxy.h"
 #include "../common/Constants.h"
 #include "../common/IPCProtocol.h"
 #include "../common/Logger.h"
@@ -61,16 +62,24 @@ void ServiceMain::StartDirect() {
         networkMonitor = std::make_unique<NetworkMonitor>(
             routeController.get(), processManager.get());
 
-        Logger::Instance().Debug("Step 8: Creating Watchdog");
+        Logger::Instance().Debug("Step 8: Creating DnsProxy");
+        dnsProxy = std::make_unique<DnsProxy>(processManager.get(), routeController.get());
+
+        Logger::Instance().Debug("Step 9: Creating Watchdog");
         watchdog = std::make_unique<Watchdog>(this);
 
-        Logger::Instance().Debug("Step 9: Starting NetworkMonitor");
+        Logger::Instance().Debug("Step 10: Starting NetworkMonitor");
         networkMonitor->Start();
 
-        Logger::Instance().Debug("Step 10: Starting Watchdog");
+        Logger::Instance().Debug("Step 11: Starting DnsProxy (if enabled)");
+        if (config.dnsProxyEnabled) {
+            dnsProxy->Start();
+        }
+
+        Logger::Instance().Debug("Step 12: Starting Watchdog");
         watchdog->Start();
 
-        Logger::Instance().Debug("Step 11: Creating pipe server thread");
+        Logger::Instance().Debug("Step 13: Creating pipe server thread");
         pipeThread = CreateThread(nullptr, 0, PipeServerThread, this, 0, nullptr);
 
         running = true;
@@ -143,6 +152,13 @@ void ServiceMain::StopDirect() {
             Logger::Instance().Debug("Waiting for watchdog destruction");
             watchdog.reset();
             Logger::Instance().Debug("Watchdog destroyed successfully");
+        }
+
+        if (dnsProxy) {
+            Logger::Instance().Info("Stopping DnsProxy");
+            dnsProxy->Stop();
+            dnsProxy.reset();
+            Logger::Instance().Debug("DnsProxy destroyed successfully");
         }
 
         if (networkMonitor) {
@@ -364,6 +380,28 @@ void ServiceMain::HandlePipeClient(HANDLE pipe) {
             case IPCMessageType::CleanupRedundantRoutes: {
                 if (routeController) {
                     routeController->CleanupRedundantRoutes();
+                }
+                break;
+            }
+
+            case IPCMessageType::SetDnsProxy: {
+                if (!msgData.empty()) {
+                    bool enabled = msgData[0] != 0;
+                    configManager->SetDnsProxyEnabled(enabled);
+                    if (dnsProxy) {
+                        if (enabled && !dnsProxy->IsActive()) {
+                            dnsProxy->Start();
+                            if (dnsProxy->IsActive()) {
+                                Logger::Instance().Info("ServiceMain: DNS proxy started via IPC");
+                            } else {
+                                Logger::Instance().Error("ServiceMain: DNS proxy failed to start via IPC");
+                            }
+                        }
+                        else if (!enabled && dnsProxy->IsActive()) {
+                            dnsProxy->Stop();
+                            Logger::Instance().Info("ServiceMain: DNS proxy stopped via IPC");
+                        }
+                    }
                 }
                 break;
             }

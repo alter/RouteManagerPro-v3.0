@@ -81,7 +81,7 @@ std::vector<uint8_t> IPCSerializer::SerializeServiceConfig(const ServiceConfig& 
 
     size_t gatewaySize = config.gatewayIp.size();
     size_t processCount = config.selectedProcesses.size();
-    size_t totalSize = sizeof(size_t) + gatewaySize + sizeof(int) + sizeof(bool) * 3 +
+    size_t totalSize = sizeof(size_t) + gatewaySize + sizeof(int) + sizeof(bool) * 4 +
         sizeof(size_t) + processCount * sizeof(size_t);
 
     for (const auto& process : config.selectedProcesses) {
@@ -107,6 +107,9 @@ std::vector<uint8_t> IPCSerializer::SerializeServiceConfig(const ServiceConfig& 
     offset += sizeof(bool);
 
     memcpy(data.data() + offset, &config.aiPreloadEnabled, sizeof(bool));
+    offset += sizeof(bool);
+
+    memcpy(data.data() + offset, &config.dnsProxyEnabled, sizeof(bool));
     offset += sizeof(bool);
 
     memcpy(data.data() + offset, &processCount, sizeof(size_t));
@@ -137,7 +140,7 @@ ServiceConfig IPCSerializer::DeserializeServiceConfig(const std::vector<uint8_t>
     config.gatewayIp.assign(reinterpret_cast<const char*>(data.data() + offset), gatewaySize);
     offset += gatewaySize;
 
-    if (offset + sizeof(int) + sizeof(bool) * 3 + sizeof(size_t) > data.size()) return config;
+    if (offset + sizeof(int) + sizeof(bool) * 4 + sizeof(size_t) > data.size()) return config;
 
     memcpy(&config.metric, data.data() + offset, sizeof(int));
     offset += sizeof(int);
@@ -149,6 +152,9 @@ ServiceConfig IPCSerializer::DeserializeServiceConfig(const std::vector<uint8_t>
     offset += sizeof(bool);
 
     memcpy(&config.aiPreloadEnabled, data.data() + offset, sizeof(bool));
+    offset += sizeof(bool);
+
+    memcpy(&config.dnsProxyEnabled, data.data() + offset, sizeof(bool));
     offset += sizeof(bool);
 
     size_t processCount;

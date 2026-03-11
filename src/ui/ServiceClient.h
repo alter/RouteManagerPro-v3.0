@@ -28,6 +28,7 @@ public:
     void ClearRoutes();
     void RestartService();
     void SetAIPreload(bool enabled);
+    void SetDnsProxy(bool enabled);
     void OptimizeRoutes();
     void CleanupRedundantRoutes();
 

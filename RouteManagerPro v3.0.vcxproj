@@ -26,10 +26,12 @@
     <ResourceCompile Include="app.rc" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="libs\jsoncpp\jsoncpp.cpp" />
     <ClCompile Include="src\common\IPCSerializer.cpp" />
     <ClCompile Include="src\common\Utils.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\service\ConfigManager.cpp" />
+    <ClCompile Include="src\service\DnsProxy.cpp" />
     <ClCompile Include="src\service\NetworkMonitor.cpp" />
     <ClCompile Include="src\service\ProcessManager.cpp" />
     <ClCompile Include="src\service\RouteController.cpp" />
@@ -55,6 +57,7 @@
     <ClInclude Include="src\common\Utils.h" />
     <ClInclude Include="src\common\WinHandles.h" />
     <ClInclude Include="src\service\ConfigManager.h" />
+    <ClInclude Include="src\service\DnsProxy.h" />
     <ClInclude Include="src\service\NetworkMonitor.h" />
     <ClInclude Include="src\service\PerformanceMonitor.h" />
     <ClInclude Include="src\service\ProcessManager.h" />
@@ -158,7 +161,7 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>_DEBUG;_WINDOWS;_CRT_SECURE_NO_WARNINGS;WIN32_LEAN_AND_MEAN;_WINSOCK_DEPRECATED_NO_WARNINGS;%(PreprocessorDefinitions);_CRT_SECURE_NO_WARNINGS;_SILENCE_CXX23_ALIGNED_STORAGE_DEPRECATION_WARNING;_HAS_CXX23=1;_HAS_CXX20=1</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\common;$(ProjectDir)src\service;$(ProjectDir)src\ui;$(ProjectDir)libs\WinDivert\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\common;$(ProjectDir)src\service;$(ProjectDir)src\ui;$(ProjectDir)libs\WinDivert\include;$(ProjectDir)libs\jsoncpp\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpplatest</LanguageStandard>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <AdditionalOptions>/Zc:__cplusplus
@@ -195,6 +198,7 @@
       <ConformanceMode>true</ConformanceMode>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
       <LanguageStandard>stdcpplatest</LanguageStandard>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\common;$(ProjectDir)src\service;$(ProjectDir)src\ui;$(ProjectDir)libs\WinDivert\include;$(ProjectDir)libs\jsoncpp\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions>/Zc:__cplusplus
 /Zc:preprocessor
 /Zc:char8_t
@@ -218,7 +222,7 @@
       <AdditionalLibraryDirectories>$(ProjectDir)libs\WinDivert\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <IgnoreSpecificDefaultLibraries>
       </IgnoreSpecificDefaultLibraries>
-      <AdditionalDependencies>%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>WinDivert.lib;iphlpapi.lib;psapi.lib;comctl32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

@@ -5,6 +5,7 @@
   "startMinimized": false,
   "startWithWindows": true,
   "aiPreloadEnabled": true,
+  "dnsProxyEnabled": false,
   "selectedProcesses": [
     "Discord.exe"
   ]
