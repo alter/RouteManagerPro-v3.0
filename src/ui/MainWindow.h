@@ -35,6 +35,7 @@ private:
     HWND applyButton;
     HWND aiPreloadCheckbox;
     HWND dnsProxyCheckbox;
+    HWND autostartCheckbox;
     HWND editPreloadButton;
     HWND statusLabel;
     HWND minimizeButton;
@@ -58,6 +59,7 @@ private:
     void OnViewLogs();
     void OnAIPreloadToggle();
     void OnDnsProxyToggle();
+    void OnAutostartToggle();
     void OnOptimizeRoutes();
     void LoadConfiguration();
     void OnClose();

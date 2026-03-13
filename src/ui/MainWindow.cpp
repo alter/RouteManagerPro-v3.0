@@ -157,7 +157,11 @@ void MainWindow::CreateControls() {
 
     dnsProxyCheckbox = CreateWindow(L"BUTTON", L"DNS Proxy",
         WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-        20, 113, 180, 20, hwnd, (HMENU)1007, hInstance, nullptr);
+        20, 113, 90, 20, hwnd, (HMENU)1007, hInstance, nullptr);
+
+    autostartCheckbox = CreateWindow(L"BUTTON", L"Autostart",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        115, 113, 90, 20, hwnd, (HMENU)1008, hInstance, nullptr);
 
     statusGroupBox = CreateWindow(L"BUTTON", L"Status", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
         220, 10, 610, 140, hwnd, nullptr, hInstance, nullptr);
@@ -209,6 +213,7 @@ LRESULT CALLBACK MainWindow::WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         case 1005: instance->OnEditPreload(); break;
         case 1006: instance->OnOptimizeRoutes(); break;
         case 1007: instance->OnDnsProxyToggle(); break;
+        case 1008: instance->OnAutostartToggle(); break;
         default:
             if (instance->processPanel) {
                 instance->processPanel->HandleCommand(wParam);
@@ -269,6 +274,8 @@ LRESULT CALLBACK MainWindow::WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 instance->config.aiPreloadEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
             SendMessage(instance->dnsProxyCheckbox, BM_SETCHECK,
                 instance->config.dnsProxyEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+            SendMessage(instance->autostartCheckbox, BM_SETCHECK,
+                instance->config.startWithWindows ? BST_CHECKED : BST_UNCHECKED, 0);
             Logger::Instance().Info("MainWindow: Updated checkboxes after route cleanup");
         }
         return 0;
@@ -539,10 +546,22 @@ void MainWindow::OnDnsProxyToggle() {
     serviceClient->SetDnsProxy(checked);
 }
 
+void MainWindow::OnAutostartToggle() {
+    bool checked = SendMessage(autostartCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED;
+
+    if (serviceClient && serviceClient->IsConnected()) {
+        config = serviceClient->GetConfig();
+    }
+
+    config.startWithWindows = checked;
+    serviceClient->SetConfig(config);
+}
+
 void MainWindow::LoadConfiguration() {
     config = serviceClient->GetConfig();
     SetWindowTextA(gatewayEdit, config.gatewayIp.c_str());
     SetWindowTextA(metricEdit, std::to_string(config.metric).c_str());
     SendMessage(aiPreloadCheckbox, BM_SETCHECK, config.aiPreloadEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessage(dnsProxyCheckbox, BM_SETCHECK, config.dnsProxyEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessage(autostartCheckbox, BM_SETCHECK, config.startWithWindows ? BST_CHECKED : BST_UNCHECKED, 0);
 }
