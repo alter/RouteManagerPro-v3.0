@@ -1,6 +1,7 @@
 // src/service/StartupManager.cpp
 #include "StartupManager.h"
 #include "../common/Logger.h"
+#include "../common/Utils.h"
 #include <windows.h>
 #include <comdef.h>
 #include <taskschd.h>
@@ -126,8 +127,8 @@ bool StartupManager::SetStartWithWindows(bool enabled) {
                 pExecAction->put_WorkingDirectory(_bstr_t(exeDir.c_str()));
 
                 Logger::Instance().Info(std::format("StartupManager: Exe='{}', WorkDir='{}'",
-                    std::string(exePath.begin(), exePath.end()),
-                    std::string(exeDir.begin(), exeDir.end())));
+                    Utils::WStringToString(exePath),
+                    Utils::WStringToString(exeDir)));
 
                 pExecAction->Release();
             }
