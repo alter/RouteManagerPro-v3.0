@@ -8,6 +8,7 @@
 #include "Watchdog.h"
 #include "ConfigManager.h"
 #include "DnsProxy.h"
+#include "StartupManager.h"
 #include "../common/Constants.h"
 #include "../common/IPCProtocol.h"
 #include "../common/Logger.h"
@@ -43,6 +44,12 @@ void ServiceMain::StartDirect() {
         Logger::Instance().Debug("Step 1: Creating ConfigManager");
         configManager = std::make_unique<ConfigManager>();
         auto config = configManager->GetConfig();
+
+        // Sync Task Scheduler state with config
+        bool taskExists = StartupManager::IsStartWithWindowsEnabled();
+        if (config.startWithWindows != taskExists) {
+            StartupManager::SetStartWithWindows(config.startWithWindows);
+        }
 
         Logger::Instance().Debug("Step 2: Creating RouteController");
         routeController = std::make_unique<RouteController>(config);
@@ -321,6 +328,10 @@ void ServiceMain::HandlePipeClient(HANDLE pipe) {
 
                 if (processManager && oldConfig.selectedProcesses != newConfig.selectedProcesses) {
                     processManager->SetSelectedProcesses(newConfig.selectedProcesses);
+                }
+
+                if (oldConfig.startWithWindows != newConfig.startWithWindows) {
+                    StartupManager::SetStartWithWindows(newConfig.startWithWindows);
                 }
 
                 break;

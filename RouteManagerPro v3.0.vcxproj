@@ -36,6 +36,7 @@
     <ClCompile Include="src\service\ProcessManager.cpp" />
     <ClCompile Include="src\service\RouteController.cpp" />
     <ClCompile Include="src\service\RouteOptimizer.cpp" />
+    <ClCompile Include="src\service\StartupManager.cpp" />
     <ClCompile Include="src\service\ServiceMain.cpp">
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</ExcludedFromBuild>
     </ClCompile>
@@ -63,6 +64,7 @@
     <ClInclude Include="src\service\ProcessManager.h" />
     <ClInclude Include="src\service\RouteController.h" />
     <ClInclude Include="src\service\RouteOptimizer.h" />
+    <ClInclude Include="src\service\StartupManager.h" />
     <ClInclude Include="src\service\ServiceMain.h" />
     <ClInclude Include="src\service\Watchdog.h" />
     <ClInclude Include="src\ui\MainWindow.h" />

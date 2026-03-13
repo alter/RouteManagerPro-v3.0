@@ -1242,6 +1242,11 @@ bool RouteController::IsGatewayReachable() {
 }
 
 void RouteController::PreloadAIRoutes() {
+    if (aiRoutesPreloaded.exchange(true)) {
+        Logger::Instance().Info("PreloadRoutes - AI routes already preloaded, skipping");
+        return;
+    }
+
     Logger::Instance().Info("PreloadRoutes - Starting preload of IP ranges from config");
 
     auto services = LoadPreloadConfig();
@@ -1368,7 +1373,18 @@ bool RouteController::AddCIDRRoute(const std::string& cidr, const std::string& s
     if (slashPos == std::string::npos) return false;
 
     std::string baseIp = cidr.substr(0, slashPos);
-    int prefixLen = std::stoi(cidr.substr(slashPos + 1));
+    int prefixLen = 0;
+    try {
+        prefixLen = std::stoi(cidr.substr(slashPos + 1));
+    } catch (const std::exception& e) {
+        Logger::Instance().Error(std::format("Invalid CIDR prefix in '{}': {}", cidr, e.what()));
+        return false;
+    }
+
+    if (prefixLen < 0 || prefixLen > 32) {
+        Logger::Instance().Error(std::format("CIDR prefix length {} out of range [0..32] in '{}'", prefixLen, cidr));
+        return false;
+    }
 
     Logger::Instance().Info(std::format("Adding CIDR route: {} for {}", cidr, service));
 

@@ -127,4 +127,6 @@ private:
     void CreateDefaultPreloadConfig(const std::string& path);
     std::vector<PreloadService> GetDefaultPreloadServices();
     bool AddCIDRRoute(const std::string& cidr, const std::string& service);
+
+    std::atomic<bool> aiRoutesPreloaded{ false };
 };
