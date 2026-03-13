@@ -282,9 +282,12 @@ void ProcessPanel::UpdateProcessList() {
     availableProcesses.clear();
     selectedProcessesDisplay.clear();
 
+    // Build case-insensitive selected set (lowercase keys)
     std::unordered_set<std::string> selectedSet;
     for (const auto& proc : selectedProcesses) {
-        selectedSet.insert(proc);
+        std::string lower = proc;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        selectedSet.insert(lower);
     }
 
     std::unordered_map<std::string, ProcessDisplayInfo> runningSelected;
@@ -311,6 +314,11 @@ void ProcessPanel::UpdateProcessList() {
                 }
 
                 if (uniqueProcesses.find(processName) == uniqueProcesses.end()) {
+                    // Case-insensitive check if this process is selected
+                    std::string processNameLower = processNameStr;
+                    std::transform(processNameLower.begin(), processNameLower.end(), processNameLower.begin(), ::tolower);
+                    bool isSelected = (selectedSet.find(processNameLower) != selectedSet.end());
+
                     std::wstring processPath;
                     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe32.th32ProcessID);
                     if (process) {
@@ -322,9 +330,11 @@ void ProcessPanel::UpdateProcessList() {
                             std::wstring pathLower = processPath;
                             std::transform(pathLower.begin(), pathLower.end(), pathLower.begin(), ::tolower);
 
-                            if (pathLower.contains(L"windows\\system32") ||
+                            // Don't filter out selected processes even if they're in system paths
+                            if (!isSelected &&
+                                (pathLower.contains(L"windows\\system32") ||
                                 pathLower.contains(L"windows\\syswow64") ||
-                                pathLower.contains(L"\\windowsapps\\")) {
+                                pathLower.contains(L"\\windowsapps\\"))) {
                                 CloseHandle(process);
                                 continue;
                             }
@@ -336,12 +346,13 @@ void ProcessPanel::UpdateProcessList() {
                     info.name = processName;
                     info.path = processPath;
                     info.isRunning = true;
-                    info.isSelected = (selectedSet.find(processNameStr) != selectedSet.end());
+                    info.isSelected = isSelected;
 
                     uniqueProcesses[processName] = info;
 
                     if (info.isSelected) {
-                        runningSelected[processNameStr] = info;
+                        // Store with lowercase key for case-insensitive lookup
+                        runningSelected[processNameLower] = info;
                     }
                 }
 
@@ -365,7 +376,10 @@ void ProcessPanel::UpdateProcessList() {
     }
 
     for (const auto& selectedName : selectedProcesses) {
-        auto it = runningSelected.find(selectedName);
+        // Case-insensitive lookup
+        std::string selectedNameLower = selectedName;
+        std::transform(selectedNameLower.begin(), selectedNameLower.end(), selectedNameLower.begin(), ::tolower);
+        auto it = runningSelected.find(selectedNameLower);
         if (it != runningSelected.end()) {
             selectedProcessesDisplay.push_back(it->second);
         }
@@ -616,9 +630,12 @@ void ProcessPanel::UpdateListsImmediately() {
     availableProcesses.clear();
     selectedProcessesDisplay.clear();
 
+    // Build case-insensitive selected set (lowercase keys)
     std::unordered_set<std::string> selectedSet;
     for (const auto& proc : selectedProcesses) {
-        selectedSet.insert(proc);
+        std::string lower = proc;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        selectedSet.insert(lower);
     }
 
     char searchText[256] = "";
@@ -650,6 +667,11 @@ void ProcessPanel::UpdateListsImmediately() {
                 }
 
                 if (uniqueProcesses.find(processName) == uniqueProcesses.end()) {
+                    // Case-insensitive check if this process is selected
+                    std::string processNameLower = processNameStr;
+                    std::transform(processNameLower.begin(), processNameLower.end(), processNameLower.begin(), ::tolower);
+                    bool isSelected = (selectedSet.find(processNameLower) != selectedSet.end());
+
                     std::wstring processPath;
                     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe32.th32ProcessID);
                     if (process) {
@@ -661,9 +683,11 @@ void ProcessPanel::UpdateListsImmediately() {
                             std::wstring pathLower = processPath;
                             std::transform(pathLower.begin(), pathLower.end(), pathLower.begin(), ::tolower);
 
-                            if (pathLower.contains(L"windows\\system32") ||
+                            // Don't filter out selected processes even if they're in system paths
+                            if (!isSelected &&
+                                (pathLower.contains(L"windows\\system32") ||
                                 pathLower.contains(L"windows\\syswow64") ||
-                                pathLower.contains(L"\\windowsapps\\")) {
+                                pathLower.contains(L"\\windowsapps\\"))) {
                                 CloseHandle(process);
                                 continue;
                             }
@@ -675,12 +699,13 @@ void ProcessPanel::UpdateListsImmediately() {
                     info.name = processName;
                     info.path = processPath;
                     info.isRunning = true;
-                    info.isSelected = (selectedSet.find(processNameStr) != selectedSet.end());
+                    info.isSelected = isSelected;
 
                     uniqueProcesses[processName] = info;
 
                     if (info.isSelected) {
-                        runningSelected[processNameStr] = info;
+                        // Store with lowercase key for case-insensitive lookup
+                        runningSelected[processNameLower] = info;
                     }
                 }
 
@@ -704,7 +729,10 @@ void ProcessPanel::UpdateListsImmediately() {
     }
 
     for (const auto& selectedName : selectedProcesses) {
-        auto it = runningSelected.find(selectedName);
+        // Case-insensitive lookup
+        std::string selectedNameLower = selectedName;
+        std::transform(selectedNameLower.begin(), selectedNameLower.end(), selectedNameLower.begin(), ::tolower);
+        auto it = runningSelected.find(selectedNameLower);
         if (it != runningSelected.end()) {
             selectedProcessesDisplay.push_back(it->second);
         }
