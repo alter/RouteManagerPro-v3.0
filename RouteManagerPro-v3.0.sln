@@ -3,7 +3,7 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.14.36203.30 d17.14
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "RouteManagerPro v3.0", "RouteManagerPro v3.0.vcxproj", "{EFD5E044-FE0B-42B9-BA2F-48D8FB3B0D98}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "RouteManagerPro-v3.0", "RouteManagerPro-v3.0.vcxproj", "{EFD5E044-FE0B-42B9-BA2F-48D8FB3B0D98}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
